@@ -1,0 +1,7 @@
+# clasp (Apps Script CLI), if used later
+.clasp.json
+.clasprc.json
+
+# OS / editor
+.DS_Store
+*.swp
