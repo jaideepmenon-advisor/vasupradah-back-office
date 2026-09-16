@@ -855,25 +855,6 @@ async function shortenLink(db, url) {
   }
   return url;
 }
-const GW_TOKEN_CACHE = { token: "", at: 0 };
-async function gwAuth(db, force) {
-  const pbUrl = String(db && db.gwPbUrl || "").trim().replace(/\/$/, "");
-  const email = String(db && db.gwEmail || "").trim();
-  const password = String(db && db.gwPassword || "");
-  if (!pbUrl || !email || !password) throw new Error("Order-link gateway credentials are not set in Settings.");
-  if (!force && GW_TOKEN_CACHE.token && Date.now() - GW_TOKEN_CACHE.at < 45 * 60 * 1e3) return GW_TOKEN_CACHE.token;
-  const res = await fetch(pbUrl + "/api/collections/api_clients/auth-with-password", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ identity: email, password })
-  });
-  if (!res.ok) throw new Error(`Order-link gateway login failed (HTTP ${res.status}).`);
-  const data = await res.json();
-  if (!data || !data.token) throw new Error("Order-link gateway login did not return a token.");
-  GW_TOKEN_CACHE.token = data.token;
-  GW_TOKEN_CACHE.at = Date.now();
-  return data.token;
-}
 let _gwOrderSeq = 0;
 const gwOrderId = (code) => `${String(code || "").trim().replace(/\s+/g, "") || "CL"}-${Date.now()}-${(_gwOrderSeq++).toString(36)}`;
 function gwPhoneDigits(raw) {
@@ -883,34 +864,28 @@ function gwPhoneDigits(raw) {
   return /^[6-9]\d{9}$/.test(d) ? d : "";
 }
 async function gwCreateOrderLink(db, { code, phone, sym, qty, side, orderType, price, triggerPrice }) {
-  const appUrl = String(db && db.gwAppUrl || "").trim().replace(/\/$/, "");
+  const proxyUrl = String(db && db.gwProxyUrl || "").trim().replace(/\/$/, "");
   const phoneNumber = gwPhoneDigits(phone);
   const ticker = String(sym || "").trim().toUpperCase();
   const q = Math.abs(Math.round(num(qty)));
-  if (!appUrl) return { ok: false, error: "Order-link gateway App URL not set in Settings." };
+  if (!proxyUrl) return { ok: false, error: "Order-link proxy URL not set in Settings." };
   if (!phoneNumber) return { ok: false, error: "No valid 10-digit WhatsApp number for this client." };
   if (!ticker || !q) return { ok: false, error: "Missing ticker/quantity." };
   const body = { orderId: gwOrderId(code), phoneNumber, ticker, quantity: q, type: String(side || "BUY").toUpperCase() === "SELL" ? "SELL" : "BUY" };
   if (orderType) body.orderType = orderType;
   if (price != null) body.price = price;
   if (triggerPrice != null) body.triggerPrice = triggerPrice;
-  const post = (token) => fetch(appUrl + "/api/order-links", {
-    method: "POST",
-    headers: { Authorization: token, "Content-Type": "application/json" },
-    body: JSON.stringify(body)
-  });
   try {
-    let token = await gwAuth(db, false);
-    let res = await post(token);
-    if (res.status === 401) {
-      token = await gwAuth(db, true);
-      res = await post(token);
-    }
+    const res = await fetch(proxyUrl + "/api/order-links", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body)
+    });
     const data = await res.json().catch(() => ({}));
-    if (!res.ok || !data.success) return { ok: false, error: data && data.error || `Order-link gateway error (HTTP ${res.status}).` };
+    if (!res.ok || !data.success) return { ok: false, error: data && data.error || `Order-link proxy error (HTTP ${res.status}).` };
     return { ok: true, url: data.url, orderId: data.orderId, shortCode: data.shortCode };
   } catch (e) {
-    return { ok: false, error: e.message || "Could not reach the order-link gateway." };
+    return { ok: false, error: "Could not reach the order-link proxy — is it running? (" + (e.message || "network error") + ")" };
   }
 }
 const plStage = (id) => PL_STAGES.find((x) => x.id === id) || PL_STAGES[0];
@@ -7206,16 +7181,10 @@ function SettingsTab({ db, commit, showToast }) {
   const [newPin, setNewPin] = useState("");
   const [sUrl, setSUrl] = useState(db.sheetUrl || "");
   const [sTok, setSTok] = useState(db.sheetToken || "");
-  const [gwAppUrl, setGwAppUrl] = useState(db.gwAppUrl || "https://equity.vasupradah.com");
-  const [gwPbUrl, setGwPbUrl] = useState(db.gwPbUrl || "https://equity.vasupradah.com/pb");
-  const [gwEmail, setGwEmail] = useState(db.gwEmail || "");
-  const [gwPassword, setGwPassword] = useState(db.gwPassword || "");
+  const [gwProxyUrl, setGwProxyUrl] = useState(db.gwProxyUrl || "http://localhost:8787");
   const saveGateway = async () => {
     await commit((d) => {
-      d.gwAppUrl = gwAppUrl.trim();
-      d.gwPbUrl = gwPbUrl.trim();
-      d.gwEmail = gwEmail.trim();
-      d.gwPassword = gwPassword;
+      d.gwProxyUrl = gwProxyUrl.trim();
     }, "edit order-link gateway settings");
     showToast("Order-link gateway settings saved.");
   };
@@ -7331,10 +7300,7 @@ function SettingsTab({ db, commit, showToast }) {
     setSebi(db.sebiRegNo);
     setSUrl(db.sheetUrl || "");
     setSTok(db.sheetToken || "");
-    setGwAppUrl(db.gwAppUrl || "https://equity.vasupradah.com");
-    setGwPbUrl(db.gwPbUrl || "https://equity.vasupradah.com/pb");
-    setGwEmail(db.gwEmail || "");
-    setGwPassword(db.gwPassword || "");
+    setGwProxyUrl(db.gwProxyUrl || "http://localhost:8787");
     setAutoBk(!!db.autoBackup);
     setTeamSync(!!db.teamSync);
     setCl({ default: 10, ...db.concLimits || {} });
@@ -7806,7 +7772,7 @@ function SettingsTab({ db, commit, showToast }) {
       rows: 7,
       className: "w-full mt-1 px-3 py-2 text-xs font-mono border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500"
     }
-  ), /* @__PURE__ */ React.createElement("div", { className: "text-[11px] text-slate-400 mt-1" }, ["name", "symbol", "company", "reportLink", "advisorName", "sebiRegNo"].map((p) => /* @__PURE__ */ React.createElement("code", { key: p, className: "bg-slate-100 rounded px-1 mr-1" }, `{${p}}`))), /* @__PURE__ */ React.createElement("button", { onClick: saveAdvice, className: "mt-3 bg-indigo-600 hover:bg-indigo-700 text-white text-sm px-4 py-2 rounded-lg" }, "Save advice templates")), /* @__PURE__ */ React.createElement(Card, { title: "Order-link gateway (execute links)", icon: Share2 }, /* @__PURE__ */ React.createElement("p", { className: "text-xs text-slate-500 mb-3" }, "Generates the one-click execute link used in Advice orders. Each link is gated to the client's WhatsApp number — it only opens for that number, and re-sending the same order reuses the same link rather than creating a duplicate. ", /* @__PURE__ */ React.createElement("b", null, "The email/password below are stored in this browser and sent on every call — use a dedicated api_clients account, not a personal login.")), /* @__PURE__ */ React.createElement("div", { className: "grid md:grid-cols-2 gap-3" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("label", { className: "text-[11px] text-slate-500 block mb-1" }, "App URL"), /* @__PURE__ */ React.createElement("input", { value: gwAppUrl, onChange: (e) => setGwAppUrl(e.target.value), placeholder: "https://equity.vasupradah.com", className: "w-full px-3 py-2 text-sm border border-slate-300 rounded-lg" })), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("label", { className: "text-[11px] text-slate-500 block mb-1" }, "PocketBase URL"), /* @__PURE__ */ React.createElement("input", { value: gwPbUrl, onChange: (e) => setGwPbUrl(e.target.value), placeholder: "https://equity.vasupradah.com/pb", className: "w-full px-3 py-2 text-sm border border-slate-300 rounded-lg" })), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("label", { className: "text-[11px] text-slate-500 block mb-1" }, "api_clients email"), /* @__PURE__ */ React.createElement("input", { value: gwEmail, onChange: (e) => setGwEmail(e.target.value), placeholder: "you@example.com", className: "w-full px-3 py-2 text-sm border border-slate-300 rounded-lg" })), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("label", { className: "text-[11px] text-slate-500 block mb-1" }, "api_clients password"), /* @__PURE__ */ React.createElement("input", { type: "password", value: gwPassword, onChange: (e) => setGwPassword(e.target.value), placeholder: "••••••••", className: "w-full px-3 py-2 text-sm border border-slate-300 rounded-lg" }))), /* @__PURE__ */ React.createElement("button", { onClick: saveGateway, className: "mt-3 bg-indigo-600 hover:bg-indigo-700 text-white text-sm px-4 py-2 rounded-lg" }, "Save gateway settings")), /* @__PURE__ */ React.createElement(Card, { title: "Google Sheet backup", icon: FileSpreadsheet }, /* @__PURE__ */ React.createElement("p", { className: "text-xs text-slate-500 mb-3" }, "Mirror the holdings into your sheet ", /* @__PURE__ */ React.createElement("b", null, "ADVISORY CLIENT DATA"), ". Two ways \u2014 the first always works."), /* @__PURE__ */ React.createElement("div", { className: "rounded-lg border border-emerald-200 bg-emerald-50/50 p-3 mb-4" }, /* @__PURE__ */ React.createElement("div", { className: "text-sm font-medium text-emerald-800 mb-1" }, "Method 1 \u2014 Copy & paste (recommended)"), /* @__PURE__ */ React.createElement("p", { className: "text-[12px] text-slate-600 mb-2" }, "Open the sheet \u2192 click cell ", /* @__PURE__ */ React.createElement("b", null, "A1"), " \u2192 paste. It fills in as columns."), /* @__PURE__ */ React.createElement("div", { className: "flex gap-2" }, /* @__PURE__ */ React.createElement("button", { onClick: copyForSheet, className: "bg-emerald-600 hover:bg-emerald-700 text-white text-sm px-4 py-2 rounded-lg flex items-center gap-1.5" }, /* @__PURE__ */ React.createElement(Download, { size: 15 }), " Copy rows for Google Sheet"), /* @__PURE__ */ React.createElement("button", { onClick: exportCsv, className: "text-sm text-emerald-700 px-3 py-2 rounded-lg border border-emerald-200 hover:bg-emerald-50" }, "Or download CSV"))), /* @__PURE__ */ React.createElement("details", { className: "rounded-lg border border-slate-200 p-3" }, /* @__PURE__ */ React.createElement("summary", { className: "text-sm font-medium text-slate-700 cursor-pointer" }, "Method 2 \u2014 Auto-send (self-hosted only)"), /* @__PURE__ */ React.createElement("p", { className: "text-[12px] text-amber-700 bg-amber-50 border border-amber-200 rounded-lg p-2 my-2" }, `The "Back up now" button below sends data straight to the sheet, but it only works when this console is hosted as a normal web page. Inside Claude it's blocked by the sandbox \u2014 that's the "could not reach the endpoint" message. Use Method 1 here.`), /* @__PURE__ */ React.createElement("ol", { className: "text-[12px] text-slate-600 list-decimal ml-4 space-y-1 mb-3" }, /* @__PURE__ */ React.createElement("li", null, "Open the sheet \u2192 ", /* @__PURE__ */ React.createElement("b", null, "Extensions \u2192 Apps Script"), ". Replace everything with the script below, set your own ", /* @__PURE__ */ React.createElement("code", { className: "bg-slate-100 px-1 rounded" }, "SECRET"), ", and ", /* @__PURE__ */ React.createElement("b", null, "Save"), "."), /* @__PURE__ */ React.createElement("li", null, /* @__PURE__ */ React.createElement("b", null, "Deploy \u2192 New deployment \u2192 Web app"), ". Execute as ", /* @__PURE__ */ React.createElement("b", null, "Me"), ", access ", /* @__PURE__ */ React.createElement("b", null, "Anyone"), ", authorise. Paste the ", /* @__PURE__ */ React.createElement("b", null, "Web app URL"), " below with the same secret."), /* @__PURE__ */ React.createElement("li", null, /* @__PURE__ */ React.createElement("b", null, "If only the header appears and no data:"), " you almost certainly edited the script without re-publishing. Go to ", /* @__PURE__ */ React.createElement("b", null, "Deploy \u2192 Manage deployments \u2192 \u270F\uFE0F Edit \u2192 Version: New version \u2192 Deploy"), ". Editing the code alone does ", /* @__PURE__ */ React.createElement("b", null, "not"), " update the live web app \u2014 it keeps running the old version."), /* @__PURE__ */ React.createElement("li", null, /* @__PURE__ */ React.createElement("b", null, "Test it:"), ' open the Web app URL in a browser tab. You should see "endpoint is live". The data lands in a tab named ', /* @__PURE__ */ React.createElement("b", null, "Holdings"), ' (created automatically) \u2014 check there. After a backup the script replies "wrote N data rows".'), /* @__PURE__ */ React.createElement("li", null, /* @__PURE__ */ React.createElement("b", null, "Live current prices:"), " the same web app also feeds the portfolio. Keep a tab named ", /* @__PURE__ */ React.createElement("b", null, "Sheet1"), " with a column for the ", /* @__PURE__ */ React.createElement("b", null, "symbol"), " (e.g. CARRARO) and one for the ", /* @__PURE__ */ React.createElement("b", null, "current price"), ' (header containing "current", "price", "LTP" or "close"). The report pulls these every couple of minutes, so Current price, Value and P/L stay live. After editing the script you must ', /* @__PURE__ */ React.createElement("b", null, "re-deploy a new version"), " for this to work."), /* @__PURE__ */ React.createElement("li", null, /* @__PURE__ */ React.createElement("b", null, "Cash & account type:"), " keep a tab named ", /* @__PURE__ */ React.createElement("b", null, "Cash"), " with the ", /* @__PURE__ */ React.createElement("b", null, "client name"), " in column 1 and the cash balance in column 2. Optionally add the ", /* @__PURE__ */ React.createElement("b", null, "client code"), " in column 3 (used in preference to the name when present) and the ", /* @__PURE__ */ React.createElement("b", null, "account type"), " (NRE / NRO / Resident Indian) in column 4. Cash, account type and a per-client ", /* @__PURE__ */ React.createElement("b", null, "Total portfolio"), " (holdings + cash) then appear in the report, with an account-type filter and stock weightages.")), /* @__PURE__ */ React.createElement("div", { className: "relative mb-3" }, /* @__PURE__ */ React.createElement("pre", { className: "whitespace-pre-wrap text-[11px] font-mono bg-slate-900 text-slate-100 rounded-lg p-3 pr-14 max-h-52 overflow-y-auto" }, APPS_SCRIPT), /* @__PURE__ */ React.createElement(
+  ), /* @__PURE__ */ React.createElement("div", { className: "text-[11px] text-slate-400 mt-1" }, ["name", "symbol", "company", "reportLink", "advisorName", "sebiRegNo"].map((p) => /* @__PURE__ */ React.createElement("code", { key: p, className: "bg-slate-100 rounded px-1 mr-1" }, `{${p}}`))), /* @__PURE__ */ React.createElement("button", { onClick: saveAdvice, className: "mt-3 bg-indigo-600 hover:bg-indigo-700 text-white text-sm px-4 py-2 rounded-lg" }, "Save advice templates")), /* @__PURE__ */ React.createElement(Card, { title: "Order-link gateway (execute links)", icon: Share2 }, /* @__PURE__ */ React.createElement("p", { className: "text-xs text-slate-500 mb-3" }, "Generates the one-click execute link used in Advice orders. Each link is gated to the client's WhatsApp number — it only opens for that number, and re-sending the same order reuses the same link rather than creating a duplicate. The Gateway itself doesn't accept calls straight from a browser (no CORS headers), so this needs a small local proxy running — see ", /* @__PURE__ */ React.createElement("code", { className: "bg-slate-100 px-1 rounded" }, "order-link-proxy/"), " in the repo for setup. ", /* @__PURE__ */ React.createElement("b", null, "The Gateway credentials live in that proxy's own .env, not in this browser.")), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("label", { className: "text-[11px] text-slate-500 block mb-1" }, "Proxy URL"), /* @__PURE__ */ React.createElement("input", { value: gwProxyUrl, onChange: (e) => setGwProxyUrl(e.target.value), placeholder: "http://localhost:8787", className: "w-full px-3 py-2 text-sm border border-slate-300 rounded-lg" })), /* @__PURE__ */ React.createElement("button", { onClick: saveGateway, className: "mt-3 bg-indigo-600 hover:bg-indigo-700 text-white text-sm px-4 py-2 rounded-lg" }, "Save gateway settings")), /* @__PURE__ */ React.createElement(Card, { title: "Google Sheet backup", icon: FileSpreadsheet }, /* @__PURE__ */ React.createElement("p", { className: "text-xs text-slate-500 mb-3" }, "Mirror the holdings into your sheet ", /* @__PURE__ */ React.createElement("b", null, "ADVISORY CLIENT DATA"), ". Two ways \u2014 the first always works."), /* @__PURE__ */ React.createElement("div", { className: "rounded-lg border border-emerald-200 bg-emerald-50/50 p-3 mb-4" }, /* @__PURE__ */ React.createElement("div", { className: "text-sm font-medium text-emerald-800 mb-1" }, "Method 1 \u2014 Copy & paste (recommended)"), /* @__PURE__ */ React.createElement("p", { className: "text-[12px] text-slate-600 mb-2" }, "Open the sheet \u2192 click cell ", /* @__PURE__ */ React.createElement("b", null, "A1"), " \u2192 paste. It fills in as columns."), /* @__PURE__ */ React.createElement("div", { className: "flex gap-2" }, /* @__PURE__ */ React.createElement("button", { onClick: copyForSheet, className: "bg-emerald-600 hover:bg-emerald-700 text-white text-sm px-4 py-2 rounded-lg flex items-center gap-1.5" }, /* @__PURE__ */ React.createElement(Download, { size: 15 }), " Copy rows for Google Sheet"), /* @__PURE__ */ React.createElement("button", { onClick: exportCsv, className: "text-sm text-emerald-700 px-3 py-2 rounded-lg border border-emerald-200 hover:bg-emerald-50" }, "Or download CSV"))), /* @__PURE__ */ React.createElement("details", { className: "rounded-lg border border-slate-200 p-3" }, /* @__PURE__ */ React.createElement("summary", { className: "text-sm font-medium text-slate-700 cursor-pointer" }, "Method 2 \u2014 Auto-send (self-hosted only)"), /* @__PURE__ */ React.createElement("p", { className: "text-[12px] text-amber-700 bg-amber-50 border border-amber-200 rounded-lg p-2 my-2" }, `The "Back up now" button below sends data straight to the sheet, but it only works when this console is hosted as a normal web page. Inside Claude it's blocked by the sandbox \u2014 that's the "could not reach the endpoint" message. Use Method 1 here.`), /* @__PURE__ */ React.createElement("ol", { className: "text-[12px] text-slate-600 list-decimal ml-4 space-y-1 mb-3" }, /* @__PURE__ */ React.createElement("li", null, "Open the sheet \u2192 ", /* @__PURE__ */ React.createElement("b", null, "Extensions \u2192 Apps Script"), ". Replace everything with the script below, set your own ", /* @__PURE__ */ React.createElement("code", { className: "bg-slate-100 px-1 rounded" }, "SECRET"), ", and ", /* @__PURE__ */ React.createElement("b", null, "Save"), "."), /* @__PURE__ */ React.createElement("li", null, /* @__PURE__ */ React.createElement("b", null, "Deploy \u2192 New deployment \u2192 Web app"), ". Execute as ", /* @__PURE__ */ React.createElement("b", null, "Me"), ", access ", /* @__PURE__ */ React.createElement("b", null, "Anyone"), ", authorise. Paste the ", /* @__PURE__ */ React.createElement("b", null, "Web app URL"), " below with the same secret."), /* @__PURE__ */ React.createElement("li", null, /* @__PURE__ */ React.createElement("b", null, "If only the header appears and no data:"), " you almost certainly edited the script without re-publishing. Go to ", /* @__PURE__ */ React.createElement("b", null, "Deploy \u2192 Manage deployments \u2192 \u270F\uFE0F Edit \u2192 Version: New version \u2192 Deploy"), ". Editing the code alone does ", /* @__PURE__ */ React.createElement("b", null, "not"), " update the live web app \u2014 it keeps running the old version."), /* @__PURE__ */ React.createElement("li", null, /* @__PURE__ */ React.createElement("b", null, "Test it:"), ' open the Web app URL in a browser tab. You should see "endpoint is live". The data lands in a tab named ', /* @__PURE__ */ React.createElement("b", null, "Holdings"), ' (created automatically) \u2014 check there. After a backup the script replies "wrote N data rows".'), /* @__PURE__ */ React.createElement("li", null, /* @__PURE__ */ React.createElement("b", null, "Live current prices:"), " the same web app also feeds the portfolio. Keep a tab named ", /* @__PURE__ */ React.createElement("b", null, "Sheet1"), " with a column for the ", /* @__PURE__ */ React.createElement("b", null, "symbol"), " (e.g. CARRARO) and one for the ", /* @__PURE__ */ React.createElement("b", null, "current price"), ' (header containing "current", "price", "LTP" or "close"). The report pulls these every couple of minutes, so Current price, Value and P/L stay live. After editing the script you must ', /* @__PURE__ */ React.createElement("b", null, "re-deploy a new version"), " for this to work."), /* @__PURE__ */ React.createElement("li", null, /* @__PURE__ */ React.createElement("b", null, "Cash & account type:"), " keep a tab named ", /* @__PURE__ */ React.createElement("b", null, "Cash"), " with the ", /* @__PURE__ */ React.createElement("b", null, "client name"), " in column 1 and the cash balance in column 2. Optionally add the ", /* @__PURE__ */ React.createElement("b", null, "client code"), " in column 3 (used in preference to the name when present) and the ", /* @__PURE__ */ React.createElement("b", null, "account type"), " (NRE / NRO / Resident Indian) in column 4. Cash, account type and a per-client ", /* @__PURE__ */ React.createElement("b", null, "Total portfolio"), " (holdings + cash) then appear in the report, with an account-type filter and stock weightages.")), /* @__PURE__ */ React.createElement("div", { className: "relative mb-3" }, /* @__PURE__ */ React.createElement("pre", { className: "whitespace-pre-wrap text-[11px] font-mono bg-slate-900 text-slate-100 rounded-lg p-3 pr-14 max-h-52 overflow-y-auto" }, APPS_SCRIPT), /* @__PURE__ */ React.createElement(
     "button",
     {
       onClick: () => {

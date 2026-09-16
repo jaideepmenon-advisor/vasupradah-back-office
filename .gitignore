@@ -5,3 +5,8 @@
 # OS / editor
 .DS_Store
 *.swp
+
+# order-link-proxy (Python)
+order-link-proxy/.env
+order-link-proxy/__pycache__/
+order-link-proxy/.venv/
