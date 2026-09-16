@@ -3805,20 +3805,25 @@ function AdviceOrders({ db, commit, showToast }) {
   const ensureGatewayLinks = async (us) => {
     const jobs = [];
     for (const u of us || []) {
-      if (!waNumber(u.whatsapp)) continue;
+      const hasPhone = !!waNumber(u.whatsapp);
       for (const l of u.lines) {
         const key = gwKey(u, l);
         if (gwLinkRef.current[key] != null) continue;
+        if (!hasPhone) {
+          gwLinkRef.current[key] = { url: "", error: "no WhatsApp number on file for this client" };
+          continue;
+        }
         jobs.push((async () => {
           const r = await gwCreateOrderLink(db, { code: u.code, phone: u.whatsapp, sym: l.sym || l.stock, qty: l.qty, side: l.side });
-          gwLinkRef.current[key] = r.ok ? r.url : "";
+          gwLinkRef.current[key] = r.ok ? { url: r.url } : { url: "", error: r.error };
           if (!r.ok) console.error("Order link failed for", u.code, l.sym || l.stock, r.error);
         })());
       }
     }
     if (jobs.length) await Promise.all(jobs);
   };
-  const gwLinkFor = (unit, l) => gwLinkRef.current[gwKey(unit, l)] || "";
+  const gwLinkFor = (unit, l) => (gwLinkRef.current[gwKey(unit, l)] || {}).url || "";
+  const gwLinkErrorFor = (unit, l) => (gwLinkRef.current[gwKey(unit, l)] || {}).error || "";
   const sym = String(stock || "").trim().toUpperCase();
   const price = priceOf(sym);
   const stockUniverse = useMemo(() => {
@@ -3986,6 +3991,10 @@ function AdviceOrders({ db, commit, showToast }) {
       if (channel === "whatsapp") {
         const link = gwLinkFor(unit, l);
         if (link) L.push(`Click Here To Execute the Order: ${link}`, "");
+        else {
+          const err = gwLinkErrorFor(unit, l);
+          L.push(`Execute link unavailable${err ? ` (${err})` : ""} — place the order through your broker.`, "");
+        }
       }
     });
     L.push(
@@ -3998,16 +4007,23 @@ function AdviceOrders({ db, commit, showToast }) {
   const buildExecNote = (unit) => {
     const L = [`Dear ${unit.name},`, ""];
     const many = unit.lines.length > 1;
+    let anyLink = false;
     unit.lines.forEach((l, i) => {
       L.push(`${many ? i + 1 + ". " : ""}${lineSentence(l)}`);
       if ((l.rationale || "").trim()) L.push(`   Rationale: ${l.rationale.trim()}`);
       if ((l.suitability || "").trim()) L.push(`   Suitability: ${l.suitability.trim()}`);
       if ((l.report || "").trim()) L.push(`   Research report: ${l.report.trim()}`);
       const link = gwLinkFor(unit, l);
-      if (link) L.push(`   Click Here To Execute the Order: ${link}`);
+      if (link) {
+        L.push(`   Click Here To Execute the Order: ${link}`);
+        anyLink = true;
+      } else {
+        const err = gwLinkErrorFor(unit, l);
+        L.push(`   Execute link unavailable${err ? ` (${err})` : ""}.`);
+      }
       L.push("");
     });
-    L.push("How to act: use the execute link above to place the order in one click, or place it through your broker.", "");
+    L.push(anyLink ? "How to act: use the execute link above to place the order in one click, or place it through your broker." : "How to act: place the order through your broker.", "");
     L.push(
       `${db.advisorName || "Jaideep Menon"}, Vasupradah Investment Advisory`,
       `SEBI RIA Reg. No. ${db.sebiRegNo || ""}`,
