@@ -1,16 +1,58 @@
 // Vasupradah backend — Google Apps Script Web App.
 //
-// This file is extracted from the APPS_SCRIPT constant inside
-// console/VasupradahClientConsole.html (Settings tab -> "Copy backend code").
-// It is kept here so the backend can be read, diffed and reviewed like normal
-// source code. The console still carries its own embedded copy for the
-// in-app "copy backend code" button — if you edit the logic here, copy the
-// change back into that constant too (and vice versa) so the two do not
-// drift apart.
-//
-// Deploy: paste this file's contents into the Apps Script editor bound to
-// the "ADVISORY CLIENT DATA" Google Sheet (Extensions -> Apps Script), run
-// `setup` once to authorise, then Deploy -> Manage deployments -> New version.
+// This file mirrors the Apps Script project's Code.gs. The console
+// (console/VasupradahClientConsole.html) also carries its own embedded copy
+// of the backend under its APPS_SCRIPT constant (Settings tab -> "Copy
+// backend code") for in-app copy-paste convenience. The two can drift when
+// either is edited alone — keep them in sync by hand until a build step
+// wires them together.
+
+/************************************************************************
+ *  Vasupradah Investment Advisory - Client Console  ·  Google Apps Script
+ *  Principal Officer: Jaideep Menon  ·  SEBI Registered Investment Adviser
+ *
+ *  ====================  SETUP ORDER  (do not skip / reorder)  ==========
+ *
+ *  0. THERE MUST BE ONLY ONE SCRIPT FILE.
+ *     If the left panel shows 'Untitled.gs' as well as 'Code.gs', delete
+ *     Untitled.gs (3 dots -> Delete). Two files = two doGet/doPost = errors.
+ *
+ *  1. Paste this ENTIRE file over everything in Code.gs. Press SAVE.
+ *
+ *  2. Function dropdown (top bar) -> choose 'grantPermissions' -> Run.
+ *     Google asks for permission -> Advanced -> Go to ... -> Allow.
+ *     This grants everything at once and needs NO token to be set yet.
+ *
+ *     If you get "An unknown error has occurred": that is the editor, not
+ *     your code. It is nearly always caused by being signed in to MORE THAN
+ *     ONE Google account. Fix: open the sheet in an Incognito window signed
+ *     in ONLY as the account that owns the sheet, then retry.
+ *
+ *  3. Set the GridKey token. Either:
+ *       (a) Project Settings (gear) -> Script properties -> Add:
+ *             GK_TOKEN       = <your token>
+ *             GK_TRADES_URL  = https://django-backend-prod.gridkey.in/transaction/export_csv/?show_zero_holding=false&filter=%7B%7D
+ *             GK_LEDGER_URL  = <paste when you have it>
+ *       (b) or run 'setGridkeyTokenManually' after pasting values into it.
+ *       (c) or, once step 4 is done, from the app: Settings -> GridKey auto-sync.
+ *
+ *  4. Deploy -> Manage deployments -> pencil -> Version: NEW VERSION -> Deploy.
+ *     ("Who has access" must stay: Anyone.)
+ *
+ *  5. Function dropdown -> 'authorizeGridkey' -> Run.  This does a REAL fetch
+ *     and should log: SUCCESS ... HTTP 200 ... about 101570 lines.
+ *
+ *  6. Function dropdown -> 'setupGridkeyTriggers' -> Run ONCE.
+ *     Installs the 6:00 am and 6:00 pm daily sync. Do this LAST: triggers
+ *     remember the permissions they had when created.
+ *
+ *  7. Project Settings -> timezone must be (GMT+05:30) India.
+ *
+ *  =====================================================================
+ *  Endpoints:
+ *    GET  ?prices=1  ?alerts=1  ?trades=1  ?holdings=1  ?gridkey=1
+ *    POST type=holdings (default) | trades | gridkey_config | gridkey_run
+ ************************************************************************/
 
 // ============================================================================
 //  Vasupradah backend. FIRST TIME: pick "setup" in the function dropdown above
@@ -29,7 +71,7 @@ function setup() {
 
 function doGet(e) {
   var p = (e && e.parameter) || {};
-  if (!p.prices && !p.alerts && !p.trades && !p.holdings && !p.gridkey && !p.greeting_status && !p.advice_alerts && !p.advice_trace && !p.ping && !p.pipeline && !p.baskets && !p.manual_trades && !p.client_details && !p.shorten) {
+  if (!p.prices && !p.alerts && !p.trades && !p.holdings && !p.gridkey && !p.greeting_status && !p.advice_alerts && !p.advice_trace && !p.ping && !p.pipeline && !p.baskets && !p.manual_trades && !p.client_details && !p.shorten && !p.dedupe && !p.gk_probe) {
     return ContentService.createTextOutput("Vasupradah backup endpoint is live (use POST from the console).");
   }
 
@@ -39,6 +81,133 @@ function doGet(e) {
     var pq = 0; try { pq = MailApp.getRemainingDailyQuota(); } catch (ePq) { pq = -1; }
     var pu = ""; try { pu = Session.getEffectiveUser().getEmail(); } catch (ePu) { pu = ""; }
     return ContentService.createTextOutput(JSON.stringify({ ok: true, version: "2026-09-05-pipeline", canSendEmail: pq >= 0, quota: pq, user: pu, tz: Session.getScriptTimeZone(), shortener: String(gkProps_().getProperty("SHORT_PROVIDER") || "isgd") })).setMimeType(ContentService.MimeType.JSON);
+  }
+
+  // Diagnose why a trade is not showing: what does the export actually return, what did the
+  // last sync do, and how big is the tab (a bloated sheet can hit Google's cell ceiling).
+  if (p.gk_probe) {
+    if (String(p.token || "") !== (PropertiesService.getScriptProperties().getProperty("SECRET") || "820082")) {
+      return ContentService.createTextOutput(JSON.stringify({ ok: false, error: "bad token" })).setMimeType(ContentService.MimeType.JSON);
+    }
+    var pr = gkProps_();
+    var which = String(p.gk_probe) === "ledger" ? "ledger" : "trades";
+    var purl = String(which === "ledger" ? (pr.getProperty("GK_LEDGER_URL") || "") : (pr.getProperty("GK_TRADES_URL") || "")).trim();
+    var sheetName = which === "ledger" ? GK_LEDGER_SHEET : GK_TRADES_SHEET;
+    var pss = SpreadsheetApp.getActiveSpreadsheet();
+    var psh = pss.getSheetByName(sheetName);
+    var out = {
+      ok: true, which: which, hasUrl: !!purl,
+      lastSync: pr.getProperty("GK_LAST_SYNC") || "", lastResult: pr.getProperty("GK_LAST_RESULT") || "",
+      sheetRows: psh ? Math.max(0, psh.getLastRow() - 1) : 0,
+      sheetCols: psh ? psh.getLastColumn() : 0,
+      sheetCells: psh ? psh.getLastRow() * psh.getLastColumn() : 0
+    };
+    if (!purl) { out.error = "no export URL saved for " + which; return ContentService.createTextOutput(JSON.stringify(out)).setMimeType(ContentService.MimeType.JSON); }
+    try {
+      var parsedP = gkParseCsv_(sheetName, gkFetch_(purl));
+      var prows = parsedP.rows;
+      out.exportRows = prows.length - 1;
+      out.header = prows[0];
+      // find the column that looks most like a date and summarise its range
+      var bestCol = -1, bestHits = 0, ci, ri, hits, canon;
+      for (ci = 0; ci < parsedP.W; ci++) {
+        hits = 0;
+        for (ri = 1; ri < Math.min(prows.length, 60); ri++) if (gkDatePart_(String(prows[ri][ci] || ""))) hits++;
+        if (hits > bestHits) { bestHits = hits; bestCol = ci; }
+      }
+      if (bestCol >= 0) {
+        var minD = "", maxD = "", found = false, want = String(p.on || "");
+        var wantCanon = want ? gkDatePart_(want) : "";
+        for (ri = 1; ri < prows.length; ri++) {
+          canon = gkDatePart_(String(prows[ri][bestCol] || ""));
+          if (!canon) continue;
+          if (!minD || canon < minD) minD = canon;
+          if (!maxD || canon > maxD) maxD = canon;
+          if (wantCanon && canon === wantCanon) found = true;
+        }
+        out.dateColumn = prows[0][bestCol];
+        out.earliest = minD; out.latest = maxD;
+        if (wantCanon) { out.askedFor = wantCanon; out.presentInExport = found; }
+      }
+    } catch (eP) { out.fetchError = String(eP.message || eP); }
+    // Stock-level check: where does a given symbol actually appear?
+    if (p.sym) {
+      var wantSym = String(p.sym).trim().toUpperCase();
+      out.symbol = wantSym;
+      try {
+        var nts = gkNormalizedTrades_(), hits = 0, lastD = "";
+        for (var si = 0; si < nts.length; si++) {
+          if (String(nts[si][3]).trim().toUpperCase() !== wantSym) continue;
+          hits++;
+          if (String(nts[si][0]) > lastD) lastD = String(nts[si][0]);
+        }
+        out.tradesForSymbol = hits;
+        out.lastTradeForSymbol = lastD;
+      } catch (eS) { out.symbolTradeError = String(eS.message || eS); }
+      // and is it a live position in the holdings the console reads?
+      try {
+        var hs = SpreadsheetApp.getActiveSpreadsheet().getSheetByName("Holdings");
+        var hcount = 0;
+        if (hs && hs.getLastRow() > 1) {
+          var hv = hs.getRange(2, 1, hs.getLastRow() - 1, hs.getLastColumn()).getValues();
+          for (var hi = 0; hi < hv.length; hi++) {
+            for (var hj = 0; hj < hv[hi].length; hj++) {
+              if (String(hv[hi][hj]).trim().toUpperCase() === wantSym) { hcount++; break; }
+            }
+          }
+        }
+        out.holdingRowsForSymbol = hcount;
+      } catch (eH) { out.symbolHoldingError = String(eH.message || eH); }
+      // and does the broker's combined-holdings export still carry it?
+      try {
+        var curl = String(gkProps_().getProperty("GK_COMBINED_URL") || gkProps_().getProperty("GK_HOLDINGS_URL") || "").trim();
+        if (curl) {
+          var cp = gkParseCsv_("CombinedHoldings", gkFetch_(curl));
+          var cHits = 0;
+          for (var ci2 = 1; ci2 < cp.rows.length; ci2++) {
+            for (var cj2 = 0; cj2 < cp.rows[ci2].length; cj2++) {
+              if (String(cp.rows[ci2][cj2]).trim().toUpperCase() === wantSym) { cHits++; break; }
+            }
+          }
+          out.combinedRowsForSymbol = cHits;
+        }
+      } catch (eC) { out.symbolCombinedError = String(eC.message || eC); }
+    }
+
+    // Sheet-side checks run regardless of whether the export can be fetched, because
+    // "does the console's feed see this date?" is the question that actually matters.
+    if (psh && psh.getLastRow() > 1 && p.on) {
+      var wc2 = gkDatePart_(String(p.on)), inSheet2 = 0, rj, cj;
+      var sv2 = psh.getRange(2, 1, psh.getLastRow() - 1, psh.getLastColumn()).getValues();
+      for (rj = 0; rj < sv2.length; rj++) {
+        for (cj = 0; cj < sv2[rj].length; cj++) {
+          var cc2 = gkCanon_(sv2[rj][cj]);
+          if (cc2 && cc2.slice(0, 10) === wc2) { inSheet2++; break; }
+        }
+      }
+      out.rowsInSheetOnThatDate = inSheet2;
+      try {
+        var nt2 = gkNormalizedTrades_(), nOn2 = 0;
+        for (rj = 0; rj < nt2.length; rj++) if (String(nt2[rj][0]).slice(0, 10) === wc2) nOn2++;
+        out.normalisedTotal = nt2.length;
+        out.normalisedOnThatDate = nOn2;
+      } catch (eN2) { out.normaliseError = String(eN2.message || eN2); }
+    }
+    return ContentService.createTextOutput(JSON.stringify(out)).setMimeType(ContentService.MimeType.JSON);
+  }
+
+  // Clean rows duplicated by the earlier comparison bug. Token-guarded because it rewrites a tab.
+  if (p.dedupe) {
+    if (String(p.token || "") !== (PropertiesService.getScriptProperties().getProperty("SECRET") || "820082")) {
+      return ContentService.createTextOutput(JSON.stringify({ ok: false, error: "bad token" })).setMimeType(ContentService.MimeType.JSON);
+    }
+    var names = String(p.dedupe) === "1" ? ["Trades", "Ledger"] : String(p.dedupe).split(",");
+    var out = [];
+    for (var di = 0; di < names.length; di++) {
+      try { out.push(gkDedupeSheet_(String(names[di]).trim())); }
+      catch (eD) { out.push({ sheet: names[di], error: String(eD.message || eD) }); }
+    }
+    return ContentService.createTextOutput(JSON.stringify({ ok: true, results: out })).setMimeType(ContentService.MimeType.JSON);
   }
 
   // Shorten an execute link (used for WhatsApp, where a URL cannot be hidden behind text).
@@ -320,7 +489,30 @@ function doGet(e) {
   // export (29 columns: Portfolio code, Nse code, Bill amount, ...). We detect which and
   // normalise here so the payload stays small and the app doesn't care which one it is.
   var tradeSheet = ss.getSheetByName("Trades");
-  if (tradeSheet) { out.trades = gkNormalizedTrades_(); }
+  if (tradeSheet) {
+    var allTrades = gkNormalizedTrades_();
+    // The full book is ~100k trades, which is far too large to ship in one response — the
+    // request stalls and the console ends up showing stale data. Allow the caller to narrow
+    // it: ?code= (one client), ?sym= (one stock), ?since=YYYY-MM-DD, ?limit=.
+    var fCode = String(p.code || "").trim();
+    var fSym = String(p.sym || "").trim().toUpperCase();
+    var fSince = String(p.since || "").trim();
+    var lim = parseInt(p.limit || "0", 10);
+    if (fCode || fSym || fSince) {
+      var picked = [];
+      for (var ti = 0; ti < allTrades.length; ti++) {
+        var tr = allTrades[ti];
+        if (fCode && String(tr[1]).trim() !== fCode) continue;
+        if (fSym && String(tr[3]).trim().toUpperCase() !== fSym) continue;
+        if (fSince && String(tr[0]) < fSince) continue;
+        picked.push(tr);
+      }
+      allTrades = picked;
+    }
+    out.tradesTotal = allTrades.length;
+    if (lim > 0 && allTrades.length > lim) allTrades = allTrades.slice(allTrades.length - lim);
+    out.trades = allTrades;
+  }
 
   // Holdings (team sync): the client/holdings backup table, returned as row arrays (header skipped)
   var holdSheet = ss.getSheetByName("Holdings");
@@ -434,7 +626,7 @@ function doPost(e) {
     if (!bsh2) { bsh2 = bss2.insertSheet("Baskets"); bsh2.getRange(1, 1, 1, bHdr.length).setValues([bHdr]); }
     if (bsh2.getLastRow() < 1) bsh2.getRange(1, 1, 1, bHdr.length).setValues([bHdr]);
     var bAll = bsh2.getLastRow() > 1 ? bsh2.getRange(2, 1, bsh2.getLastRow() - 1, bHdr.length).getValues() : [];
-    var bKey = function (c, sym) { return String(c).trim().toLowerCase() + "" + String(sym).trim().toUpperCase(); };
+    var bKey = function (c, sym) { return String(c).trim().toLowerCase() + "\u0001" + String(sym).trim().toUpperCase(); };
 
     if (body.action === "delete") {
       var dk = bKey(body.category, body.symbol);
@@ -816,7 +1008,7 @@ function gkFetch_(url) {
 
 // Parse a GridKey CSV payload into padded rows (shared by the merge and replace writers).
 function gkParseCsv_(sheetName, csvText) {
-  var body = String(csvText || "").replace(/^﻿/, "").trim();
+  var body = String(csvText || "").replace(/^\uFEFF/, "").trim();
   if (!body) throw new Error("Empty response from GridKey for " + sheetName + ".");
   if (body.charAt(0) === "{" || body.charAt(0) === "[") {
     var j;
@@ -837,54 +1029,151 @@ function gkParseCsv_(sheetName, csvText) {
   return { rows: rows, W: W };
 }
 
-// One comparable signature per row, so a row already in the sheet is never added twice.
-// Dates are normalised because Sheets turns a date string into a Date object on write.
-function gkRowSig_(row) {
-  var tz = Session.getScriptTimeZone(), parts = [];
-  for (var i = 0; i < row.length; i++) {
-    var v = row[i];
-    if (Object.prototype.toString.call(v) === "[object Date]") v = Utilities.formatDate(v, tz, "yyyy-MM-dd HH:mm:ss");
-    else if (typeof v === "number") v = String(v);
-    parts.push(String(v == null ? "" : v).trim().toLowerCase());
+// Values must be compared in a canonical form, because Sheets silently converts what we write:
+// the text 2026-07-14 comes back as a Date, and 9450 as a number. Comparing the raw values made
+// every row look new, so each sync re-appended the whole export. Written without regular
+// expressions, since this file lives inside a template literal where escapes do not survive.
+function gkNumStr_(n) {
+  if (!isFinite(n)) return "";
+  var s = String(n);
+  if (s.indexOf("e") >= 0 || s.indexOf("E") >= 0) s = n.toFixed(6);
+  return s;
+}
+function gkDatePart_(s) {
+  var sep = "";
+  if (s.indexOf("-") >= 0) sep = "-"; else if (s.indexOf("/") >= 0) sep = "/"; else return "";
+  var head = s.split(" ")[0];
+  var bits = head.split(sep);
+  if (bits.length !== 3) return "";
+  var a = bits[0], b = bits[1], c = bits[2], i, ch;
+  for (i = 0; i < head.length; i++) { ch = head.charAt(i); if (ch !== sep && (ch < "0" || ch > "9")) return ""; }
+  var y, m, d;
+  if (a.length === 4) { y = a; m = b; d = c; }
+  else if (c.length === 4) { y = c; m = b; d = a; }
+  else return "";
+  if (m.length < 2) m = "0" + m;
+  if (d.length < 2) d = "0" + d;
+  return y + "-" + m + "-" + d;
+}
+function gkCanon_(v) {
+  if (v == null) return "";
+  if (Object.prototype.toString.call(v) === "[object Date]") {
+    var tz = Session.getScriptTimeZone();
+    var withTime = v.getHours() || v.getMinutes() || v.getSeconds();
+    return Utilities.formatDate(v, tz, withTime ? "yyyy-MM-dd HH:mm" : "yyyy-MM-dd");
   }
-  return parts.join("").replace(/()+$/, "");
+  if (typeof v === "number") return gkNumStr_(v);
+  if (typeof v === "boolean") return v ? "true" : "false";
+  var s = String(v);
+  var t = "", k;
+  for (k = 0; k < s.length; k++) { var c0 = s.charAt(k); if (c0 !== " " && c0 !== String.fromCharCode(9)) break; }
+  t = s.slice(k);
+  while (t.length && (t.charAt(t.length - 1) === " " || t.charAt(t.length - 1) === String.fromCharCode(9))) t = t.slice(0, -1);
+  if (!t) return "";
+  // number written as text, possibly with thousands separators or a currency prefix
+  var cleaned = "", digits = 0, dots = 0, okNum = true, i, ch;
+  for (i = 0; i < t.length; i++) {
+    ch = t.charAt(i);
+    if (ch >= "0" && ch <= "9") { digits++; cleaned += ch; }
+    else if (ch === ".") { dots++; cleaned += ch; }
+    else if (ch === "-" && i === 0) { cleaned += ch; }
+    else if (ch === "," || ch === " ") { /* separator */ }
+    else if (i === 0 && (ch === String.fromCharCode(8377) || ch === "$")) { /* currency */ }
+    else { okNum = false; break; }
+  }
+  if (okNum && digits > 0 && dots <= 1) {
+    var n = Number(cleaned);
+    if (!isNaN(n)) return gkNumStr_(n);
+  }
+  var dp = gkDatePart_(t);
+  if (dp) {
+    var rest = t.split(" ")[1];
+    return rest ? dp + " " + rest.slice(0, 5) : dp;
+  }
+  return t.toLowerCase();
+}
+// One comparable signature per row, so a row already in the sheet is never added twice.
+function gkRowSig_(row) {
+  var SEP = String.fromCharCode(1), parts = [], i;
+  for (i = 0; i < row.length; i++) parts.push(gkCanon_(row[i]));
+  while (parts.length && parts[parts.length - 1] === "") parts.pop();   // ignore trailing blanks
+  return parts.join(SEP);
 }
 
-// APPEND-ONLY writer: keeps every row already in the tab and adds only rows that aren't there.
-// Nothing is ever cleared, so a re-run, a partial export or a bad fetch cannot lose history.
+// Remove rows already duplicated by the old comparison. Keeps the FIRST copy of each row.
+function gkDedupeSheet_(name) {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sh = ss.getSheetByName(name);
+  if (!sh || sh.getLastRow() < 3) return { sheet: name, before: sh ? Math.max(0, sh.getLastRow() - 1) : 0, after: sh ? Math.max(0, sh.getLastRow() - 1) : 0, removed: 0 };
+  var w = sh.getLastColumn();
+  var vals = sh.getRange(1, 1, sh.getLastRow(), w).getValues();
+  var header = vals[0], seen = {}, kept = [], i, sig;
+  for (i = 1; i < vals.length; i++) {
+    sig = gkRowSig_(vals[i]);
+    if (!sig) continue;                 // drop fully blank rows
+    if (seen[sig]) continue;
+    seen[sig] = true;
+    kept.push(vals[i]);
+  }
+  var before = vals.length - 1, removed = before - kept.length;
+  if (removed > 0) {
+    sh.clearContents();
+    sh.getRange(1, 1, 1, w).setValues([header]);
+    var CH = 5000;
+    for (var st = 0; st < kept.length; st += CH) {
+      var block = kept.slice(st, st + CH);
+      sh.getRange(2 + st, 1, block.length, w).setValues(block);
+    }
+    SpreadsheetApp.flush();
+  }
+  return { sheet: name, before: before, after: kept.length, removed: removed };
+}
+
+// APPEND-ONLY writer. Compares by COUNT, not by presence: if the export lists a row three
+// times (a broker reporting one order as three identical fills) the tab must end up with three.
+// We append only the shortfall, so re-running the same export adds nothing while genuine repeat
+// trades are never swallowed.
 function gkMergeCsv_(sheetName, csvText) {
   var parsed = gkParseCsv_(sheetName, csvText);
   var rows = parsed.rows, W = parsed.W;
   var ss = SpreadsheetApp.getActiveSpreadsheet();
   var sh = ss.getSheetByName(sheetName) || ss.insertSheet(sheetName);
-  var had = sh.getLastRow();
-  if (had === 0) { sh.getRange(1, 1, 1, W).setValues([rows[0]]); had = 1; }
+  if (sh.getLastRow() === 0) sh.getRange(1, 1, 1, W).setValues([rows[0]]);
 
-  var existing = {}, exW = sh.getLastColumn();
+  var exW = Math.max(sh.getLastColumn(), W);
+  var have = {}, i, sig;
   if (sh.getLastRow() > 1) {
-    var ev = sh.getRange(2, 1, sh.getLastRow() - 1, exW).getValues();
-    for (var e = 0; e < ev.length; e++) existing[gkRowSig_(ev[e])] = true;
+    var ev = sh.getRange(2, 1, sh.getLastRow() - 1, sh.getLastColumn()).getValues();
+    for (i = 0; i < ev.length; i++) {
+      sig = gkRowSig_(ev[i]);
+      have[sig] = (have[sig] || 0) + 1;
+    }
   }
-  var fresh = [];
-  for (var i = 1; i < rows.length; i++) {
-    var sig = gkRowSig_(rows[i]);
-    if (existing[sig]) continue;
-    existing[sig] = true;
-    var row = rows[i].slice();
+  var want = {}, order = [];
+  for (i = 1; i < rows.length; i++) {
+    sig = gkRowSig_(rows[i]);
+    if (!sig) continue;
+    want[sig] = (want[sig] || 0) + 1;
+    order.push({ sig: sig, row: rows[i] });
+  }
+  var used = {}, fresh = [];
+  for (i = 0; i < order.length; i++) {
+    var sg = order[i].sig;
+    used[sg] = (used[sg] || 0) + 1;
+    if (used[sg] <= (have[sg] || 0)) continue;      // this copy is already in the sheet
+    var row = order[i].row.slice();
     while (row.length < exW) row.push("");
-    fresh.push(row.slice(0, Math.max(exW, W)));
+    fresh.push(row.slice(0, exW));
   }
   if (fresh.length) {
-    var WW = Math.max(exW, W);
-    for (var f = 0; f < fresh.length; f++) while (fresh[f].length < WW) fresh[f].push("");
     var CH = 5000;
     for (var st = 0; st < fresh.length; st += CH) {
       var block = fresh.slice(st, st + CH);
-      sh.getRange(sh.getLastRow() + 1, 1, block.length, WW).setValues(block);
+      sh.getRange(sh.getLastRow() + 1, 1, block.length, exW).setValues(block);
     }
   }
   SpreadsheetApp.flush();
-  return fresh.length; // NEW rows appended this run
+  return fresh.length;   // NEW rows appended this run
 }
 
 // Write a CSV payload to a tab, replacing whatever was there.
@@ -1497,3 +1786,4 @@ function authorizeGridkey() {
   Logger.log(msg);
   return msg;
 }
+

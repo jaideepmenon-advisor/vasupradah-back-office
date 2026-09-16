@@ -1587,7 +1587,7 @@ function setup() {
 
 function doGet(e) {
   var p = (e && e.parameter) || {};
-  if (!p.prices && !p.alerts && !p.trades && !p.holdings && !p.gridkey && !p.greeting_status && !p.advice_alerts && !p.advice_trace && !p.ping && !p.pipeline && !p.baskets && !p.manual_trades && !p.client_details && !p.shorten) {
+  if (!p.prices && !p.alerts && !p.trades && !p.holdings && !p.gridkey && !p.greeting_status && !p.advice_alerts && !p.advice_trace && !p.ping && !p.pipeline && !p.baskets && !p.manual_trades && !p.client_details && !p.shorten && !p.dedupe && !p.gk_probe) {
     return ContentService.createTextOutput("Vasupradah backup endpoint is live (use POST from the console).");
   }
 
@@ -1597,6 +1597,133 @@ function doGet(e) {
     var pq = 0; try { pq = MailApp.getRemainingDailyQuota(); } catch (ePq) { pq = -1; }
     var pu = ""; try { pu = Session.getEffectiveUser().getEmail(); } catch (ePu) { pu = ""; }
     return ContentService.createTextOutput(JSON.stringify({ ok: true, version: "2026-09-05-pipeline", canSendEmail: pq >= 0, quota: pq, user: pu, tz: Session.getScriptTimeZone(), shortener: String(gkProps_().getProperty("SHORT_PROVIDER") || "isgd") })).setMimeType(ContentService.MimeType.JSON);
+  }
+
+  // Diagnose why a trade is not showing: what does the export actually return, what did the
+  // last sync do, and how big is the tab (a bloated sheet can hit Google's cell ceiling).
+  if (p.gk_probe) {
+    if (String(p.token || "") !== (PropertiesService.getScriptProperties().getProperty("SECRET") || "820082")) {
+      return ContentService.createTextOutput(JSON.stringify({ ok: false, error: "bad token" })).setMimeType(ContentService.MimeType.JSON);
+    }
+    var pr = gkProps_();
+    var which = String(p.gk_probe) === "ledger" ? "ledger" : "trades";
+    var purl = String(which === "ledger" ? (pr.getProperty("GK_LEDGER_URL") || "") : (pr.getProperty("GK_TRADES_URL") || "")).trim();
+    var sheetName = which === "ledger" ? GK_LEDGER_SHEET : GK_TRADES_SHEET;
+    var pss = SpreadsheetApp.getActiveSpreadsheet();
+    var psh = pss.getSheetByName(sheetName);
+    var out = {
+      ok: true, which: which, hasUrl: !!purl,
+      lastSync: pr.getProperty("GK_LAST_SYNC") || "", lastResult: pr.getProperty("GK_LAST_RESULT") || "",
+      sheetRows: psh ? Math.max(0, psh.getLastRow() - 1) : 0,
+      sheetCols: psh ? psh.getLastColumn() : 0,
+      sheetCells: psh ? psh.getLastRow() * psh.getLastColumn() : 0
+    };
+    if (!purl) { out.error = "no export URL saved for " + which; return ContentService.createTextOutput(JSON.stringify(out)).setMimeType(ContentService.MimeType.JSON); }
+    try {
+      var parsedP = gkParseCsv_(sheetName, gkFetch_(purl));
+      var prows = parsedP.rows;
+      out.exportRows = prows.length - 1;
+      out.header = prows[0];
+      // find the column that looks most like a date and summarise its range
+      var bestCol = -1, bestHits = 0, ci, ri, hits, canon;
+      for (ci = 0; ci < parsedP.W; ci++) {
+        hits = 0;
+        for (ri = 1; ri < Math.min(prows.length, 60); ri++) if (gkDatePart_(String(prows[ri][ci] || ""))) hits++;
+        if (hits > bestHits) { bestHits = hits; bestCol = ci; }
+      }
+      if (bestCol >= 0) {
+        var minD = "", maxD = "", found = false, want = String(p.on || "");
+        var wantCanon = want ? gkDatePart_(want) : "";
+        for (ri = 1; ri < prows.length; ri++) {
+          canon = gkDatePart_(String(prows[ri][bestCol] || ""));
+          if (!canon) continue;
+          if (!minD || canon < minD) minD = canon;
+          if (!maxD || canon > maxD) maxD = canon;
+          if (wantCanon && canon === wantCanon) found = true;
+        }
+        out.dateColumn = prows[0][bestCol];
+        out.earliest = minD; out.latest = maxD;
+        if (wantCanon) { out.askedFor = wantCanon; out.presentInExport = found; }
+      }
+    } catch (eP) { out.fetchError = String(eP.message || eP); }
+    // Stock-level check: where does a given symbol actually appear?
+    if (p.sym) {
+      var wantSym = String(p.sym).trim().toUpperCase();
+      out.symbol = wantSym;
+      try {
+        var nts = gkNormalizedTrades_(), hits = 0, lastD = "";
+        for (var si = 0; si < nts.length; si++) {
+          if (String(nts[si][3]).trim().toUpperCase() !== wantSym) continue;
+          hits++;
+          if (String(nts[si][0]) > lastD) lastD = String(nts[si][0]);
+        }
+        out.tradesForSymbol = hits;
+        out.lastTradeForSymbol = lastD;
+      } catch (eS) { out.symbolTradeError = String(eS.message || eS); }
+      // and is it a live position in the holdings the console reads?
+      try {
+        var hs = SpreadsheetApp.getActiveSpreadsheet().getSheetByName("Holdings");
+        var hcount = 0;
+        if (hs && hs.getLastRow() > 1) {
+          var hv = hs.getRange(2, 1, hs.getLastRow() - 1, hs.getLastColumn()).getValues();
+          for (var hi = 0; hi < hv.length; hi++) {
+            for (var hj = 0; hj < hv[hi].length; hj++) {
+              if (String(hv[hi][hj]).trim().toUpperCase() === wantSym) { hcount++; break; }
+            }
+          }
+        }
+        out.holdingRowsForSymbol = hcount;
+      } catch (eH) { out.symbolHoldingError = String(eH.message || eH); }
+      // and does the broker's combined-holdings export still carry it?
+      try {
+        var curl = String(gkProps_().getProperty("GK_COMBINED_URL") || gkProps_().getProperty("GK_HOLDINGS_URL") || "").trim();
+        if (curl) {
+          var cp = gkParseCsv_("CombinedHoldings", gkFetch_(curl));
+          var cHits = 0;
+          for (var ci2 = 1; ci2 < cp.rows.length; ci2++) {
+            for (var cj2 = 0; cj2 < cp.rows[ci2].length; cj2++) {
+              if (String(cp.rows[ci2][cj2]).trim().toUpperCase() === wantSym) { cHits++; break; }
+            }
+          }
+          out.combinedRowsForSymbol = cHits;
+        }
+      } catch (eC) { out.symbolCombinedError = String(eC.message || eC); }
+    }
+
+    // Sheet-side checks run regardless of whether the export can be fetched, because
+    // "does the console's feed see this date?" is the question that actually matters.
+    if (psh && psh.getLastRow() > 1 && p.on) {
+      var wc2 = gkDatePart_(String(p.on)), inSheet2 = 0, rj, cj;
+      var sv2 = psh.getRange(2, 1, psh.getLastRow() - 1, psh.getLastColumn()).getValues();
+      for (rj = 0; rj < sv2.length; rj++) {
+        for (cj = 0; cj < sv2[rj].length; cj++) {
+          var cc2 = gkCanon_(sv2[rj][cj]);
+          if (cc2 && cc2.slice(0, 10) === wc2) { inSheet2++; break; }
+        }
+      }
+      out.rowsInSheetOnThatDate = inSheet2;
+      try {
+        var nt2 = gkNormalizedTrades_(), nOn2 = 0;
+        for (rj = 0; rj < nt2.length; rj++) if (String(nt2[rj][0]).slice(0, 10) === wc2) nOn2++;
+        out.normalisedTotal = nt2.length;
+        out.normalisedOnThatDate = nOn2;
+      } catch (eN2) { out.normaliseError = String(eN2.message || eN2); }
+    }
+    return ContentService.createTextOutput(JSON.stringify(out)).setMimeType(ContentService.MimeType.JSON);
+  }
+
+  // Clean rows duplicated by the earlier comparison bug. Token-guarded because it rewrites a tab.
+  if (p.dedupe) {
+    if (String(p.token || "") !== (PropertiesService.getScriptProperties().getProperty("SECRET") || "820082")) {
+      return ContentService.createTextOutput(JSON.stringify({ ok: false, error: "bad token" })).setMimeType(ContentService.MimeType.JSON);
+    }
+    var names = String(p.dedupe) === "1" ? ["Trades", "Ledger"] : String(p.dedupe).split(",");
+    var out = [];
+    for (var di = 0; di < names.length; di++) {
+      try { out.push(gkDedupeSheet_(String(names[di]).trim())); }
+      catch (eD) { out.push({ sheet: names[di], error: String(eD.message || eD) }); }
+    }
+    return ContentService.createTextOutput(JSON.stringify({ ok: true, results: out })).setMimeType(ContentService.MimeType.JSON);
   }
 
   // Shorten an execute link (used for WhatsApp, where a URL cannot be hidden behind text).
@@ -1878,7 +2005,30 @@ function doGet(e) {
   // export (29 columns: Portfolio code, Nse code, Bill amount, ...). We detect which and
   // normalise here so the payload stays small and the app doesn't care which one it is.
   var tradeSheet = ss.getSheetByName("Trades");
-  if (tradeSheet) { out.trades = gkNormalizedTrades_(); }
+  if (tradeSheet) {
+    var allTrades = gkNormalizedTrades_();
+    // The full book is ~100k trades, which is far too large to ship in one response \u2014 the
+    // request stalls and the console ends up showing stale data. Allow the caller to narrow
+    // it: ?code= (one client), ?sym= (one stock), ?since=YYYY-MM-DD, ?limit=.
+    var fCode = String(p.code || "").trim();
+    var fSym = String(p.sym || "").trim().toUpperCase();
+    var fSince = String(p.since || "").trim();
+    var lim = parseInt(p.limit || "0", 10);
+    if (fCode || fSym || fSince) {
+      var picked = [];
+      for (var ti = 0; ti < allTrades.length; ti++) {
+        var tr = allTrades[ti];
+        if (fCode && String(tr[1]).trim() !== fCode) continue;
+        if (fSym && String(tr[3]).trim().toUpperCase() !== fSym) continue;
+        if (fSince && String(tr[0]) < fSince) continue;
+        picked.push(tr);
+      }
+      allTrades = picked;
+    }
+    out.tradesTotal = allTrades.length;
+    if (lim > 0 && allTrades.length > lim) allTrades = allTrades.slice(allTrades.length - lim);
+    out.trades = allTrades;
+  }
 
   // Holdings (team sync): the client/holdings backup table, returned as row arrays (header skipped)
   var holdSheet = ss.getSheetByName("Holdings");
@@ -2395,54 +2545,151 @@ function gkParseCsv_(sheetName, csvText) {
   return { rows: rows, W: W };
 }
 
-// One comparable signature per row, so a row already in the sheet is never added twice.
-// Dates are normalised because Sheets turns a date string into a Date object on write.
-function gkRowSig_(row) {
-  var tz = Session.getScriptTimeZone(), parts = [];
-  for (var i = 0; i < row.length; i++) {
-    var v = row[i];
-    if (Object.prototype.toString.call(v) === "[object Date]") v = Utilities.formatDate(v, tz, "yyyy-MM-dd HH:mm:ss");
-    else if (typeof v === "number") v = String(v);
-    parts.push(String(v == null ? "" : v).trim().toLowerCase());
+// Values must be compared in a canonical form, because Sheets silently converts what we write:
+// the text 2026-07-14 comes back as a Date, and 9450 as a number. Comparing the raw values made
+// every row look new, so each sync re-appended the whole export. Written without regular
+// expressions, since this file lives inside a template literal where escapes do not survive.
+function gkNumStr_(n) {
+  if (!isFinite(n)) return "";
+  var s = String(n);
+  if (s.indexOf("e") >= 0 || s.indexOf("E") >= 0) s = n.toFixed(6);
+  return s;
+}
+function gkDatePart_(s) {
+  var sep = "";
+  if (s.indexOf("-") >= 0) sep = "-"; else if (s.indexOf("/") >= 0) sep = "/"; else return "";
+  var head = s.split(" ")[0];
+  var bits = head.split(sep);
+  if (bits.length !== 3) return "";
+  var a = bits[0], b = bits[1], c = bits[2], i, ch;
+  for (i = 0; i < head.length; i++) { ch = head.charAt(i); if (ch !== sep && (ch < "0" || ch > "9")) return ""; }
+  var y, m, d;
+  if (a.length === 4) { y = a; m = b; d = c; }
+  else if (c.length === 4) { y = c; m = b; d = a; }
+  else return "";
+  if (m.length < 2) m = "0" + m;
+  if (d.length < 2) d = "0" + d;
+  return y + "-" + m + "-" + d;
+}
+function gkCanon_(v) {
+  if (v == null) return "";
+  if (Object.prototype.toString.call(v) === "[object Date]") {
+    var tz = Session.getScriptTimeZone();
+    var withTime = v.getHours() || v.getMinutes() || v.getSeconds();
+    return Utilities.formatDate(v, tz, withTime ? "yyyy-MM-dd HH:mm" : "yyyy-MM-dd");
   }
-  return parts.join("").replace(/()+$/, "");
+  if (typeof v === "number") return gkNumStr_(v);
+  if (typeof v === "boolean") return v ? "true" : "false";
+  var s = String(v);
+  var t = "", k;
+  for (k = 0; k < s.length; k++) { var c0 = s.charAt(k); if (c0 !== " " && c0 !== String.fromCharCode(9)) break; }
+  t = s.slice(k);
+  while (t.length && (t.charAt(t.length - 1) === " " || t.charAt(t.length - 1) === String.fromCharCode(9))) t = t.slice(0, -1);
+  if (!t) return "";
+  // number written as text, possibly with thousands separators or a currency prefix
+  var cleaned = "", digits = 0, dots = 0, okNum = true, i, ch;
+  for (i = 0; i < t.length; i++) {
+    ch = t.charAt(i);
+    if (ch >= "0" && ch <= "9") { digits++; cleaned += ch; }
+    else if (ch === ".") { dots++; cleaned += ch; }
+    else if (ch === "-" && i === 0) { cleaned += ch; }
+    else if (ch === "," || ch === " ") { /* separator */ }
+    else if (i === 0 && (ch === String.fromCharCode(8377) || ch === "$")) { /* currency */ }
+    else { okNum = false; break; }
+  }
+  if (okNum && digits > 0 && dots <= 1) {
+    var n = Number(cleaned);
+    if (!isNaN(n)) return gkNumStr_(n);
+  }
+  var dp = gkDatePart_(t);
+  if (dp) {
+    var rest = t.split(" ")[1];
+    return rest ? dp + " " + rest.slice(0, 5) : dp;
+  }
+  return t.toLowerCase();
+}
+// One comparable signature per row, so a row already in the sheet is never added twice.
+function gkRowSig_(row) {
+  var SEP = String.fromCharCode(1), parts = [], i;
+  for (i = 0; i < row.length; i++) parts.push(gkCanon_(row[i]));
+  while (parts.length && parts[parts.length - 1] === "") parts.pop();   // ignore trailing blanks
+  return parts.join(SEP);
 }
 
-// APPEND-ONLY writer: keeps every row already in the tab and adds only rows that aren't there.
-// Nothing is ever cleared, so a re-run, a partial export or a bad fetch cannot lose history.
+// Remove rows already duplicated by the old comparison. Keeps the FIRST copy of each row.
+function gkDedupeSheet_(name) {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sh = ss.getSheetByName(name);
+  if (!sh || sh.getLastRow() < 3) return { sheet: name, before: sh ? Math.max(0, sh.getLastRow() - 1) : 0, after: sh ? Math.max(0, sh.getLastRow() - 1) : 0, removed: 0 };
+  var w = sh.getLastColumn();
+  var vals = sh.getRange(1, 1, sh.getLastRow(), w).getValues();
+  var header = vals[0], seen = {}, kept = [], i, sig;
+  for (i = 1; i < vals.length; i++) {
+    sig = gkRowSig_(vals[i]);
+    if (!sig) continue;                 // drop fully blank rows
+    if (seen[sig]) continue;
+    seen[sig] = true;
+    kept.push(vals[i]);
+  }
+  var before = vals.length - 1, removed = before - kept.length;
+  if (removed > 0) {
+    sh.clearContents();
+    sh.getRange(1, 1, 1, w).setValues([header]);
+    var CH = 5000;
+    for (var st = 0; st < kept.length; st += CH) {
+      var block = kept.slice(st, st + CH);
+      sh.getRange(2 + st, 1, block.length, w).setValues(block);
+    }
+    SpreadsheetApp.flush();
+  }
+  return { sheet: name, before: before, after: kept.length, removed: removed };
+}
+
+// APPEND-ONLY writer. Compares by COUNT, not by presence: if the export lists a row three
+// times (a broker reporting one order as three identical fills) the tab must end up with three.
+// We append only the shortfall, so re-running the same export adds nothing while genuine repeat
+// trades are never swallowed.
 function gkMergeCsv_(sheetName, csvText) {
   var parsed = gkParseCsv_(sheetName, csvText);
   var rows = parsed.rows, W = parsed.W;
   var ss = SpreadsheetApp.getActiveSpreadsheet();
   var sh = ss.getSheetByName(sheetName) || ss.insertSheet(sheetName);
-  var had = sh.getLastRow();
-  if (had === 0) { sh.getRange(1, 1, 1, W).setValues([rows[0]]); had = 1; }
+  if (sh.getLastRow() === 0) sh.getRange(1, 1, 1, W).setValues([rows[0]]);
 
-  var existing = {}, exW = sh.getLastColumn();
+  var exW = Math.max(sh.getLastColumn(), W);
+  var have = {}, i, sig;
   if (sh.getLastRow() > 1) {
-    var ev = sh.getRange(2, 1, sh.getLastRow() - 1, exW).getValues();
-    for (var e = 0; e < ev.length; e++) existing[gkRowSig_(ev[e])] = true;
+    var ev = sh.getRange(2, 1, sh.getLastRow() - 1, sh.getLastColumn()).getValues();
+    for (i = 0; i < ev.length; i++) {
+      sig = gkRowSig_(ev[i]);
+      have[sig] = (have[sig] || 0) + 1;
+    }
   }
-  var fresh = [];
-  for (var i = 1; i < rows.length; i++) {
-    var sig = gkRowSig_(rows[i]);
-    if (existing[sig]) continue;
-    existing[sig] = true;
-    var row = rows[i].slice();
+  var want = {}, order = [];
+  for (i = 1; i < rows.length; i++) {
+    sig = gkRowSig_(rows[i]);
+    if (!sig) continue;
+    want[sig] = (want[sig] || 0) + 1;
+    order.push({ sig: sig, row: rows[i] });
+  }
+  var used = {}, fresh = [];
+  for (i = 0; i < order.length; i++) {
+    var sg = order[i].sig;
+    used[sg] = (used[sg] || 0) + 1;
+    if (used[sg] <= (have[sg] || 0)) continue;      // this copy is already in the sheet
+    var row = order[i].row.slice();
     while (row.length < exW) row.push("");
-    fresh.push(row.slice(0, Math.max(exW, W)));
+    fresh.push(row.slice(0, exW));
   }
   if (fresh.length) {
-    var WW = Math.max(exW, W);
-    for (var f = 0; f < fresh.length; f++) while (fresh[f].length < WW) fresh[f].push("");
     var CH = 5000;
     for (var st = 0; st < fresh.length; st += CH) {
       var block = fresh.slice(st, st + CH);
-      sh.getRange(sh.getLastRow() + 1, 1, block.length, WW).setValues(block);
+      sh.getRange(sh.getLastRow() + 1, 1, block.length, exW).setValues(block);
     }
   }
   SpreadsheetApp.flush();
-  return fresh.length; // NEW rows appended this run
+  return fresh.length;   // NEW rows appended this run
 }
 
 // Write a CSV payload to a tab, replacing whatever was there.
@@ -4883,7 +5130,7 @@ function TradeHistoryModal({ db, code, name, symbol, onClose }) {
           if (!dead && (!local || local.marker)) setState(local && local.marker ? "error" : "empty");
           return;
         }
-        const res = await fetch(url + (url.includes("?") ? "&" : "?") + "trades=1");
+        const res = await fetch(url + (url.includes("?") ? "&" : "?") + "trades=1&code=" + encodeURIComponent(code) + "&sym=" + encodeURIComponent(sym));
         const data = await res.json();
         let list = Array.isArray(data.trades) ? data.trades : [];
         if (dead) return;
@@ -7024,6 +7271,80 @@ function SettingsTab({ db, commit, showToast }) {
     }, "edit sheet backup");
     showToast(teamSync ? "Saved. Team sync is ON \u2014 this device now pulls at sign-in and pushes every change." : "Google Sheet backup settings saved.");
   };
+  const [dedupeBusy, setDedupeBusy] = useState(false);
+  const [dedupeMsg, setDedupeMsg] = useState("");
+  const runDedupe = async () => {
+    const url = (db.sheetUrl || "").trim();
+    if (!url) {
+      showToast("Connect your Google Sheet first.", "err");
+      return;
+    }
+    if (!window.confirm("Remove duplicate rows from the Trades and Ledger tabs? The first copy of every row is kept. Take a copy of the sheet first if you want a safety net.")) return;
+    setDedupeBusy(true);
+    setDedupeMsg("Cleaning\u2026 this can take a minute on a large sheet.");
+    try {
+      const res = await fetch(url + (url.includes("?") ? "&" : "?") + "dedupe=Trades,Ledger&token=" + encodeURIComponent(db.sheetToken || ""));
+      const d = await res.json();
+      if (!d.ok) setDedupeMsg("Couldn't clean: " + (d.error || "unknown error"));
+      else setDedupeMsg((d.results || []).map((r) => r.error ? `${r.sheet}: ${r.error}` : `${r.sheet}: ${fmtNum(r.before)} rows \u2192 ${fmtNum(r.after)} (removed ${fmtNum(r.removed)})`).join(" \xB7 "));
+    } catch (e) {
+      setDedupeMsg("Couldn't reach the endpoint. Make sure the script is re-deployed as a new version.");
+    } finally {
+      setDedupeBusy(false);
+    }
+  };
+  const [loadBusy, setLoadBusy] = useState(false);
+  const [loadMsg, setLoadMsg] = useState("");
+  const loadHoldingsNow = async () => {
+    const url = (db.sheetUrl || "").trim();
+    if (!url) {
+      showToast("Connect your Google Sheet first.", "err");
+      return;
+    }
+    setLoadBusy(true);
+    setLoadMsg("Reading the sheet\u2026");
+    try {
+      const r = await pullHoldingsFromSheet(url);
+      if (!r || !r.built || !r.built.clientCount) {
+        setLoadMsg("The sheet's Holdings tab came back empty \u2014 run Fetch now first.");
+        return;
+      }
+      await commit((d) => {
+        d.clients = r.built.clients;
+      }, "pull from sheet");
+      const want = probeSym.trim().toUpperCase();
+      let found = 0;
+      if (want) {
+        for (const c of Object.values(r.built.clients)) if (Object.values(c.holdings || {}).some((h) => String(h.stock).toUpperCase() === want && num(h.quantity) > 0)) found++;
+      }
+      setLoadMsg(`Loaded ${fmtNum(r.built.clientCount)} clients and ${fmtNum(r.built.holdingCount)} holdings onto this device.` + (want ? found ? ` ${want} now shows in ${fmtNum(found)} client portfolio(s).` : ` ${want} still isn't in what the sheet returned \u2014 press Fetch now, then try again.` : ""));
+    } catch (e) {
+      setLoadMsg("Couldn't read the sheet. Check the /exec URL and that the script is deployed as a NEW version.");
+    } finally {
+      setLoadBusy(false);
+    }
+  };
+  const [probeOn, setProbeOn] = useState((/* @__PURE__ */ new Date()).toISOString().slice(0, 10));
+  const [probeSym, setProbeSym] = useState("");
+  const [probeBusy, setProbeBusy] = useState(false);
+  const [probe, setProbe] = useState(null);
+  const runProbe = async () => {
+    const url = (db.sheetUrl || "").trim();
+    if (!url) {
+      showToast("Connect your Google Sheet first.", "err");
+      return;
+    }
+    setProbeBusy(true);
+    setProbe(null);
+    try {
+      const res = await fetch(url + (url.includes("?") ? "&" : "?") + "gk_probe=trades&on=" + encodeURIComponent(probeOn) + (probeSym.trim() ? "&sym=" + encodeURIComponent(probeSym.trim()) : "") + "&token=" + encodeURIComponent(db.sheetToken || ""));
+      setProbe(await res.json());
+    } catch (e) {
+      setProbe({ ok: false, error: "Couldn't reach the endpoint \u2014 redeploy the script as a new version." });
+    } finally {
+      setProbeBusy(false);
+    }
+  };
   const [shortProv, setShortProv] = useState("isgd");
   const [shortTok, setShortTok] = useState("");
   const [shortBase, setShortBase] = useState("");
@@ -7298,7 +7619,7 @@ function SettingsTab({ db, commit, showToast }) {
       placeholder: "https://\u2026gridkey.in/\u2026/combined_holdings\u2026",
       className: "w-full px-3 py-2 text-[12px] font-mono border border-slate-300 rounded-lg"
     }
-  ))), /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap gap-2 mt-3" }, /* @__PURE__ */ React.createElement("button", { onClick: saveGk, disabled: gkBusy, className: "bg-indigo-600 hover:bg-indigo-700 text-white text-sm px-4 py-2 rounded-lg disabled:opacity-50" }, "Save to server"), /* @__PURE__ */ React.createElement("button", { onClick: runGk, disabled: gkBusy, className: "bg-slate-700 hover:bg-slate-800 text-white text-sm px-4 py-2 rounded-lg flex items-center gap-1.5 disabled:opacity-50" }, /* @__PURE__ */ React.createElement(RefreshCw, { size: 15, className: gkBusy ? "animate-spin" : "" }), " ", gkBusy ? "Fetching\u2026" : "Fetch now"), /* @__PURE__ */ React.createElement("button", { onClick: loadGk, className: "border border-slate-300 hover:bg-slate-50 text-slate-700 text-sm px-4 py-2 rounded-lg" }, "Refresh status")), gk && /* @__PURE__ */ React.createElement("div", { className: "mt-3 text-[12px] rounded-lg border px-3 py-2 space-y-0.5 border-slate-200 bg-slate-50" }, /* @__PURE__ */ React.createElement("div", null, "Schedule: ", gk.triggers > 0 ? /* @__PURE__ */ React.createElement("span", { className: "text-emerald-700 font-medium" }, "active \u2014 ", gk.triggers, " daily trigger(s) (", gk.timezone, ")") : /* @__PURE__ */ React.createElement("span", { className: "text-amber-700 font-medium" }, "not installed yet \u2014 run ", /* @__PURE__ */ React.createElement("code", { className: "bg-white px-1 rounded border" }, "setupGridkeyTriggers"), " once in Apps Script")), gk.lastSync && /* @__PURE__ */ React.createElement("div", null, "Last run: ", /* @__PURE__ */ React.createElement("b", null, gk.lastSync)), gk.lastResult && /* @__PURE__ */ React.createElement("div", { className: /^ERROR/.test(gk.lastResult) ? "text-rose-700" : "text-emerald-700" }, gk.lastResult), !gk.ledgerUrl && /* @__PURE__ */ React.createElement("div", { className: "text-slate-500" }, "Ledger URL not set \u2014 only trades will sync."))), /* @__PURE__ */ React.createElement(Card, { title: "Email sending & diagnostics", icon: Mail }, /* @__PURE__ */ React.createElement("p", { className: "text-sm text-slate-500 mb-3" }, "Advice, broadcasts and alerts are emailed by your Apps Script from the Google account that authorised it. If mail isn't going out, check it here \u2014 it shows the exact reason."), /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap gap-2 items-center" }, /* @__PURE__ */ React.createElement("button", { onClick: runDiag, disabled: diagBusy, className: "text-sm px-3 py-2 rounded-lg border border-slate-300 hover:bg-slate-50 text-slate-700 flex items-center gap-1.5 disabled:opacity-50" }, /* @__PURE__ */ React.createElement(ShieldCheck, { size: 15 }), " Check email setup"), /* @__PURE__ */ React.createElement("input", { value: testTo, onChange: (e) => setTestTo(e.target.value), placeholder: "send a test email to\u2026", className: "flex-1 min-w-[220px] px-3 py-2 text-sm border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500" }), /* @__PURE__ */ React.createElement("button", { onClick: sendTest, disabled: diagBusy, className: "text-sm px-4 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-700 text-white flex items-center gap-1.5 disabled:opacity-50" }, /* @__PURE__ */ React.createElement(Send, { size: 15 }), " Send test email")), diag && /* @__PURE__ */ React.createElement("div", { className: "mt-3 text-[13px] rounded-lg p-3 border bg-slate-50 border-slate-200 space-y-1" }, diag.error ? /* @__PURE__ */ React.createElement("div", { className: "text-rose-700" }, "Endpoint not reachable \u2014 check the /exec URL and that the deployment access is ", /* @__PURE__ */ React.createElement("b", null, "Anyone"), ", then redeploy a new version.") : /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("div", null, "Sends mail as: ", /* @__PURE__ */ React.createElement("b", { className: /@/.test(diag.user || "") ? "text-slate-800" : "text-rose-700" }, diag.user || "unknown"), " ", diag.user && !/vasupradah\.com/i.test(diag.user) && /* @__PURE__ */ React.createElement("span", { className: "text-amber-700" }, "\u2190 not your firm address; re-authorise & redeploy the script while signed in as jaideepmenon@vasupradah.com")), /* @__PURE__ */ React.createElement("div", null, "Gmail sends left today: ", /* @__PURE__ */ React.createElement("b", { className: diag.quota > 0 ? "text-emerald-700" : "text-rose-700" }, diag.quota), diag.quota === 0 && /* @__PURE__ */ React.createElement("span", { className: "text-rose-700" }, " \u2014 daily limit reached; try again tomorrow")), /* @__PURE__ */ React.createElement("div", { className: "text-slate-500" }, "Deployed version: ", diag.version || "unknown", diag.version !== "2026-09-05-pipeline" && /* @__PURE__ */ React.createElement("span", { className: "text-amber-700" }, " \u2014 older than this app; ", /* @__PURE__ */ React.createElement("b", null, "redeploy a NEW version"), " of the Apps Script (Deploy \u2192 Manage deployments \u2192 New version)")))), testMsg && /* @__PURE__ */ React.createElement("div", { className: "mt-2 text-[13px] text-slate-700 bg-slate-50 border border-slate-200 rounded-lg p-3" }, testMsg), /* @__PURE__ */ React.createElement("div", { className: "mt-3 text-[12px] text-slate-500" }, "If mail isn't sending, the usual cause is the Apps Script wasn't ", /* @__PURE__ */ React.createElement("b", null, "re-deployed as a NEW version"), " after the last update, or the ", /* @__PURE__ */ React.createElement("b", null, "Secret"), ` saved here doesn't match the one in the script. "Send test email" tells you which.`), /* @__PURE__ */ React.createElement("div", { className: "mt-4 pt-3 border-t border-slate-100" }, /* @__PURE__ */ React.createElement("div", { className: "text-sm font-medium text-slate-700 mb-1" }, "Short links for WhatsApp"), /* @__PURE__ */ React.createElement("p", { className: "text-[12px] text-slate-500 mb-2" }, "Emails hide the execute link behind a button, but WhatsApp always shows the address \u2014 so it is shortened. Pick who does the shortening."), /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap gap-2 items-end" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("label", { className: "text-[11px] text-slate-500 block mb-1" }, "Provider"), /* @__PURE__ */ React.createElement("select", { value: shortProv, onChange: (e) => setShortProv(e.target.value), className: "px-3 py-2 text-sm border border-slate-300 rounded-lg bg-white" }, /* @__PURE__ */ React.createElement("option", { value: "isgd" }, "is.gd (free, no account)"), /* @__PURE__ */ React.createElement("option", { value: "bitly" }, "Bitly (your account / branded domain)"), /* @__PURE__ */ React.createElement("option", { value: "custom" }, "Your own domain (redirect service)"), /* @__PURE__ */ React.createElement("option", { value: "tinyurl" }, "TinyURL"), /* @__PURE__ */ React.createElement("option", { value: "off" }, "Off \u2014 send the full link"))), shortProv === "bitly" && /* @__PURE__ */ React.createElement("div", { className: "flex-1 min-w-[220px]" }, /* @__PURE__ */ React.createElement("label", { className: "text-[11px] text-slate-500 block mb-1" }, "Bitly access token"), /* @__PURE__ */ React.createElement("input", { type: "password", value: shortTok, onChange: (e) => setShortTok(e.target.value), placeholder: "paste token", className: "w-full px-3 py-2 text-sm border border-slate-300 rounded-lg" })), (shortProv === "bitly" || shortProv === "custom") && /* @__PURE__ */ React.createElement("div", { className: "flex-1 min-w-[220px]" }, /* @__PURE__ */ React.createElement("label", { className: "text-[11px] text-slate-500 block mb-1" }, shortProv === "bitly" ? "Branded domain (optional)" : "Your shortener endpoint"), /* @__PURE__ */ React.createElement("input", { value: shortBase, onChange: (e) => setShortBase(e.target.value), placeholder: shortProv === "bitly" ? "links.vasupradah.com" : "https://vasupradah.com/s/create", className: "w-full px-3 py-2 text-sm border border-slate-300 rounded-lg" })), /* @__PURE__ */ React.createElement("button", { onClick: saveShortener, disabled: shortBusy, className: "text-sm px-4 py-2 rounded-lg text-white disabled:opacity-50", style: { background: "#2E3192" } }, shortBusy ? "Saving\u2026" : "Save")), /* @__PURE__ */ React.createElement("div", { className: "mt-2 text-[11px] text-slate-500" }, "The token is stored on Google's server with your script \u2014 never in this browser or the sheet. A custom endpoint should take ", /* @__PURE__ */ React.createElement("code", null, "?url="), " and return the short link as plain text.", diag && diag.shortener ? /* @__PURE__ */ React.createElement(React.Fragment, null, " Currently active: ", /* @__PURE__ */ React.createElement("b", null, diag.shortener), ".") : null))), /* @__PURE__ */ React.createElement(Card, { title: "Concentration limits", icon: AlertTriangle }, /* @__PURE__ */ React.createElement("p", { className: "text-xs text-slate-500 mb-3" }, "Flag any single stock whose market value exceeds this share of a client's ", /* @__PURE__ */ React.createElement("b", null, "total assets (holdings + cash)"), ". Leave a category blank to use the default. Breaches show as a red banner and a ", /* @__PURE__ */ React.createElement("b", null, "Concentration alerts"), " view in the Portfolio Report."), /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-2 sm:grid-cols-3 gap-3" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("label", { className: "text-[11px] text-slate-500 block mb-1" }, "Default limit"), /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-1" }, /* @__PURE__ */ React.createElement(
+  ))), /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap gap-2 mt-3" }, /* @__PURE__ */ React.createElement("button", { onClick: saveGk, disabled: gkBusy, className: "bg-indigo-600 hover:bg-indigo-700 text-white text-sm px-4 py-2 rounded-lg disabled:opacity-50" }, "Save to server"), /* @__PURE__ */ React.createElement("button", { onClick: runGk, disabled: gkBusy, className: "bg-slate-700 hover:bg-slate-800 text-white text-sm px-4 py-2 rounded-lg flex items-center gap-1.5 disabled:opacity-50" }, /* @__PURE__ */ React.createElement(RefreshCw, { size: 15, className: gkBusy ? "animate-spin" : "" }), " ", gkBusy ? "Fetching\u2026" : "Fetch now"), /* @__PURE__ */ React.createElement("button", { onClick: loadGk, className: "border border-slate-300 hover:bg-slate-50 text-slate-700 text-sm px-4 py-2 rounded-lg" }, "Refresh status")), /* @__PURE__ */ React.createElement("div", { className: "mt-3 flex flex-wrap gap-2 items-end" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("label", { className: "text-[11px] text-slate-500 block mb-1" }, "Trade missing? Check a date"), /* @__PURE__ */ React.createElement("input", { type: "date", value: probeOn, onChange: (e) => setProbeOn(e.target.value), className: "px-3 py-2 text-sm border border-slate-300 rounded-lg" })), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("label", { className: "text-[11px] text-slate-500 block mb-1" }, "\u2026or a stock symbol"), /* @__PURE__ */ React.createElement("input", { value: probeSym, onChange: (e) => setProbeSym(e.target.value.toUpperCase()), placeholder: "e.g. GICRE", className: "px-3 py-2 text-sm border border-slate-300 rounded-lg w-36" })), /* @__PURE__ */ React.createElement("button", { onClick: runProbe, disabled: probeBusy, className: "border border-slate-300 hover:bg-slate-50 text-slate-700 text-sm px-4 py-2 rounded-lg disabled:opacity-50" }, probeBusy ? "Checking\u2026" : "Check what GridKey returns"), /* @__PURE__ */ React.createElement("button", { onClick: loadHoldingsNow, disabled: loadBusy, className: "text-white text-sm px-4 py-2 rounded-lg disabled:opacity-50", style: { background: "#2E3192" } }, loadBusy ? "Loading\u2026" : "Load holdings onto this device")), loadMsg && /* @__PURE__ */ React.createElement("div", { className: "mt-2 text-[12px] rounded-lg border border-slate-200 bg-slate-50 px-3 py-2" }, loadMsg), probe && /* @__PURE__ */ React.createElement("div", { className: "mt-2 text-[12px] rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 space-y-0.5" }, probe.ok === false ? /* @__PURE__ */ React.createElement("div", { className: "text-rose-700" }, probe.error) : /* @__PURE__ */ React.createElement(React.Fragment, null, probe.fetchError ? /* @__PURE__ */ React.createElement("div", { className: "text-rose-700" }, "The export could not be fetched: ", probe.fetchError) : /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("div", null, "Export returned ", /* @__PURE__ */ React.createElement("b", null, fmtNum(probe.exportRows || 0)), " rows", probe.earliest ? /* @__PURE__ */ React.createElement(React.Fragment, null, " covering ", /* @__PURE__ */ React.createElement("b", null, probe.earliest), " to ", /* @__PURE__ */ React.createElement("b", null, probe.latest)) : null, "."), probe.askedFor && (probe.presentInExport ? /* @__PURE__ */ React.createElement("div", { className: "text-emerald-700" }, probe.askedFor, " ", /* @__PURE__ */ React.createElement("b", null, "is"), " in the export", probe.rowsInSheetOnThatDate != null ? /* @__PURE__ */ React.createElement(React.Fragment, null, " \u2014 and ", probe.rowsInSheetOnThatDate > 0 ? /* @__PURE__ */ React.createElement(React.Fragment, null, "already sits in the sheet (", fmtNum(probe.rowsInSheetOnThatDate), " row(s))") : /* @__PURE__ */ React.createElement("b", null, "is not in the sheet yet \u2014 press \u201CFetch now\u201D")) : null, ".") : /* @__PURE__ */ React.createElement("div", { className: "text-amber-700" }, probe.askedFor, " is ", /* @__PURE__ */ React.createElement("b", null, "not in the export at all"), " \u2014 the export URL is filtered or hasn't caught up, so the console can never see it."))), probe.symbol && /* @__PURE__ */ React.createElement("div", { className: "mt-1 pt-1 border-t border-slate-200" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("b", null, probe.symbol), ": ", fmtNum(probe.tradesForSymbol || 0), " trade(s) in the book", probe.lastTradeForSymbol ? /* @__PURE__ */ React.createElement(React.Fragment, null, ", latest ", /* @__PURE__ */ React.createElement("b", null, String(probe.lastTradeForSymbol).slice(0, 10))) : null, "."), /* @__PURE__ */ React.createElement("div", { className: probe.holdingRowsForSymbol ? "text-emerald-700" : "text-amber-700" }, probe.holdingRowsForSymbol ? /* @__PURE__ */ React.createElement(React.Fragment, null, "Held in ", /* @__PURE__ */ React.createElement("b", null, fmtNum(probe.holdingRowsForSymbol)), " client row(s) in the Holdings tab.") : /* @__PURE__ */ React.createElement(React.Fragment, null, "Not present in the Holdings tab \u2014 so the console cannot show it as a position.")), probe.combinedRowsForSymbol != null && /* @__PURE__ */ React.createElement("div", { className: probe.combinedRowsForSymbol ? "text-slate-500" : "text-rose-700" }, probe.combinedRowsForSymbol ? /* @__PURE__ */ React.createElement(React.Fragment, null, "GridKey's combined-holdings export lists it ", fmtNum(probe.combinedRowsForSymbol), " time(s) \u2014 press ", /* @__PURE__ */ React.createElement("b", null, "Fetch now"), " to pull it in.") : /* @__PURE__ */ React.createElement(React.Fragment, null, "GridKey's combined-holdings export does not contain it at all, so the position cannot reach the console.")), probe.symbolCombinedError && /* @__PURE__ */ React.createElement("div", { className: "text-amber-700" }, "Combined-holdings check failed: ", probe.symbolCombinedError)), probe.normalisedOnThatDate != null && (probe.normalisedOnThatDate > 0 ? /* @__PURE__ */ React.createElement("div", { className: "text-emerald-700" }, "The console's trade feed sees ", /* @__PURE__ */ React.createElement("b", null, fmtNum(probe.normalisedOnThatDate)), " trade(s) on that date (", fmtNum(probe.normalisedTotal || 0), " in total).") : /* @__PURE__ */ React.createElement("div", { className: "text-rose-700" }, "The sheet has those rows but the console's trade feed reads ", /* @__PURE__ */ React.createElement("b", null, "0"), " for that date \u2014 the export's columns aren't being recognised. Send me the Trades tab header row.")), /* @__PURE__ */ React.createElement("div", { className: "text-slate-500" }, "Sheet holds ", fmtNum(probe.sheetRows || 0), " rows \xD7 ", probe.sheetCols || 0, " columns (", fmtNum(probe.sheetCells || 0), " cells", (probe.sheetCells || 0) > 8e6 ? " \u2014 close to Google's 10 million cell limit, which blocks new rows" : "", ")."), probe.lastSync && /* @__PURE__ */ React.createElement("div", { className: "text-slate-500" }, "Last sync: ", probe.lastSync, " \u2014 ", probe.lastResult))), dedupeMsg && /* @__PURE__ */ React.createElement("div", { className: "mt-3 text-[12px] text-slate-700 bg-slate-50 border border-slate-200 rounded-lg px-3 py-2" }, dedupeMsg), gk && /* @__PURE__ */ React.createElement("div", { className: "mt-3 text-[12px] rounded-lg border px-3 py-2 space-y-0.5 border-slate-200 bg-slate-50" }, /* @__PURE__ */ React.createElement("div", null, "Schedule: ", gk.triggers > 0 ? /* @__PURE__ */ React.createElement("span", { className: "text-emerald-700 font-medium" }, "active \u2014 ", gk.triggers, " daily trigger(s) (", gk.timezone, ")") : /* @__PURE__ */ React.createElement("span", { className: "text-amber-700 font-medium" }, "not installed yet \u2014 run ", /* @__PURE__ */ React.createElement("code", { className: "bg-white px-1 rounded border" }, "setupGridkeyTriggers"), " once in Apps Script")), gk.lastSync && /* @__PURE__ */ React.createElement("div", null, "Last run: ", /* @__PURE__ */ React.createElement("b", null, gk.lastSync)), gk.lastResult && /* @__PURE__ */ React.createElement("div", { className: /^ERROR/.test(gk.lastResult) ? "text-rose-700" : "text-emerald-700" }, gk.lastResult), !gk.ledgerUrl && /* @__PURE__ */ React.createElement("div", { className: "text-slate-500" }, "Ledger URL not set \u2014 only trades will sync."))), /* @__PURE__ */ React.createElement(Card, { title: "Email sending & diagnostics", icon: Mail }, /* @__PURE__ */ React.createElement("p", { className: "text-sm text-slate-500 mb-3" }, "Advice, broadcasts and alerts are emailed by your Apps Script from the Google account that authorised it. If mail isn't going out, check it here \u2014 it shows the exact reason."), /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap gap-2 items-center" }, /* @__PURE__ */ React.createElement("button", { onClick: runDiag, disabled: diagBusy, className: "text-sm px-3 py-2 rounded-lg border border-slate-300 hover:bg-slate-50 text-slate-700 flex items-center gap-1.5 disabled:opacity-50" }, /* @__PURE__ */ React.createElement(ShieldCheck, { size: 15 }), " Check email setup"), /* @__PURE__ */ React.createElement("input", { value: testTo, onChange: (e) => setTestTo(e.target.value), placeholder: "send a test email to\u2026", className: "flex-1 min-w-[220px] px-3 py-2 text-sm border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500" }), /* @__PURE__ */ React.createElement("button", { onClick: sendTest, disabled: diagBusy, className: "text-sm px-4 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-700 text-white flex items-center gap-1.5 disabled:opacity-50" }, /* @__PURE__ */ React.createElement(Send, { size: 15 }), " Send test email")), diag && /* @__PURE__ */ React.createElement("div", { className: "mt-3 text-[13px] rounded-lg p-3 border bg-slate-50 border-slate-200 space-y-1" }, diag.error ? /* @__PURE__ */ React.createElement("div", { className: "text-rose-700" }, "Endpoint not reachable \u2014 check the /exec URL and that the deployment access is ", /* @__PURE__ */ React.createElement("b", null, "Anyone"), ", then redeploy a new version.") : /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("div", null, "Sends mail as: ", /* @__PURE__ */ React.createElement("b", { className: /@/.test(diag.user || "") ? "text-slate-800" : "text-rose-700" }, diag.user || "unknown"), " ", diag.user && !/vasupradah\.com/i.test(diag.user) && /* @__PURE__ */ React.createElement("span", { className: "text-amber-700" }, "\u2190 not your firm address; re-authorise & redeploy the script while signed in as jaideepmenon@vasupradah.com")), /* @__PURE__ */ React.createElement("div", null, "Gmail sends left today: ", /* @__PURE__ */ React.createElement("b", { className: diag.quota > 0 ? "text-emerald-700" : "text-rose-700" }, diag.quota), diag.quota === 0 && /* @__PURE__ */ React.createElement("span", { className: "text-rose-700" }, " \u2014 daily limit reached; try again tomorrow")), /* @__PURE__ */ React.createElement("div", { className: "text-slate-500" }, "Deployed version: ", diag.version || "unknown", diag.version !== "2026-09-05-pipeline" && /* @__PURE__ */ React.createElement("span", { className: "text-amber-700" }, " \u2014 older than this app; ", /* @__PURE__ */ React.createElement("b", null, "redeploy a NEW version"), " of the Apps Script (Deploy \u2192 Manage deployments \u2192 New version)")))), testMsg && /* @__PURE__ */ React.createElement("div", { className: "mt-2 text-[13px] text-slate-700 bg-slate-50 border border-slate-200 rounded-lg p-3" }, testMsg), /* @__PURE__ */ React.createElement("div", { className: "mt-3 text-[12px] text-slate-500" }, "If mail isn't sending, the usual cause is the Apps Script wasn't ", /* @__PURE__ */ React.createElement("b", null, "re-deployed as a NEW version"), " after the last update, or the ", /* @__PURE__ */ React.createElement("b", null, "Secret"), ` saved here doesn't match the one in the script. "Send test email" tells you which.`), /* @__PURE__ */ React.createElement("div", { className: "mt-4 pt-3 border-t border-slate-100" }, /* @__PURE__ */ React.createElement("div", { className: "text-sm font-medium text-slate-700 mb-1" }, "Short links for WhatsApp"), /* @__PURE__ */ React.createElement("p", { className: "text-[12px] text-slate-500 mb-2" }, "Emails hide the execute link behind a button, but WhatsApp always shows the address \u2014 so it is shortened. Pick who does the shortening."), /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap gap-2 items-end" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("label", { className: "text-[11px] text-slate-500 block mb-1" }, "Provider"), /* @__PURE__ */ React.createElement("select", { value: shortProv, onChange: (e) => setShortProv(e.target.value), className: "px-3 py-2 text-sm border border-slate-300 rounded-lg bg-white" }, /* @__PURE__ */ React.createElement("option", { value: "isgd" }, "is.gd (free, no account)"), /* @__PURE__ */ React.createElement("option", { value: "bitly" }, "Bitly (your account / branded domain)"), /* @__PURE__ */ React.createElement("option", { value: "custom" }, "Your own domain (redirect service)"), /* @__PURE__ */ React.createElement("option", { value: "tinyurl" }, "TinyURL"), /* @__PURE__ */ React.createElement("option", { value: "off" }, "Off \u2014 send the full link"))), shortProv === "bitly" && /* @__PURE__ */ React.createElement("div", { className: "flex-1 min-w-[220px]" }, /* @__PURE__ */ React.createElement("label", { className: "text-[11px] text-slate-500 block mb-1" }, "Bitly access token"), /* @__PURE__ */ React.createElement("input", { type: "password", value: shortTok, onChange: (e) => setShortTok(e.target.value), placeholder: "paste token", className: "w-full px-3 py-2 text-sm border border-slate-300 rounded-lg" })), (shortProv === "bitly" || shortProv === "custom") && /* @__PURE__ */ React.createElement("div", { className: "flex-1 min-w-[220px]" }, /* @__PURE__ */ React.createElement("label", { className: "text-[11px] text-slate-500 block mb-1" }, shortProv === "bitly" ? "Branded domain (optional)" : "Your shortener endpoint"), /* @__PURE__ */ React.createElement("input", { value: shortBase, onChange: (e) => setShortBase(e.target.value), placeholder: shortProv === "bitly" ? "links.vasupradah.com" : "https://vasupradah.com/s/create", className: "w-full px-3 py-2 text-sm border border-slate-300 rounded-lg" })), /* @__PURE__ */ React.createElement("button", { onClick: saveShortener, disabled: shortBusy, className: "text-sm px-4 py-2 rounded-lg text-white disabled:opacity-50", style: { background: "#2E3192" } }, shortBusy ? "Saving\u2026" : "Save")), /* @__PURE__ */ React.createElement("div", { className: "mt-2 text-[11px] text-slate-500" }, "The token is stored on Google's server with your script \u2014 never in this browser or the sheet. A custom endpoint should take ", /* @__PURE__ */ React.createElement("code", null, "?url="), " and return the short link as plain text.", diag && diag.shortener ? /* @__PURE__ */ React.createElement(React.Fragment, null, " Currently active: ", /* @__PURE__ */ React.createElement("b", null, diag.shortener), ".") : null))), /* @__PURE__ */ React.createElement(Card, { title: "Concentration limits", icon: AlertTriangle }, /* @__PURE__ */ React.createElement("p", { className: "text-xs text-slate-500 mb-3" }, "Flag any single stock whose market value exceeds this share of a client's ", /* @__PURE__ */ React.createElement("b", null, "total assets (holdings + cash)"), ". Leave a category blank to use the default. Breaches show as a red banner and a ", /* @__PURE__ */ React.createElement("b", null, "Concentration alerts"), " view in the Portfolio Report."), /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-2 sm:grid-cols-3 gap-3" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("label", { className: "text-[11px] text-slate-500 block mb-1" }, "Default limit"), /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-1" }, /* @__PURE__ */ React.createElement(
     "input",
     {
       type: "number",
