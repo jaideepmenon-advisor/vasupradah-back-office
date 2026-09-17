@@ -119,6 +119,33 @@ for the execute link), so the client never sees a raw URL. **This needs the
 updated backend deployed** — re-paste `Code.gs` (or Settings → "Copy backend
 code") and deploy a new version, otherwise the links arrive as raw text.
 
+## Market and limit orders, and price laddering
+
+Advice orders can be sent at market or at a limit price:
+
+- **Risk group** — an "Order type" selector (Market / Limit). On Limit you
+  give the **first client's price** and a **tick step** (default ₹0.05). Each
+  subsequent selected client is stepped one tick away so a batch doesn't
+  stack identical prices on the book: **buys step up** (100.00, 100.05,
+  100.10 …), **sells step down** (100.00, 99.95, 99.90 …). The ladder follows
+  the table order and re-derives whenever you tick clients in or out; the
+  per-client price is shown in a "Limit ₹" column before you send, and is
+  floored at ₹0.01 so a long sell ladder can never cross zero.
+- **Single client** — each order line has its own limit box; leave it blank
+  for a market order.
+
+The limit price flows into the email body ("Order Type: LMT", `Price:` and a
+`Total Amount:` computed at the limit), the Excel export, and the gateway
+execute link (sent as `orderType: LIMIT` with `price`).
+
+Subjects are per client and name the order:
+`RAMEEZ MOHAMMED (RMZ39939) — BUY IDEA 50 @ market price`, or with a limit,
+`… — SELL LIQUIDCASE 862 @ 99.95`. A client with more than two lines in one
+batch gets `… — 3 orders` instead.
+
+Note that order **sizing** still uses the live market price, so a limit order
+far from the market will show a quantity based on the market price.
+
 ## Order-link gateway (Advice orders)
 
 The one-click "Click Here To Execute the Order" link sent in Advice orders is
