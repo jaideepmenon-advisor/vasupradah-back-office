@@ -1030,23 +1030,29 @@ function waNumber(raw) {
   if (d.length === 11 && d.startsWith("0")) return "91" + d.slice(1);
   return d;
 }
-function openWhatsApp(number, text) {
-  const n = waNumber(number);
-  if (!n) return false;
+// Always use wa.me click-to-chat. The whatsapp:// scheme silently ignores the
+// phone parameter on WhatsApp Desktop and drops the text into whichever chat
+// happens to be open - which means one client's advice can land in another
+// client's chat.
+function openWaUrl(url) {
   const a = document.createElement("a");
-  a.href = `whatsapp://send?phone=${n}&text=${encodeURIComponent(text || "")}`;
+  a.href = url;
+  a.target = "_blank";
+  a.rel = "noopener";
   document.body.appendChild(a);
   a.click();
   a.remove();
   return true;
 }
+function openWhatsApp(number, text) {
+  const n = waNumber(number);
+  if (!n || n.length < 8 || n.length > 15) return false;
+  return openWaUrl(`https://wa.me/${n}?text=${encodeURIComponent(text || "")}`);
+}
 function openWhatsAppShare(text) {
-  const a = document.createElement("a");
-  a.href = `whatsapp://send?text=${encodeURIComponent(text || "")}`;
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
-  return true;
+  // No recipient: wa.me opens the chat picker so a group can be chosen, rather
+  // than dropping the message into whatever chat is already open.
+  return openWaUrl(`https://wa.me/?text=${encodeURIComponent(text || "")}`);
 }
 const normKey = (k) => String(k).toLowerCase().replace(/[^a-z0-9]/g, "");
 const HEADER_MAP = {
