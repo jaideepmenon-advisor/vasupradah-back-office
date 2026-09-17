@@ -105,7 +105,9 @@ from one model to the other later just rewrites their row:
   team in Cc (first address in the setting is the To, the rest are Cc)
   with the subject and the approval text — "Place this order as GTC" by
   default — already filled in, plus the order details. Reject opens a reply
-  to the reject address only, with "REJECTED BY CLIENT" in the subject.
+  to `jaideepmenon@` with `kavyajaigopal@` and `minicr@` in Cc (same
+  first-is-To rule), with "REJECTED BY CLIENT" in the subject — the dealer
+  is deliberately not copied on a rejection.
   The mail's `Reply-To` is also set to the same team list, so a plain
   "Reply" reaches them too.
 - **Execute link** — the advice mail carries the one-click gateway link
