@@ -981,6 +981,36 @@ function normalizeRisk(v) {
 const EXEC_MODE_LABEL = { email: "Email approval", gateway: "Execute link" };
 const execModeOf = (db, code) => (db && db.execMode || {})[String(code ?? "").trim()] === "gateway" ? "gateway" : "email";
 const mailList = (s) => String(s || "").split(/[,;]/).map((x) => x.trim()).filter((x) => x.includes("@"));
+// navigator.clipboard only exists in a secure context, so it is undefined when this
+// console is opened as a local file:// page. Fall back to execCommand, and report
+// failure honestly rather than claiming a copy that never happened.
+async function copyText(text) {
+  const s = String(text == null ? "" : text);
+  try {
+    if (navigator.clipboard && window.isSecureContext) {
+      await navigator.clipboard.writeText(s);
+      return true;
+    }
+  } catch (e) {
+  }
+  try {
+    const ta = document.createElement("textarea");
+    ta.value = s;
+    ta.setAttribute("readonly", "");
+    ta.style.position = "fixed";
+    ta.style.top = "-1000px";
+    ta.style.opacity = "0";
+    document.body.appendChild(ta);
+    ta.select();
+    ta.setSelectionRange(0, s.length);
+    const ok = document.execCommand("copy");
+    ta.remove();
+    return !!ok;
+  } catch (e) {
+    return false;
+  }
+}
+const COPY_FAILED = "Couldn't reach the clipboard — select the text and copy it manually (Ctrl/Cmd+C).";
 const approveReplyTo = (db) => mailList(db && db.approveTo != null ? db.approveTo : DEFAULT_APPROVE_TO).join(",");
 const mailtoUrl = (to, cc, subject, body) => {
   const q = [];
@@ -2589,7 +2619,7 @@ function gkFetch_(url) {
 
 // Parse a GridKey CSV payload into padded rows (shared by the merge and replace writers).
 function gkParseCsv_(sheetName, csvText) {
-  var body = String(csvText || "").replace(/^\uFEFF/, "").trim();
+  var body = String(csvText || "").replace(/^\\uFEFF/, "").trim();
   if (!body) throw new Error("Empty response from GridKey for " + sheetName + ".");
   if (body.charAt(0) === "{" || body.charAt(0) === "[") {
     var j;
@@ -4775,7 +4805,7 @@ ${SENDER}` }
   };
   const copyMsg = () => {
     try {
-      navigator.clipboard.writeText(msg);
+      copyText(msg);
       showToast("Message copied.");
     } catch (e) {
       showToast("Couldn't copy.", "err");
@@ -4801,7 +4831,7 @@ ${SENDER}` }
     {
       onClick: () => {
         try {
-          navigator.clipboard.writeText(plShareText(r, cfg));
+          copyText(plShareText(r, cfg));
           showToast("Lead details copied.");
         } catch (e) {
           showToast("Couldn't copy.", "err");
@@ -6054,7 +6084,7 @@ Total portfolio: ${money(total)} | Overall P/L: ${money(pnl)} (${fmtNum(pnlPct)}
       showToast("No email addresses in this view.", "err");
       return;
     }
-    navigator.clipboard?.writeText(recipientEmails.join(", ")).then(() => showToast(`${recipientEmails.length} email(s) copied \u2014 paste into the BCC field.`)).catch(() => showToast("Copy failed \u2014 try the Email all button instead.", "err"));
+    copyText(recipientEmails.join(", ")).then(() => showToast(`${recipientEmails.length} email(s) copied \u2014 paste into the BCC field.`)).catch(() => showToast("Copy failed \u2014 try the Email all button instead.", "err"));
   };
   const emailAllBcc = () => {
     if (!recipientEmails.length) {
@@ -7149,7 +7179,7 @@ function AdviceTab({ db, user, commit, showToast }) {
       showToast("No emails found for these clients.", "err");
       return;
     }
-    navigator.clipboard?.writeText(emails.join(", ")).then(() => showToast(`${emails.length} emails copied \u2014 paste into BCC and attach the report.`)).catch(() => showToast("Copy failed.", "err"));
+    copyText(emails.join(", ")).then(() => showToast(`${emails.length} emails copied \u2014 paste into BCC and attach the report.`)).catch(() => showToast("Copy failed.", "err"));
   };
   return /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement(AdviceAlertsPanel, { db, user, commit, showToast }), /* @__PURE__ */ React.createElement(AdviceTracePanel, { db, showToast }), /* @__PURE__ */ React.createElement("div", { className: "bg-white border border-slate-200 rounded-xl p-6 mb-4" }, /* @__PURE__ */ React.createElement("h2", { className: "text-base font-semibold mb-1 flex items-center gap-2" }, /* @__PURE__ */ React.createElement(Bell, { size: 18 }), " Buy / Sell advice alerts"), /* @__PURE__ */ React.createElement("p", { className: "text-sm text-slate-500 mb-4" }, "Upload an advice file (one stock). The symbol, ", /* @__PURE__ */ React.createElement("b", null, "BUY/SELL"), ", quantity and price are read from the sheet (symbol falls back to the file name's first word). Each client is matched to your master for the WhatsApp number. Re-uploading the same stock + date replaces that list."), /* @__PURE__ */ React.createElement(
     "div",
@@ -7690,12 +7720,9 @@ function SettingsTab({ db, commit, showToast }) {
   const copyForSheet = async () => {
     const rows = clientRows(db);
     const tsv = [SHEET_HEADER, ...rows].map((r) => r.join("	")).join("\n");
-    try {
-      await navigator.clipboard.writeText(tsv);
-      showToast(`Copied ${rows.length} rows \u2014 paste into cell A1.`);
-    } catch {
-      showToast("Copy blocked \u2014 use CSV export instead.", "err");
-    }
+    const ok = await copyText(tsv);
+    if (ok) showToast(`Copied ${rows.length} rows \u2014 paste into cell A1.`);
+    else showToast("Copy blocked \u2014 use the CSV export instead.", "err");
   };
   const exportCsv = () => {
     const rows = [];
@@ -7877,9 +7904,9 @@ function SettingsTab({ db, commit, showToast }) {
   }), !execShown.length && /* @__PURE__ */ React.createElement("div", { className: "px-3 py-6 text-center text-sm text-slate-400" }, execClients.length ? "No client matches that filter." : "No clients loaded yet.")))), /* @__PURE__ */ React.createElement(Card, { title: "Order-link gateway (execute links)", icon: Share2 }, /* @__PURE__ */ React.createElement("p", { className: "text-xs text-slate-500 mb-3" }, "Generates the one-click execute link used in Advice orders. Each link is gated to the client's WhatsApp number — it only opens for that number, and re-sending the same order reuses the same link rather than creating a duplicate. The Gateway itself doesn't accept calls straight from a browser (no CORS headers), so this needs a small local proxy running — see ", /* @__PURE__ */ React.createElement("code", { className: "bg-slate-100 px-1 rounded" }, "order-link-proxy/"), " in the repo for setup. ", /* @__PURE__ */ React.createElement("b", null, "The Gateway credentials live in that proxy's own .env, not in this browser.")), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("label", { className: "text-[11px] text-slate-500 block mb-1" }, "Proxy URL"), /* @__PURE__ */ React.createElement("input", { value: gwProxyUrl, onChange: (e) => setGwProxyUrl(e.target.value), placeholder: "http://localhost:8787", className: "w-full px-3 py-2 text-sm border border-slate-300 rounded-lg" })), /* @__PURE__ */ React.createElement("button", { onClick: saveGateway, className: "mt-3 bg-indigo-600 hover:bg-indigo-700 text-white text-sm px-4 py-2 rounded-lg" }, "Save gateway settings")), /* @__PURE__ */ React.createElement(Card, { title: "Google Sheet backup", icon: FileSpreadsheet }, /* @__PURE__ */ React.createElement("p", { className: "text-xs text-slate-500 mb-3" }, "Mirror the holdings into your sheet ", /* @__PURE__ */ React.createElement("b", null, "ADVISORY CLIENT DATA"), ". Two ways \u2014 the first always works."), /* @__PURE__ */ React.createElement("div", { className: "rounded-lg border border-emerald-200 bg-emerald-50/50 p-3 mb-4" }, /* @__PURE__ */ React.createElement("div", { className: "text-sm font-medium text-emerald-800 mb-1" }, "Method 1 \u2014 Copy & paste (recommended)"), /* @__PURE__ */ React.createElement("p", { className: "text-[12px] text-slate-600 mb-2" }, "Open the sheet \u2192 click cell ", /* @__PURE__ */ React.createElement("b", null, "A1"), " \u2192 paste. It fills in as columns."), /* @__PURE__ */ React.createElement("div", { className: "flex gap-2" }, /* @__PURE__ */ React.createElement("button", { onClick: copyForSheet, className: "bg-emerald-600 hover:bg-emerald-700 text-white text-sm px-4 py-2 rounded-lg flex items-center gap-1.5" }, /* @__PURE__ */ React.createElement(Download, { size: 15 }), " Copy rows for Google Sheet"), /* @__PURE__ */ React.createElement("button", { onClick: exportCsv, className: "text-sm text-emerald-700 px-3 py-2 rounded-lg border border-emerald-200 hover:bg-emerald-50" }, "Or download CSV"))), /* @__PURE__ */ React.createElement("details", { className: "rounded-lg border border-slate-200 p-3" }, /* @__PURE__ */ React.createElement("summary", { className: "text-sm font-medium text-slate-700 cursor-pointer" }, "Method 2 \u2014 Auto-send (self-hosted only)"), /* @__PURE__ */ React.createElement("p", { className: "text-[12px] text-amber-700 bg-amber-50 border border-amber-200 rounded-lg p-2 my-2" }, `The "Back up now" button below sends data straight to the sheet, but it only works when this console is hosted as a normal web page. Inside Claude it's blocked by the sandbox \u2014 that's the "could not reach the endpoint" message. Use Method 1 here.`), /* @__PURE__ */ React.createElement("ol", { className: "text-[12px] text-slate-600 list-decimal ml-4 space-y-1 mb-3" }, /* @__PURE__ */ React.createElement("li", null, "Open the sheet \u2192 ", /* @__PURE__ */ React.createElement("b", null, "Extensions \u2192 Apps Script"), ". Replace everything with the script below, set your own ", /* @__PURE__ */ React.createElement("code", { className: "bg-slate-100 px-1 rounded" }, "SECRET"), ", and ", /* @__PURE__ */ React.createElement("b", null, "Save"), "."), /* @__PURE__ */ React.createElement("li", null, /* @__PURE__ */ React.createElement("b", null, "Deploy \u2192 New deployment \u2192 Web app"), ". Execute as ", /* @__PURE__ */ React.createElement("b", null, "Me"), ", access ", /* @__PURE__ */ React.createElement("b", null, "Anyone"), ", authorise. Paste the ", /* @__PURE__ */ React.createElement("b", null, "Web app URL"), " below with the same secret."), /* @__PURE__ */ React.createElement("li", null, /* @__PURE__ */ React.createElement("b", null, "If only the header appears and no data:"), " you almost certainly edited the script without re-publishing. Go to ", /* @__PURE__ */ React.createElement("b", null, "Deploy \u2192 Manage deployments \u2192 \u270F\uFE0F Edit \u2192 Version: New version \u2192 Deploy"), ". Editing the code alone does ", /* @__PURE__ */ React.createElement("b", null, "not"), " update the live web app \u2014 it keeps running the old version."), /* @__PURE__ */ React.createElement("li", null, /* @__PURE__ */ React.createElement("b", null, "Test it:"), ' open the Web app URL in a browser tab. You should see "endpoint is live". The data lands in a tab named ', /* @__PURE__ */ React.createElement("b", null, "Holdings"), ' (created automatically) \u2014 check there. After a backup the script replies "wrote N data rows".'), /* @__PURE__ */ React.createElement("li", null, /* @__PURE__ */ React.createElement("b", null, "Live current prices:"), " the same web app also feeds the portfolio. Keep a tab named ", /* @__PURE__ */ React.createElement("b", null, "Sheet1"), " with a column for the ", /* @__PURE__ */ React.createElement("b", null, "symbol"), " (e.g. CARRARO) and one for the ", /* @__PURE__ */ React.createElement("b", null, "current price"), ' (header containing "current", "price", "LTP" or "close"). The report pulls these every couple of minutes, so Current price, Value and P/L stay live. After editing the script you must ', /* @__PURE__ */ React.createElement("b", null, "re-deploy a new version"), " for this to work."), /* @__PURE__ */ React.createElement("li", null, /* @__PURE__ */ React.createElement("b", null, "Cash & account type:"), " keep a tab named ", /* @__PURE__ */ React.createElement("b", null, "Cash"), " with the ", /* @__PURE__ */ React.createElement("b", null, "client name"), " in column 1 and the cash balance in column 2. Optionally add the ", /* @__PURE__ */ React.createElement("b", null, "client code"), " in column 3 (used in preference to the name when present) and the ", /* @__PURE__ */ React.createElement("b", null, "account type"), " (NRE / NRO / Resident Indian) in column 4. Cash, account type and a per-client ", /* @__PURE__ */ React.createElement("b", null, "Total portfolio"), " (holdings + cash) then appear in the report, with an account-type filter and stock weightages.")), /* @__PURE__ */ React.createElement("div", { className: "relative mb-3" }, /* @__PURE__ */ React.createElement("pre", { className: "whitespace-pre-wrap text-[11px] font-mono bg-slate-900 text-slate-100 rounded-lg p-3 pr-14 max-h-52 overflow-y-auto" }, APPS_SCRIPT), /* @__PURE__ */ React.createElement(
     "button",
     {
-      onClick: () => {
-        navigator.clipboard?.writeText(APPS_SCRIPT);
-        showToast("Apps Script copied.");
+      onClick: async () => {
+        const ok = await copyText(APPS_SCRIPT);
+        showToast(ok ? "Apps Script copied." : COPY_FAILED, ok ? "ok" : "err");
       },
       className: "absolute top-2 right-2 text-[11px] bg-white/15 hover:bg-white/25 text-white px-2 py-1 rounded"
     },
@@ -8545,7 +8572,7 @@ function GreetingModal({ db, onClose, showToast }) {
     }
     const hadName = /\{name\}/.test(t);
     if (hadName) t = t.split("{name}").join("Investor");
-    navigator.clipboard?.writeText(t).then(() => showToast(hadName ? "Message copied. WhatsApp broadcasts can't personalise names, so {name} was set to \u201CInvestor\u201D." : "Message copied \u2014 paste it into your WhatsApp broadcast, or use it as the image caption.")).catch(() => showToast("Copy failed \u2014 select the text and copy it manually.", "err"));
+    copyText(t).then(() => showToast(hadName ? "Message copied. WhatsApp broadcasts can't personalise names, so {name} was set to \u201CInvestor\u201D." : "Message copied \u2014 paste it into your WhatsApp broadcast, or use it as the image caption.")).catch(() => showToast("Copy failed \u2014 select the text and copy it manually.", "err"));
   };
   const emailAll = async () => {
     if (!recipients.length) {
@@ -8802,7 +8829,7 @@ function StatementModal({ data, client, onClose, showToast }) {
       showToast("This client holds no stocks.", "err");
       return;
     }
-    navigator.clipboard?.writeText(stockList).then(() => showToast("Stock list copied.")).catch(() => showToast("Copy failed \u2014 select the text and copy manually.", "err"));
+    copyText(stockList).then(() => showToast("Stock list copied.")).catch(() => showToast("Copy failed \u2014 select the text and copy manually.", "err"));
   };
   return /* @__PURE__ */ React.createElement(Modal, { onClose, title: "Portfolio statement", wide: true }, /* @__PURE__ */ React.createElement("div", { className: "text-xs text-slate-500 mb-3" }, "Share as an ", /* @__PURE__ */ React.createElement("b", null, "image"), " (best for WhatsApp) or an ", /* @__PURE__ */ React.createElement("b", null, "HTML file"), " (best for email). On a phone, \u201CShare image\u201D opens WhatsApp/Mail directly with the picture attached."), /* @__PURE__ */ React.createElement("div", { ref, className: "rounded-lg overflow-hidden border border-slate-200 max-h-[55vh] overflow-y-auto bg-slate-50" }, /* @__PURE__ */ React.createElement("div", { dangerouslySetInnerHTML: { __html: data.inner } })), /* @__PURE__ */ React.createElement("div", { className: "mt-3 flex items-center gap-2" }, /* @__PURE__ */ React.createElement("div", { className: "flex-1 min-w-0 text-xs text-slate-600 bg-slate-50 border border-slate-200 rounded-lg px-3 py-2 truncate", title: stockList }, stockList || "No stocks"), /* @__PURE__ */ React.createElement("button", { onClick: copyStocks, className: "shrink-0 text-xs px-3 py-2 rounded-lg border border-slate-200 hover:bg-slate-50" }, "Copy stocks")), /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap gap-2 mt-4" }, /* @__PURE__ */ React.createElement("button", { onClick: shareJpg, disabled: busy, className: "bg-indigo-600 hover:bg-indigo-700 text-white text-sm px-4 py-2 rounded-lg flex items-center gap-2 disabled:opacity-50" }, /* @__PURE__ */ React.createElement(Share2, { size: 15 }), " ", busy ? "Rendering\u2026" : "Share image"), /* @__PURE__ */ React.createElement("button", { onClick: saveJpg, disabled: busy, className: "text-sm px-3 py-2 rounded-lg border border-slate-200 hover:bg-slate-50 flex items-center gap-1.5 disabled:opacity-50" }, /* @__PURE__ */ React.createElement(Download, { size: 15 }), " Save JPG"), /* @__PURE__ */ React.createElement("button", { onClick: downloadHTML, className: "text-sm px-3 py-2 rounded-lg border border-slate-200 hover:bg-slate-50 flex items-center gap-1.5" }, /* @__PURE__ */ React.createElement(FileText, { size: 15 }), " Save HTML"), /* @__PURE__ */ React.createElement("button", { onClick: wa, className: "text-sm px-3 py-2 rounded-lg border border-emerald-200 text-emerald-700 hover:bg-emerald-50 flex items-center gap-1.5" }, /* @__PURE__ */ React.createElement(Send, { size: 15 }), " WhatsApp"), /* @__PURE__ */ React.createElement("button", { onClick: mail, className: "text-sm px-3 py-2 rounded-lg border border-blue-200 text-blue-700 hover:bg-blue-50 flex items-center gap-1.5" }, /* @__PURE__ */ React.createElement(Mail, { size: 15 }), " Email")));
 }
@@ -8877,7 +8904,7 @@ function AlertShareModal({ data, target, onClose, showToast }) {
     }
     window.location.href = `mailto:${encodeURIComponent(target.email)}?subject=${encodeURIComponent("Trade alert \u2014 Vasupradah")}&body=${encodeURIComponent(data.caption)}`;
   };
-  const copyText = () => navigator.clipboard?.writeText(data.caption).then(() => showToast("Alert text copied.")).catch(() => showToast("Copy failed.", "err"));
+  const copyText = () => copyText(data.caption).then(() => showToast("Alert text copied.")).catch(() => showToast("Copy failed.", "err"));
   return /* @__PURE__ */ React.createElement(Modal, { onClose, title: `Send alert \xB7 ${target.name}`, wide: true }, /* @__PURE__ */ React.createElement("div", { className: "text-xs text-slate-500 mb-3" }, "Send as a branded ", /* @__PURE__ */ React.createElement("b", null, "image (JPG)"), " \u2014 best for WhatsApp \u2014 an ", /* @__PURE__ */ React.createElement("b", null, "HTML file"), ", or plain ", /* @__PURE__ */ React.createElement("b", null, "text"), ". On a phone, \u201CShare image\u201D opens WhatsApp/Mail directly with the picture attached."), /* @__PURE__ */ React.createElement("div", { ref, className: "rounded-lg overflow-hidden border border-slate-200 max-h-[55vh] overflow-y-auto bg-slate-50" }, /* @__PURE__ */ React.createElement("div", { dangerouslySetInnerHTML: { __html: data.inner } })), /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap gap-2 mt-4" }, /* @__PURE__ */ React.createElement("button", { onClick: shareJpg, disabled: busy, className: "bg-indigo-600 hover:bg-indigo-700 text-white text-sm px-4 py-2 rounded-lg flex items-center gap-2 disabled:opacity-50" }, /* @__PURE__ */ React.createElement(Share2, { size: 15 }), " ", busy ? "Rendering\u2026" : "Share image"), /* @__PURE__ */ React.createElement("button", { onClick: saveJpg, disabled: busy, className: "text-sm px-3 py-2 rounded-lg border border-slate-200 hover:bg-slate-50 flex items-center gap-1.5 disabled:opacity-50" }, /* @__PURE__ */ React.createElement(Download, { size: 15 }), " Save JPG"), /* @__PURE__ */ React.createElement("button", { onClick: downloadHTML, className: "text-sm px-3 py-2 rounded-lg border border-slate-200 hover:bg-slate-50 flex items-center gap-1.5" }, /* @__PURE__ */ React.createElement(FileText, { size: 15 }), " Save HTML"), /* @__PURE__ */ React.createElement("button", { onClick: wa, className: "text-sm px-3 py-2 rounded-lg border border-emerald-200 text-emerald-700 hover:bg-emerald-50 flex items-center gap-1.5" }, /* @__PURE__ */ React.createElement(Send, { size: 15 }), " WhatsApp text"), /* @__PURE__ */ React.createElement("button", { onClick: mail, className: "text-sm px-3 py-2 rounded-lg border border-blue-200 text-blue-700 hover:bg-blue-50 flex items-center gap-1.5" }, /* @__PURE__ */ React.createElement(Mail, { size: 15 }), " Email"), /* @__PURE__ */ React.createElement("button", { onClick: copyText, className: "text-sm px-3 py-2 rounded-lg border border-slate-200 hover:bg-slate-50" }, "Copy text")));
 }
 function StockNoteModal({ db, row, content, setContent, onClose, showToast }) {
@@ -9054,7 +9081,7 @@ Note: this exceeds the cash currently available in the account (${money(rb.cash)
     window.location.href = `mailto:${encodeURIComponent(row.email)}?subject=${encodeURIComponent((content.heading || "Update on " + row.stock) + " \u2014 Vasupradah")}&body=${encodeURIComponent(data.caption)}`;
     logRebalance("email");
   };
-  const copyText = () => navigator.clipboard?.writeText(data.caption).then(() => showToast("Message text copied.")).catch(() => showToast("Copy failed.", "err"));
+  const copyText = () => copyText(data.caption).then(() => showToast("Message text copied.")).catch(() => showToast("Copy failed.", "err"));
   return /* @__PURE__ */ React.createElement(Modal, { onClose, title: `Message about ${row.stock} \xB7 ${row.name || row.code}`, wide: true }, /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-1 md:grid-cols-2 gap-4" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("label", { className: "text-xs text-slate-500" }, "Heading"), /* @__PURE__ */ React.createElement(
     "input",
     {
@@ -9093,7 +9120,7 @@ Note: this exceeds the cash currently available in the account (${money(rb.cash)
 }
 function PreviewModal({ db, client, onClose, onSend, onEmail }) {
   const msg = buildMessage(db, client);
-  return /* @__PURE__ */ React.createElement(Modal, { onClose, title: `Message \xB7 ${client.name || client.code}` }, /* @__PURE__ */ React.createElement("pre", { className: "whitespace-pre-wrap text-xs bg-slate-50 border border-slate-200 rounded-lg p-3 max-h-72 overflow-y-auto" }, msg), /* @__PURE__ */ React.createElement("div", { className: "flex gap-2 mt-4" }, /* @__PURE__ */ React.createElement("button", { onClick: onSend, className: "bg-emerald-600 hover:bg-emerald-700 text-white text-sm px-4 py-2 rounded-lg flex items-center gap-2 flex-1 justify-center" }, /* @__PURE__ */ React.createElement(Send, { size: 15 }), " WhatsApp"), /* @__PURE__ */ React.createElement("button", { onClick: onEmail, className: "bg-blue-600 hover:bg-blue-700 text-white text-sm px-4 py-2 rounded-lg flex items-center gap-2 flex-1 justify-center" }, /* @__PURE__ */ React.createElement(Mail, { size: 15 }), " Email"), /* @__PURE__ */ React.createElement("button", { onClick: () => navigator.clipboard?.writeText(msg), className: "text-slate-600 text-sm px-4 py-2 rounded-lg border border-slate-200 hover:bg-slate-50" }, "Copy")));
+  return /* @__PURE__ */ React.createElement(Modal, { onClose, title: `Message \xB7 ${client.name || client.code}` }, /* @__PURE__ */ React.createElement("pre", { className: "whitespace-pre-wrap text-xs bg-slate-50 border border-slate-200 rounded-lg p-3 max-h-72 overflow-y-auto" }, msg), /* @__PURE__ */ React.createElement("div", { className: "flex gap-2 mt-4" }, /* @__PURE__ */ React.createElement("button", { onClick: onSend, className: "bg-emerald-600 hover:bg-emerald-700 text-white text-sm px-4 py-2 rounded-lg flex items-center gap-2 flex-1 justify-center" }, /* @__PURE__ */ React.createElement(Send, { size: 15 }), " WhatsApp"), /* @__PURE__ */ React.createElement("button", { onClick: onEmail, className: "bg-blue-600 hover:bg-blue-700 text-white text-sm px-4 py-2 rounded-lg flex items-center gap-2 flex-1 justify-center" }, /* @__PURE__ */ React.createElement(Mail, { size: 15 }), " Email"), /* @__PURE__ */ React.createElement("button", { onClick: () => copyText(msg), className: "text-slate-600 text-sm px-4 py-2 rounded-lg border border-slate-200 hover:bg-slate-50" }, "Copy")));
 }
 function ConfirmModal({ title, body, confirmLabel, tone, onConfirm, onClose }) {
   return /* @__PURE__ */ React.createElement(Modal, { onClose, title }, /* @__PURE__ */ React.createElement("p", { className: "text-sm text-slate-600" }, body), /* @__PURE__ */ React.createElement("div", { className: "flex gap-2 mt-5" }, /* @__PURE__ */ React.createElement("button", { onClick: onConfirm, className: `text-white text-sm px-4 py-2 rounded-lg flex-1 ${tone === "danger" ? "bg-rose-600 hover:bg-rose-700" : "bg-indigo-600 hover:bg-indigo-700"}` }, confirmLabel), /* @__PURE__ */ React.createElement("button", { onClick: onClose, className: "text-slate-500 text-sm px-4 py-2 rounded-lg hover:bg-slate-100" }, "Cancel")));
