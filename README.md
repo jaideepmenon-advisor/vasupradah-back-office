@@ -154,6 +154,35 @@ batch gets `… — 3 orders` instead.
 Note that order **sizing** still uses the live market price, so a limit order
 far from the market will show a quantity based on the market price.
 
+## Advice contacts (order-link login numbers)
+
+A client often opens the order link with a **different mobile from the
+WhatsApp number in Holdings**, and the link only opens for the number it was
+tagged with. So the two are kept apart:
+
+- **Holdings → WhatsApp column** — used for WhatsApp alerts. Unchanged.
+- **`AdviceContacts` tab** — the mobile used to open an order link. When a
+  client has a row here, order links are tagged with that number; otherwise
+  the WhatsApp number is used as before.
+
+Upload it in **Upload Data → Advice contacts (order-link logins)** from a
+`.xlsx` or `.csv` with these columns, in this order:
+
+```
+client code | client name | email id | mobile number | risk category | PAN number
+```
+
+A header row is optional — the columns are matched by name when a header is
+present and by position when it isn't (a headerless file keeps its first
+client rather than losing it to the header). The preview shows how many rows
+carry a mobile, how many differ from the WhatsApp number on file, and how
+many client codes aren't recognised, before anything is saved. Rows are
+upserted by client code into the sheet, so re-uploading corrects rows rather
+than duplicating them.
+
+Only the **mobile** changes behaviour today; name, email, risk and PAN are
+stored alongside it for reference and do not override the client master.
+
 ## Order-link gateway (Advice orders)
 
 The one-click "Click Here To Execute the Order" link sent in Advice orders is

@@ -62,7 +62,7 @@ function setup() {
 
 function doGet(e) {
   var p = (e && e.parameter) || {};
-  if (!p.prices && !p.alerts && !p.trades && !p.holdings && !p.gridkey && !p.greeting_status && !p.advice_alerts && !p.advice_trace && !p.ping && !p.pipeline && !p.baskets && !p.manual_trades && !p.client_details && !p.exec_modes && !p.shorten && !p.dedupe && !p.gk_probe) {
+  if (!p.prices && !p.alerts && !p.trades && !p.holdings && !p.gridkey && !p.greeting_status && !p.advice_alerts && !p.advice_trace && !p.ping && !p.pipeline && !p.baskets && !p.manual_trades && !p.client_details && !p.exec_modes && !p.advice_contacts && !p.shorten && !p.dedupe && !p.gk_probe) {
     return ContentService.createTextOutput("Vasupradah backup endpoint is live (use POST from the console).");
   }
 
@@ -277,6 +277,15 @@ function doGet(e) {
   // Stock baskets by risk category, kept in the "Baskets" tab so they survive a device reset.
   // Per-client order method (email approval vs execute link), kept in "OrderMethod"
   // so the choice survives a device reset and reaches every staff device.
+  // Advice contact set: the mobile a client uses to open an order link, which is
+  // often NOT the WhatsApp number in Holdings. Kept in "AdviceContacts".
+  if (p.advice_contacts) {
+    var acss = SpreadsheetApp.getActiveSpreadsheet();
+    var acsh = acss.getSheetByName("AdviceContacts");
+    if (!acsh || acsh.getLastRow() < 2) return ContentService.createTextOutput(JSON.stringify({ ok: true, rows: [] })).setMimeType(ContentService.MimeType.JSON);
+    return ContentService.createTextOutput(JSON.stringify({ ok: true, rows: acsh.getDataRange().getValues() })).setMimeType(ContentService.MimeType.JSON);
+  }
+
   if (p.exec_modes) {
     var xss = SpreadsheetApp.getActiveSpreadsheet();
     var xsh = xss.getSheetByName("OrderMethod");
@@ -621,6 +630,32 @@ function doPost(e) {
   //     here, never by a reload, a fresh device or an empty local copy. ---
   // Upsert by client code, so changing a client from one model to the other later
   // just rewrites that row.
+  // Upsert by client code so a re-upload corrects rows instead of duplicating them.
+  if (body.type === "advice_contacts") {
+    var acHdr = ["Client code", "Name", "Email", "Mobile", "Risk category", "PAN", "Updated at"];
+    var acss2 = SpreadsheetApp.getActiveSpreadsheet();
+    var acsh2 = acss2.getSheetByName("AdviceContacts");
+    if (!acsh2) { acsh2 = acss2.insertSheet("AdviceContacts"); acsh2.getRange(1, 1, 1, acHdr.length).setValues([acHdr]); }
+    if (acsh2.getLastRow() < 1) acsh2.getRange(1, 1, 1, acHdr.length).setValues([acHdr]);
+    var acAll = acsh2.getLastRow() > 1 ? acsh2.getRange(2, 1, acsh2.getLastRow() - 1, acHdr.length).getValues() : [];
+    var acIn = Array.isArray(body.rows) ? body.rows : [];
+    var acAdd = 0, acUpd = 0;
+    for (var ai = 0; ai < acIn.length; ai++) {
+      var ar = acIn[ai] || {};
+      var aCode = String(ar.code || "").trim();
+      if (!aCode) continue;
+      // Mobile is stored as text so a leading zero or "+" survives the sheet.
+      var aRow = [aCode, String(ar.name || ""), String(ar.email || ""), "'" + String(ar.mobile || ""),
+        String(ar.risk || ""), String(ar.pan || ""), Date.now()];
+      var aHit = -1;
+      for (var aj = 0; aj < acAll.length; aj++) if (String(acAll[aj][0]).trim() === aCode) { aHit = aj; break; }
+      if (aHit >= 0) { acsh2.getRange(aHit + 2, 1, 1, acHdr.length).setValues([aRow]); acAll[aHit] = aRow; acUpd++; }
+      else { acsh2.appendRow(aRow); acAll.push(aRow); acAdd++; }
+    }
+    SpreadsheetApp.flush();
+    return ContentService.createTextOutput("ok: advice contacts +" + acAdd + " ~" + acUpd);
+  }
+
   if (body.type === "exec_modes") {
     var xHdr = ["Client code", "Name", "Method", "Updated at"];
     var xss2 = SpreadsheetApp.getActiveSpreadsheet();

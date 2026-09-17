@@ -624,6 +624,7 @@ const defaultDB = () => ({
   // "gateway" (one-click execute link). Keyed by client code; unset = email.
   execMode: {},
   execModeAt: {},
+  adviceContacts: {},
   approveTo: DEFAULT_APPROVE_TO,
   rejectTo: DEFAULT_REJECT_TO,
   approveText: DEFAULT_APPROVE_TEXT,
@@ -969,10 +970,12 @@ function normalizeRisk(v) {
     lowrisk: "Low Risk",
     low: "Low Risk",
     mediumtolowrisk: "Medium to Low Risk",
+    mediumtolow: "Medium to Low Risk",
     mediumlow: "Medium to Low Risk",
     medtolow: "Medium to Low Risk",
     ml: "Medium to Low Risk",
     mediumtohighrisk: "Medium to High Risk",
+    mediumtohigh: "Medium to High Risk",
     mediumhigh: "Medium to High Risk",
     medtohigh: "Medium to High Risk",
     mh: "Medium to High Risk",
@@ -982,6 +985,10 @@ function normalizeRisk(v) {
   };
   return map[t] || s;
 }
+// The order-link login number, falling back to the WhatsApp number when a client
+// has no separate advice contact on file.
+const adviceMobileOf = (db, code) => String(((db && db.adviceContacts || {})[String(code ?? "").trim()] || {}).mobile || "").trim();
+const orderPhoneOf = (db, code, whatsapp) => adviceMobileOf(db, code) || String(whatsapp || "");
 const EXEC_MODE_LABEL = { email: "Email approval", gateway: "Execute link" };
 const execModeOf = (db, code) => (db && db.execMode || {})[String(code ?? "").trim()] === "gateway" ? "gateway" : "email";
 const mailList = (s) => String(s || "").split(/[,;]/).map((x) => x.trim()).filter((x) => x.includes("@"));
@@ -1156,6 +1163,39 @@ function parseCombinedRow(row) {
     cmp,
     avg,
     descriptor: String(g.portfolio ?? g.portfolioname ?? "").trim()
+  };
+}
+// Advice contacts: client code, client name, email id, mobile number, risk
+// category, PAN. The mobile here is the number the client uses to open an order
+// link, which is deliberately separate from the WhatsApp number in Holdings.
+const CONTACT_FIELDS = ["code", "name", "email", "mobile", "risk", "pan"];
+const CONTACT_HEADER_KEYS = ["clientcode", "code", "portfoliocode", "clientname", "name", "emailid", "email",
+  "emailaddress", "mobilenumber", "mobile", "phone", "phonenumber", "loginnumber", "loginmobile",
+  "riskcategory", "risk", "category", "riskprofile", "pan", "pannumber", "panno"];
+const looksLikeContactHeader = (keys) => (keys || []).some((k) => CONTACT_HEADER_KEYS.includes(normKey(k)));
+function parseContactRow(row) {
+  const rec = {};
+  const keys = Object.keys(row || {});
+  for (const k of keys) {
+    const n = normKey(k);
+    if (["clientcode", "code", "portfoliocode"].includes(n)) rec.code = row[k];
+    else if (["clientname", "name"].includes(n)) rec.name = row[k];
+    else if (["emailid", "email", "emailaddress"].includes(n)) rec.email = row[k];
+    else if (["mobilenumber", "mobile", "phone", "phonenumber", "loginnumber", "loginmobile"].includes(n)) rec.mobile = row[k];
+    else if (["riskcategory", "risk", "category", "riskprofile"].includes(n)) rec.risk = row[k];
+    else if (["pan", "pannumber", "panno"].includes(n)) rec.pan = row[k];
+  }
+  // No recognisable header: fall back to the documented column order.
+  if (rec.code == null) CONTACT_FIELDS.forEach((f, i) => {
+    if (rec[f] == null && keys[i] != null) rec[f] = row[keys[i]];
+  });
+  return {
+    code: String(rec.code ?? "").trim(),
+    name: String(rec.name ?? "").trim(),
+    email: String(rec.email ?? "").trim(),
+    mobile: waDisplay(rec.mobile),
+    risk: normalizeRisk(rec.risk),
+    pan: String(rec.pan ?? "").trim().toUpperCase()
   };
 }
 function parseClientRow(row) {
@@ -1719,7 +1759,7 @@ function setup() {
 
 function doGet(e) {
   var p = (e && e.parameter) || {};
-  if (!p.prices && !p.alerts && !p.trades && !p.holdings && !p.gridkey && !p.greeting_status && !p.advice_alerts && !p.advice_trace && !p.ping && !p.pipeline && !p.baskets && !p.manual_trades && !p.client_details && !p.exec_modes && !p.shorten && !p.dedupe && !p.gk_probe) {
+  if (!p.prices && !p.alerts && !p.trades && !p.holdings && !p.gridkey && !p.greeting_status && !p.advice_alerts && !p.advice_trace && !p.ping && !p.pipeline && !p.baskets && !p.manual_trades && !p.client_details && !p.exec_modes && !p.advice_contacts && !p.shorten && !p.dedupe && !p.gk_probe) {
     return ContentService.createTextOutput("Vasupradah backup endpoint is live (use POST from the console).");
   }
 
@@ -1934,6 +1974,15 @@ function doGet(e) {
   // Stock baskets by risk category, kept in the "Baskets" tab so they survive a device reset.
   // Per-client order method (email approval vs execute link), kept in "OrderMethod"
   // so the choice survives a device reset and reaches every staff device.
+  // Advice contact set: the mobile a client uses to open an order link, which is
+  // often NOT the WhatsApp number in Holdings. Kept in "AdviceContacts".
+  if (p.advice_contacts) {
+    var acss = SpreadsheetApp.getActiveSpreadsheet();
+    var acsh = acss.getSheetByName("AdviceContacts");
+    if (!acsh || acsh.getLastRow() < 2) return ContentService.createTextOutput(JSON.stringify({ ok: true, rows: [] })).setMimeType(ContentService.MimeType.JSON);
+    return ContentService.createTextOutput(JSON.stringify({ ok: true, rows: acsh.getDataRange().getValues() })).setMimeType(ContentService.MimeType.JSON);
+  }
+
   if (p.exec_modes) {
     var xss = SpreadsheetApp.getActiveSpreadsheet();
     var xsh = xss.getSheetByName("OrderMethod");
@@ -2278,6 +2327,32 @@ function doPost(e) {
   //     here, never by a reload, a fresh device or an empty local copy. ---
   // Upsert by client code, so changing a client from one model to the other later
   // just rewrites that row.
+  // Upsert by client code so a re-upload corrects rows instead of duplicating them.
+  if (body.type === "advice_contacts") {
+    var acHdr = ["Client code", "Name", "Email", "Mobile", "Risk category", "PAN", "Updated at"];
+    var acss2 = SpreadsheetApp.getActiveSpreadsheet();
+    var acsh2 = acss2.getSheetByName("AdviceContacts");
+    if (!acsh2) { acsh2 = acss2.insertSheet("AdviceContacts"); acsh2.getRange(1, 1, 1, acHdr.length).setValues([acHdr]); }
+    if (acsh2.getLastRow() < 1) acsh2.getRange(1, 1, 1, acHdr.length).setValues([acHdr]);
+    var acAll = acsh2.getLastRow() > 1 ? acsh2.getRange(2, 1, acsh2.getLastRow() - 1, acHdr.length).getValues() : [];
+    var acIn = Array.isArray(body.rows) ? body.rows : [];
+    var acAdd = 0, acUpd = 0;
+    for (var ai = 0; ai < acIn.length; ai++) {
+      var ar = acIn[ai] || {};
+      var aCode = String(ar.code || "").trim();
+      if (!aCode) continue;
+      // Mobile is stored as text so a leading zero or "+" survives the sheet.
+      var aRow = [aCode, String(ar.name || ""), String(ar.email || ""), "'" + String(ar.mobile || ""),
+        String(ar.risk || ""), String(ar.pan || ""), Date.now()];
+      var aHit = -1;
+      for (var aj = 0; aj < acAll.length; aj++) if (String(acAll[aj][0]).trim() === aCode) { aHit = aj; break; }
+      if (aHit >= 0) { acsh2.getRange(aHit + 2, 1, 1, acHdr.length).setValues([aRow]); acAll[aHit] = aRow; acUpd++; }
+      else { acsh2.appendRow(aRow); acAll.push(aRow); acAdd++; }
+    }
+    SpreadsheetApp.flush();
+    return ContentService.createTextOutput("ok: advice contacts +" + acAdd + " ~" + acUpd);
+  }
+
   if (body.type === "exec_modes") {
     var xHdr = ["Client code", "Name", "Method", "Updated at"];
     var xss2 = SpreadsheetApp.getActiveSpreadsheet();
@@ -3659,6 +3734,40 @@ async function pushClientDetails(db, row) {
     return false;
   }
 }
+async function pullAdviceContacts(url) {
+  const res = await fetch(url + (url.includes("?") ? "&" : "?") + "advice_contacts=1");
+  const data = await res.json();
+  const rows = Array.isArray(data.rows) ? data.rows : [];
+  if (rows.length < 2) return {};
+  const out = {};
+  for (const r of rows.slice(1)) {
+    const code = String(r[0] || "").trim();
+    if (!code) continue;
+    out[code] = {
+      name: String(r[1] || ""),
+      email: String(r[2] || "").trim(),
+      mobile: waDisplay(r[3]),
+      risk: String(r[4] || ""),
+      pan: String(r[5] || ""),
+      updatedAt: num(r[6])
+    };
+  }
+  return out;
+}
+async function pushAdviceContacts(db, rows) {
+  if (!(db.sheetUrl || "").trim() || !(rows || []).length) return false;
+  try {
+    await fetch(db.sheetUrl, {
+      method: "POST",
+      mode: "no-cors",
+      headers: { "Content-Type": "text/plain;charset=utf-8" },
+      body: JSON.stringify({ token: db.sheetToken || "", type: "advice_contacts", rows })
+    });
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
 async function pullExecModes(url) {
   const res = await fetch(url + (url.includes("?") ? "&" : "?") + "exec_modes=1");
   const data = await res.json();
@@ -3979,17 +4088,18 @@ function AdviceOrders({ db, commit, showToast }) {
   const ensureGatewayLinks = async (us) => {
     const jobs = [];
     for (const u of us || []) {
-      const hasPhone = !!waNumber(u.whatsapp);
+      const orderPhone = orderPhoneOf(db, u.code, u.whatsapp);
+      const hasPhone = !!waNumber(orderPhone);
       for (const l of u.lines) {
         const key = gwKey(u, l);
         if (gwLinkRef.current[key] != null) continue;
         if (!hasPhone) {
-          gwLinkRef.current[key] = { url: "", error: "no WhatsApp number on file for this client" };
+          gwLinkRef.current[key] = { url: "", error: "no order-link mobile on file for this client" };
           continue;
         }
         jobs.push((async () => {
           const lim = l.orderType === "LIMIT" && num(l.limitPrice) > 0 ? num(l.limitPrice) : null;
-          const r = await gwCreateOrderLink(db, { code: u.code, phone: u.whatsapp, sym: l.sym || l.stock, qty: l.qty, side: l.side, orderType: lim ? "LIMIT" : "MARKET", price: lim });
+          const r = await gwCreateOrderLink(db, { code: u.code, phone: orderPhone, sym: l.sym || l.stock, qty: l.qty, side: l.side, orderType: lim ? "LIMIT" : "MARKET", price: lim });
           gwLinkRef.current[key] = r.ok ? { url: r.url } : { url: "", error: r.error };
           if (!r.ok) console.error("Order link failed for", u.code, l.sym || l.stock, r.error);
         })());
@@ -5149,6 +5259,22 @@ function App() {
         }
         if (sigD(mergedD) !== sigD(curD.clientDetails)) await commit((d) => {
           d.clientDetails = mergedD;
+        }, "team sync pull");
+      } catch (e) {
+      }
+      try {
+        const remoteC = await pullAdviceContacts(url);
+        const curC = await loadDB() || latest;
+        const mergedC = { ...curC.adviceContacts || {} };
+        let changedC = false;
+        for (const [code, v] of Object.entries(remoteC)) {
+          const mine = mergedC[code];
+          if (mine && num(mine.updatedAt) >= num(v.updatedAt)) continue;
+          mergedC[code] = v;
+          changedC = true;
+        }
+        if (changedC) await commit((d) => {
+          d.adviceContacts = mergedC;
         }, "team sync pull");
       } catch (e) {
       }
@@ -6737,6 +6863,29 @@ function UploadTab({ db, commit, showToast }) {
         }
         setPending({ kind: "holdings", recs, added, updated, removed, skipped, absent });
       });
+    } else if (mode === "contacts") {
+      readFile(file, (rows) => {
+        const keys = Object.keys(rows[0] || {});
+        let source = rows;
+        if (rows.length && !looksLikeContactHeader(keys)) {
+          // No header row, so the parser turned the first client into the column
+          // names. Put that record back and read everything by position.
+          const asRow = (arr) => {
+            const o = {};
+            CONTACT_FIELDS.forEach((f, i) => o[f] = arr[i] ?? "");
+            return o;
+          };
+          source = [asRow(keys), ...rows.map((r) => asRow(keys.map((k) => r[k])))];
+        }
+        const recs = source.map(parseContactRow).filter((r) => r.code);
+        const withMobile = recs.filter((r) => waNumber(r.mobile)).length;
+        const unknown = recs.filter((r) => !db.clients[r.code]).length;
+        const differs = recs.filter((r) => {
+          const c = db.clients[r.code];
+          return c && waNumber(r.mobile) && waNumber(c.whatsapp) && waNumber(r.mobile) !== waNumber(c.whatsapp);
+        }).length;
+        setPending({ kind: "contacts", recs, withMobile, unknown, differs });
+      });
     } else {
       readFile(file, (rows) => {
         const recs = rows.map(parseClientRow).filter((r) => r.code);
@@ -6837,6 +6986,17 @@ function UploadTab({ db, commit, showToast }) {
       showToast(res.ok ? "Also backed up to Google Sheet." : res.msg || "Sheet backup failed \u2014 open Settings and click Back up now (push).", res.ok ? "ok" : "err");
     }
   };
+  const applyContacts = async () => {
+    const { recs } = pending;
+    await commit((d) => {
+      const m = { ...d.adviceContacts || {} }, now = Date.now();
+      for (const r of recs) m[r.code] = { name: r.name, email: r.email, mobile: r.mobile, risk: r.risk, pan: r.pan, updatedAt: now };
+      d.adviceContacts = m;
+    }, "upload advice contacts");
+    const ok = await pushAdviceContacts(db, recs);
+    showToast(`Advice contacts: ${recs.length} row(s) saved${ok ? " to the sheet's AdviceContacts tab" : " on this device only \u2014 the sheet wasn't reachable"}.`, ok ? "ok" : "err");
+    setPending(null);
+  };
   const applyClients = async () => {
     const { recs, added, updated } = pending;
     await commit((d) => {
@@ -6862,7 +7022,10 @@ function UploadTab({ db, commit, showToast }) {
   } }, "Stock holdings"), /* @__PURE__ */ React.createElement(ModeBtn, { active: mode === "clients", icon: Contact, onClick: () => {
     setMode("clients");
     reset();
-  } }, "Client master")), /* @__PURE__ */ React.createElement("div", { className: "bg-white border border-slate-200 rounded-xl p-6" }, mode === "combined" ? /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("h2", { className: "text-base font-semibold mb-1 flex items-center gap-2" }, /* @__PURE__ */ React.createElement(FileSpreadsheet, { size: 18 }), " Upload the GridKey combined holdings"), /* @__PURE__ */ React.createElement("p", { className: "text-sm text-slate-500 mb-4" }, "This is the one file that has ", /* @__PURE__ */ React.createElement("b", null, "every client and every stock"), " in a single sheet \u2014 GridKey's", /* @__PURE__ */ React.createElement("b", null, " combined holdings"), " export (Holdings Overview \u2192 export). It is already ", /* @__PURE__ */ React.createElement("b", null, "split/bonus adjusted"), " and carries the live ", /* @__PURE__ */ React.createElement("b", null, "CMP"), ", so it fixes the quantity, average price and price for every holding at once. It replaces all current positions: stocks that have been fully sold are removed, and client names / WhatsApp numbers you already have are kept. Undo reverses it.")) : mode === "holdings" ? /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("h2", { className: "text-base font-semibold mb-1 flex items-center gap-2" }, /* @__PURE__ */ React.createElement(Layers, { size: 18 }), " Upload one stock's holdings"), /* @__PURE__ */ React.createElement("p", { className: "text-sm text-slate-500 mb-4" }, "Each file is ", /* @__PURE__ */ React.createElement("b", null, "one stock"), ", with a row per client (column 1 = client code, column 2 = client details). Type the stock name below \u2014 it's applied to every client in the file. ", /* @__PURE__ */ React.createElement("b", null, "Re-uploading the same stock replaces its holder list"), ": clients in the file are added or updated, and anyone not in the file (or with zero quantity) is removed from that stock. Other stocks are untouched, and Undo reverses it."), /* @__PURE__ */ React.createElement("label", { className: "text-xs text-slate-500" }, "Stock / scrip name"), /* @__PURE__ */ React.createElement(
+  } }, "Client master"), /* @__PURE__ */ React.createElement(ModeBtn, { active: mode === "contacts", icon: Share2, onClick: () => {
+    setMode("contacts");
+    reset();
+  } }, "Advice contacts (order-link logins)")), /* @__PURE__ */ React.createElement("div", { className: "bg-white border border-slate-200 rounded-xl p-6" }, mode === "combined" ? /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("h2", { className: "text-base font-semibold mb-1 flex items-center gap-2" }, /* @__PURE__ */ React.createElement(FileSpreadsheet, { size: 18 }), " Upload the GridKey combined holdings"), /* @__PURE__ */ React.createElement("p", { className: "text-sm text-slate-500 mb-4" }, "This is the one file that has ", /* @__PURE__ */ React.createElement("b", null, "every client and every stock"), " in a single sheet \u2014 GridKey's", /* @__PURE__ */ React.createElement("b", null, " combined holdings"), " export (Holdings Overview \u2192 export). It is already ", /* @__PURE__ */ React.createElement("b", null, "split/bonus adjusted"), " and carries the live ", /* @__PURE__ */ React.createElement("b", null, "CMP"), ", so it fixes the quantity, average price and price for every holding at once. It replaces all current positions: stocks that have been fully sold are removed, and client names / WhatsApp numbers you already have are kept. Undo reverses it.")) : mode === "holdings" ? /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("h2", { className: "text-base font-semibold mb-1 flex items-center gap-2" }, /* @__PURE__ */ React.createElement(Layers, { size: 18 }), " Upload one stock's holdings"), /* @__PURE__ */ React.createElement("p", { className: "text-sm text-slate-500 mb-4" }, "Each file is ", /* @__PURE__ */ React.createElement("b", null, "one stock"), ", with a row per client (column 1 = client code, column 2 = client details). Type the stock name below \u2014 it's applied to every client in the file. ", /* @__PURE__ */ React.createElement("b", null, "Re-uploading the same stock replaces its holder list"), ": clients in the file are added or updated, and anyone not in the file (or with zero quantity) is removed from that stock. Other stocks are untouched, and Undo reverses it."), /* @__PURE__ */ React.createElement("label", { className: "text-xs text-slate-500" }, "Stock / scrip name"), /* @__PURE__ */ React.createElement(
     "input",
     {
       value: stock,
@@ -6926,6 +7089,16 @@ function UploadTab({ db, commit, showToast }) {
       headers: ["Code", "Name", "Email", "WhatsApp", "Risk"],
       rows: pending.recs.slice(0, 200).map((r) => [r.code, r.name, r.email, waDisplay(r.whatsapp), r.risk || "\u2014", false]),
       applyLabel: "Apply client master"
+    }
+  ), pending && pending.kind === "contacts" && /* @__PURE__ */ React.createElement(
+    ReviewCard,
+    {
+      onApply: applyContacts,
+      onCancel: () => setPending(null),
+      stats: [["Rows", pending.recs.length], ["With a mobile", pending.withMobile, "pos"], ["Differs from WhatsApp", pending.differs], ["Unknown code", pending.unknown, pending.unknown ? "neg" : null]],
+      headers: ["Code", "Name", "Email", "Order-link mobile", "Risk", "PAN"],
+      rows: pending.recs.slice(0, 200).map((r) => [r.code, r.name, r.email, waDisplay(r.mobile) || "\u2014", r.risk || "\u2014", r.pan || "\u2014", !waNumber(r.mobile)]),
+      applyLabel: "Save advice contacts"
     }
   ), /* @__PURE__ */ React.createElement(ManualTradePanel, { db, showToast }));
 }
