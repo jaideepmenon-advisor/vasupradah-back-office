@@ -1,15 +1,6 @@
-// Vasupradah backend — Google Apps Script Web App.
-//
-// This file mirrors the Apps Script project's Code.gs. The console
-// (console/VasupradahClientConsole.html) also carries its own embedded copy
-// of the backend under its APPS_SCRIPT constant (Settings tab -> "Copy
-// backend code") for in-app copy-paste convenience. The two can drift when
-// either is edited alone — keep them in sync by hand until a build step
-// wires them together.
-
 /************************************************************************
- *  Vasupradah Investment Advisory - Client Console  ·  Google Apps Script
- *  Principal Officer: Jaideep Menon  ·  SEBI Registered Investment Adviser
+ *  Vasupradah Investment Advisory - Client Console  -  Google Apps Script
+ *  Principal Officer: Jaideep Menon  -  SEBI Registered Investment Adviser
  *
  *  ====================  SETUP ORDER  (do not skip / reorder)  ==========
  *
@@ -56,7 +47,7 @@
 
 // ============================================================================
 //  Vasupradah backend. FIRST TIME: pick "setup" in the function dropdown above
-//  and press Run once — approve the permissions (including "send email as you").
+//  and press Run once - approve the permissions (including "send email as you").
 //  It emails you a confirmation. Then Deploy > Manage deployments > Edit > New version.
 // ============================================================================
 function setup() {
@@ -76,7 +67,7 @@ function doGet(e) {
   }
 
   // Diagnostics: confirms this deployment is current, which Google account it sends mail as, and
-  // how much Gmail quota is left today. Used by Settings → Email diagnostics.
+  // how much Gmail quota is left today. Used by Settings -> Email diagnostics.
   if (p.ping) {
     var pq = 0; try { pq = MailApp.getRemainingDailyQuota(); } catch (ePq) { pq = -1; }
     var pu = ""; try { pu = Session.getEffectiveUser().getEmail(); } catch (ePu) { pu = ""; }
@@ -260,7 +251,7 @@ function doGet(e) {
           var tt = String(tr.getContentText() || "").trim();
           if (tt.indexOf("http") === 0) shortUrl = tt;
         }
-      } else {   // default: is.gd — free, no account, no tracking
+      } else {   // default: is.gd - free, no account, no tracking
         var ir = UrlFetchApp.fetch("https://is.gd/create.php?format=simple&url=" + encodeURIComponent(longUrl), { muteHttpExceptions: true });
         if (ir.getResponseCode() === 200) {
           var it = String(ir.getContentText() || "").trim();
@@ -321,7 +312,7 @@ function doGet(e) {
   }
 
   // Advice alerts pushed by the Principal Officer, so staff on any device can send them from
-  // the Advice Alerts tab. Stored one row per (batch × client) in the "AdviceAlerts" tab.
+  // the Advice Alerts tab. Stored one row per (batch x client) in the "AdviceAlerts" tab.
   if (p.advice_alerts) {
     var ass = SpreadsheetApp.getActiveSpreadsheet();
     var ash = ass.getSheetByName("AdviceAlerts");
@@ -338,7 +329,7 @@ function doGet(e) {
     return ContentService.createTextOutput(JSON.stringify({ ok: true, result: gj.result || "", at: gj.at || 0 })).setMimeType(ContentService.MimeType.JSON);
   }
 
-  // GridKey auto-sync status. NEVER returns the token itself — only whether one is set.
+  // GridKey auto-sync status. NEVER returns the token itself - only whether one is set.
   if (p.gridkey) {
     var gp = PropertiesService.getScriptProperties();
     var st = {
@@ -380,7 +371,7 @@ function doGet(e) {
   }
 
   // Enrich prices with CMP from the combined-holdings export, so every currently-held stock
-  // has a live price even if it isn't in Sheet1 (this is what removes the ₹0 / -100% rows).
+  // has a live price even if it isn't in Sheet1 (this is what removes the Rs.0 / -100% rows).
   var cmpMap = gkCombinedPrices_();
   for (var cs in cmpMap) { if (out.prices[cs] == null) out.prices[cs] = cmpMap[cs]; }
   out.count = Object.keys(out.prices).length;
@@ -461,7 +452,7 @@ function doGet(e) {
     }
   }
 
-  // Buy/Sell alerts from a tab named "Alerts" — returned as a list of objects
+  // Buy/Sell alerts from a tab named "Alerts" - returned as a list of objects
   var alertSheet = ss.getSheetByName("Alerts") || ss.getSheetByName("Advice");
   if (alertSheet) {
     var av = alertSheet.getDataRange().getValues();
@@ -483,7 +474,7 @@ function doGet(e) {
     }
   }
 
-  // Trades from a tab named "Trades" — always returned as compact arrays
+  // Trades from a tab named "Trades" - always returned as compact arrays
   // [Date, Client code, Client name, Symbol, Action, Quantity, Price, Amount].
   // The tab may hold EITHER the app's own 8-column backup format, OR a raw broker/GridKey
   // export (29 columns: Portfolio code, Nse code, Bill amount, ...). We detect which and
@@ -491,7 +482,7 @@ function doGet(e) {
   var tradeSheet = ss.getSheetByName("Trades");
   if (tradeSheet) {
     var allTrades = gkNormalizedTrades_();
-    // The full book is ~100k trades, which is far too large to ship in one response — the
+    // The full book is ~100k trades, which is far too large to ship in one response - the
     // request stalls and the console ends up showing stale data. Allow the caller to narrow
     // it: ?code= (one client), ?sym= (one stock), ?since=YYYY-MM-DD, ?limit=.
     var fCode = String(p.code || "").trim();
@@ -821,14 +812,14 @@ function doPost(e) {
 
         var nameFor = function (n) { return (n && n.length) ? n : "Investor"; };
         var subName = function (s, n) { return s.split("{name}").join(nameFor(n)); };
-        // Turn plain text into simple HTML: newlines -> <br>, and leading "* " bullets -> "• ".
+        // Turn plain text into simple HTML: newlines -> <br>, and leading "* " bullets -> "* ".
         var htmlOf = function (t) {
           var lines = t.split(String.fromCharCode(10)), out = [];
           for (var li = 0; li < lines.length; li++) {
             var ln = lines[li], i = 0;
             while (i < ln.length && (ln.charCodeAt(i) === 32 || ln.charCodeAt(i) === 9)) i++;
             var rest = ln.substring(i);
-            if (rest.charAt(0) === "*" && rest.charAt(1) === " ") ln = ln.substring(0, i) + "• " + rest.substring(2);
+            if (rest.charAt(0) === "*" && rest.charAt(1) === " ") ln = ln.substring(0, i) + "\u2022 " + rest.substring(2);
             out.push(ln);
           }
           return out.join("<br>");
@@ -902,14 +893,14 @@ function doPost(e) {
             }
           }
           if (sent === 0) gres = "error: Gmail's daily send limit is already used up. Try again tomorrow, or broadcast on WhatsApp.";
-          else gres = "OK — personalised email sent to " + sent + " client(s)"
-            + (skipped > 0 ? " (" + skipped + " not sent today — Gmail daily limit; send the rest tomorrow)" : "");
+          else gres = "OK \u2014 personalised email sent to " + sent + " client(s)"
+            + (skipped > 0 ? " (" + skipped + " not sent today \u2014 Gmail daily limit; send the rest tomorrow)" : "");
         } else {
           // One BCC email, identical to everyone.
           var list = [];
           for (var bi = 0; bi < recips.length; bi++) list.push(recips[bi].email);
           var sendList = list, extra = "";
-          if (list.length > quota) { sendList = list.slice(0, quota); extra = " (" + (list.length - quota) + " not sent today — Gmail daily limit; send the rest tomorrow or broadcast on WhatsApp)"; }
+          if (list.length > quota) { sendList = list.slice(0, quota); extra = " (" + (list.length - quota) + " not sent today \u2014 Gmail daily limit; send the rest tomorrow or broadcast on WhatsApp)"; }
           if (!sendList.length) {
             gres = "error: Gmail's daily send limit is already used up. Try again tomorrow, or broadcast on WhatsApp.";
           } else {
@@ -917,7 +908,7 @@ function doPost(e) {
             if (inlineImages) opts2.inlineImages = inlineImages;
             if (!toAddr) toAddr = sendList[0];
             MailApp.sendEmail(toAddr, subjectT, textT, opts2);
-            gres = "OK — emailed to " + sendList.length + " client(s)" + extra;
+            gres = "OK \u2014 emailed to " + sendList.length + " client(s)" + extra;
           }
         }
       }
@@ -971,7 +962,7 @@ function doPost(e) {
 /* ==================================================================
  *  GRIDKEY AUTO-SYNC  (trades + ledger, twice daily)
  *
- *  The API token is stored in Script Properties — NOT in the sheet and
+ *  The API token is stored in Script Properties - NOT in the sheet and
  *  NOT in the browser app. Set it from the console:
  *      Settings -> GridKey auto-sync -> paste token -> Save.
  *  Or here:  Project Settings -> Script properties -> GK_TOKEN.
@@ -987,7 +978,7 @@ var GK_HOLDINGS_SHEET = "CombinedHoldings";
 
 function gkProps_() { return PropertiesService.getScriptProperties(); }
 
-// Pull a clean URL out of whatever was pasted — a plain URL, or a full cURL command
+// Pull a clean URL out of whatever was pasted - a plain URL, or a full cURL command
 // (e.g. "curl 'https://...' -H '...'"). Prevents the common 'pasted the whole cURL' mistake.
 function gkExtractUrl_(v) {
   var s = String(v || "").trim();
@@ -1001,7 +992,7 @@ function gkFetch_(url) {
   var token = String(props.getProperty("GK_TOKEN") || "").trim();
   if (!token) throw new Error("No GridKey token set. Add it in the console (Settings -> GridKey auto-sync).");
   url = gkExtractUrl_(url);
-  if (!url || url.indexOf("http") !== 0) throw new Error("No valid URL configured for this feed (paste only the https://… address, not the whole cURL).");
+  if (!url || url.indexOf("http") !== 0) throw new Error("No valid URL configured for this feed (paste only the https://\u2026 address, not the whole cURL).");
   var opts = {
     method: "get", muteHttpExceptions: true, followRedirects: true,
     headers: {
@@ -1042,7 +1033,7 @@ function gkParseCsv_(sheetName, csvText) {
     }
   }
   var rows = Utilities.parseCsv(body);
-  if (!rows || rows.length < 2) throw new Error("Parsed 0 data rows for " + sheetName + " — check the URL/filters.");
+  if (!rows || rows.length < 2) throw new Error("Parsed 0 data rows for " + sheetName + " \u2014 check the URL/filters.");
   var W = 0;
   for (var i = 0; i < rows.length; i++) W = Math.max(W, rows[i].length);
   for (var r = 0; r < rows.length; r++) { while (rows[r].length < W) rows[r].push(""); }
@@ -1213,7 +1204,7 @@ function gkWriteCsv_(sheetName, csvText) {
     }
   }
   var rows = Utilities.parseCsv(body);
-  if (!rows || rows.length < 2) throw new Error("Parsed 0 data rows for " + sheetName + " — check the URL/filters.");
+  if (!rows || rows.length < 2) throw new Error("Parsed 0 data rows for " + sheetName + " \u2014 check the URL/filters.");
 
   // Pad every row to the header width so setValues never fails on ragged rows.
   var W = 0;
@@ -1222,11 +1213,11 @@ function gkWriteCsv_(sheetName, csvText) {
 
   var ss = SpreadsheetApp.getActiveSpreadsheet();
   var sh = ss.getSheetByName(sheetName) || ss.insertSheet(sheetName);
-  // Holdings is a snapshot of current positions, so it is replaced rather than appended — but
+  // Holdings is a snapshot of current positions, so it is replaced rather than appended - but
   // never with a suspiciously small export, which would silently wipe most of the book.
   var hadRows = Math.max(0, sh.getLastRow() - 1);
   if (hadRows >= 20 && (rows.length - 1) < hadRows * 0.5) {
-    throw new Error("Refusing to replace " + hadRows + " rows in " + sheetName + " with only " + (rows.length - 1) + " — the export looks truncated. Nothing was changed.");
+    throw new Error("Refusing to replace " + hadRows + " rows in " + sheetName + " with only " + (rows.length - 1) + " \u2014 the export looks truncated. Nothing was changed.");
   }
   sh.clearContents(); // snapshot tab: replaced, guarded above
   // Write in chunks so very large exports don't blow the execution limit in one call.
@@ -1246,7 +1237,7 @@ function syncGridkeyTrades() {
 
 function syncGridkeyLedger() {
   var url = String(gkProps_().getProperty("GK_LEDGER_URL") || "").trim();
-  if (!url) return -1; // not configured yet — skip quietly
+  if (!url) return -1; // not configured yet - skip quietly
   return gkMergeCsv_(GK_LEDGER_SHEET, gkFetch_(url));  // append-only
 }
 
@@ -1273,7 +1264,7 @@ function runGridkeySync(force) {
       ok = false;
       var em = String(e && e.message ? e.message : e);
       if (em.indexOf("script.external_request") >= 0 || em.indexOf("permission to call UrlFetchApp") >= 0) {
-        em = "NOT AUTHORISED YET — in the Apps Script editor, pick 'authorizeGridkey' from the function dropdown and press Run, click Allow, then Deploy a New version and re-run setupGridkeyTriggers.";
+        em = "NOT AUTHORISED YET \u2014 in the Apps Script editor, pick 'authorizeGridkey' from the function dropdown and press Run, click Allow, then Deploy a New version and re-run setupGridkeyTriggers.";
       }
       msgs.push("trades FAILED: " + em);
     }
@@ -1295,7 +1286,7 @@ function runGridkeySync(force) {
   } catch (e) { ok = false; msgs.push("combined holdings FAILED: " + e.message); }
 
   // Rebuild the Holdings tab ONLY from the combined-holdings export (corporate-action correct).
-  // We deliberately NO LONGER rebuild from the raw transaction feed — that feed is pre-split and
+  // We deliberately NO LONGER rebuild from the raw transaction feed - that feed is pre-split and
   // was overwriting good data. If the combined export isn't configured, Holdings is left exactly
   // as-is (so a manual "Combined holdings" upload from the console persists). Set
   // GK_REBUILD_HOLDINGS="0" to switch even the combined rebuild off.
@@ -1310,7 +1301,7 @@ function runGridkeySync(force) {
     }
   }
 
-  var result = (ok ? "OK" : "ERROR") + " — " + msgs.join(" · ");
+  var result = (ok ? "OK" : "ERROR") + " \u2014 " + msgs.join(" \u00B7 ");
   props.setProperty("GK_LAST_SYNC", stamp);
   props.setProperty("GK_LAST_RESULT", result);
 
@@ -1320,7 +1311,7 @@ function runGridkeySync(force) {
     var log = ss.getSheetByName("Sync log") || ss.insertSheet("Sync log");
     if (log.getLastRow() === 0) log.getRange(1, 1, 1, 3).setValues([["When", "Status", "Detail"]]);
     log.insertRowAfter(1);
-    log.getRange(2, 1, 1, 3).setValues([[stamp, ok ? "OK" : "ERROR", msgs.join(" · ")]]);
+    log.getRange(2, 1, 1, 3).setValues([[stamp, ok ? "OK" : "ERROR", msgs.join(" \u00B7 ")]]);
     // trim to the last 200 entries
     if (log.getLastRow() > 201) log.deleteRows(202, log.getLastRow() - 201);
   } catch (e) { /* logging must never break the sync */ }
@@ -1359,7 +1350,7 @@ function gkTriggerCount_() {
  *  reflects the latest dealing without anyone re-uploading anything.
  *
  *  Client master data (Name / Email / WhatsApp / Risk category) is NOT
- *  invented here — it is carried over from whatever is already in the
+ *  invented here - it is carried over from whatever is already in the
  *  Holdings tab, keyed on client code. Clients you have in Holdings but
  *  who have no trades (e.g. cash-only) are left untouched.
  * ================================================================== */
@@ -1368,7 +1359,7 @@ function gkTriggerCount_() {
 // [Date, Client code, Client name, Symbol, Action, Quantity, Price, Amount]
 // Works with a raw GridKey export (29 cols) OR the app's own 8-col backup.
 // NOTE: for a broker export the key is PORTFOLIO code (e.g. MAY39939), not the
-// client code (C000009) — one client can run several portfolios and the console
+// client code (C000009) - one client can run several portfolios and the console
 // treats each as its own account. Keep this order.
 function gkNormalizedTrades_() {
   var ss = SpreadsheetApp.getActiveSpreadsheet();
@@ -1491,7 +1482,7 @@ function gkPositions_() {
     if (act === "BUY") {
       p.qty += qty;
       p.cost += amt;
-    } else { // SELL — relieve cost at the running average, so 'cost' stays the book value of what's left
+    } else { // SELL - relieve cost at the running average, so 'cost' stays the book value of what's left
       var avg = p.qty > 0 ? p.cost / p.qty : 0;
       var sell = Math.min(qty, p.qty);
       p.qty -= sell;
@@ -1540,7 +1531,7 @@ function rebuildHoldingsFromTrades() {
   var rows = [], liveCodes = {}, open = 0;
   for (var k in P.pos) {
     var p = P.pos[k];
-    if (p.qty <= 0) continue; // fully exited — drop from Holdings
+    if (p.qty <= 0) continue; // fully exited - drop from Holdings
     open++;
     liveCodes[p.code] = true;
     var m = master[p.code] || {};
@@ -1607,7 +1598,7 @@ function rebuildHoldingsFromTrades() {
  * ================================================================== */
 function syncGridkeyHoldings() {
   var url = String(gkProps_().getProperty("GK_HOLDINGS_URL") || "").trim();
-  if (!url) return -1; // not configured — skip quietly
+  if (!url) return -1; // not configured - skip quietly
   var n = gkWriteCsv_(GK_HOLDINGS_SHEET, gkFetch_(url));
   return n;
 }
@@ -1615,7 +1606,7 @@ function syncGridkeyHoldings() {
 function rebuildHoldingsFromCombined() {
   var ss = SpreadsheetApp.getActiveSpreadsheet();
   var src = ss.getSheetByName(GK_HOLDINGS_SHEET);
-  if (!src) throw new Error("No CombinedHoldings tab — set the combined-holdings URL and sync first.");
+  if (!src) throw new Error("No CombinedHoldings tab \u2014 set the combined-holdings URL and sync first.");
   var v = src.getDataRange().getValues();
   if (v.length < 2) throw new Error("CombinedHoldings tab is empty.");
 
@@ -1689,7 +1680,7 @@ function rebuildHoldingsFromCombined() {
       "", 0, "0.00", "0.00", 0, 0, "0.00", "0.00", "Sheet", stamp]);
   }
 
-  // Safety valve — never wipe a healthy Holdings tab on a bad/short feed.
+  // Safety valve - never wipe a healthy Holdings tab on a bad/short feed.
   if (open === 0) throw new Error("Refusing to rebuild Holdings: 0 holdings parsed from CombinedHoldings.");
   if (prevPositions > 20 && open < prevPositions * 0.5)
     throw new Error("Refusing to rebuild Holdings: positions would fall from " + prevPositions + " to " + open + ". Check the CombinedHoldings tab.");
@@ -1703,8 +1694,8 @@ function rebuildHoldingsFromCombined() {
   return { rows: rows.length, positions: open, clients: Object.keys(liveCodes).length };
 }
 
-// CMP per symbol from the CombinedHoldings tab — used to enrich the price feed so held
-// stocks always have a live price (no more ₹0 / -100%).
+// CMP per symbol from the CombinedHoldings tab - used to enrich the price feed so held
+// stocks always have a live price (no more Rs.0 / -100%).
 function gkCombinedPrices_() {
   var ss = SpreadsheetApp.getActiveSpreadsheet();
   var src = ss.getSheetByName(GK_HOLDINGS_SHEET);
@@ -1726,7 +1717,7 @@ function gkCombinedPrices_() {
 }
 
 /* ------------------------------------------------------------------
- *  STEP 1 OF AUTHORISATION — RUN THIS FIRST, FROM THE EDITOR.
+ *  STEP 1 OF AUTHORISATION - RUN THIS FIRST, FROM THE EDITOR.
  *
  *  This asks Google for every permission the script needs, and it does
  *  NOT depend on the token or the URLs being saved yet. Pick
@@ -1770,7 +1761,7 @@ function setGridkeyTokenManually() {
 }
 
 /* ------------------------------------------------------------------
- *  STEP 2 — a real test fetch against GridKey, once the token is saved.
+ *  STEP 2 - a real test fetch against GridKey, once the token is saved.
  * ------------------------------------------------------------------ */
 function authorizeGridkey() {
   var props = gkProps_();
@@ -1779,7 +1770,7 @@ function authorizeGridkey() {
   if (!token) throw new Error("No token saved yet. In the console: Settings -> GridKey auto-sync -> paste the token -> Save to server. Then run this again.");
   if (!url) throw new Error("No trades URL saved yet. Save it from the console first, then run this again.");
 
-  // This line is what needs the permission — running it by hand triggers the consent screen.
+  // This line is what needs the permission - running it by hand triggers the consent screen.
   var res = UrlFetchApp.fetch(url, {
     method: "get",
     muteHttpExceptions: true,
@@ -1797,7 +1788,7 @@ function authorizeGridkey() {
   var msg;
   if (code === 200) {
     var lines = text.split(/\r?\n/).length;
-    msg = "SUCCESS — permission granted and GridKey answered (HTTP 200, about " + lines + " lines). Now: Deploy -> Manage deployments -> New version -> Deploy, then run setupGridkeyTriggers.";
+    msg = "SUCCESS \u2014 permission granted and GridKey answered (HTTP 200, about " + lines + " lines). Now: Deploy -> Manage deployments -> New version -> Deploy, then run setupGridkeyTriggers.";
   } else if (code === 401 || code === 403) {
     msg = "Permission is now granted, BUT GridKey rejected the token (HTTP " + code + "). Update the token in the console and try again.";
   } else {

@@ -20,6 +20,13 @@ console/
 google-apps-script/
   Code.gs                        The backend, as a plain .gs file for
                                   reading/reviewing/diffing in an editor.
+                                  Byte-identical to the console's embedded
+                                  APPS_SCRIPT copy, and deliberately pure
+                                  ASCII — the Apps Script editor rejects
+                                  pasted source containing characters like
+                                  em dashes or "·" with "Invalid or
+                                  unexpected token", so non-ASCII lives in
+                                  string literals as \uXXXX escapes only.
   appsscript.json                Apps Script manifest (best-effort defaults —
                                   check it against your actual deployment's
                                   Project Settings before relying on it).
@@ -43,13 +50,16 @@ order-link-proxy/
   `doGet`/`doPost` JSON API the console calls (over `fetch`) to back up and
   restore data, pull live prices/holdings, sync trades via the "GridKey" feed,
   and send email.
-- **These two pieces are independent deployments.** The console still carries
-  its own embedded copy of the backend source (`APPS_SCRIPT` constant, shown
+- **These two pieces are independent deployments.** The console carries its
+  own embedded copy of the backend source (`APPS_SCRIPT` constant, shown
   under Settings → Google Sheet backup → "Copy backend code") so a user can
   copy-paste it straight into the Apps Script editor without leaving the app.
   `Code.gs` here is that same source, extracted so it can be read and
-  version-controlled normally. **If you change the backend logic, update both
-  copies** — there's no build step wiring them together yet.
+  version-controlled normally. The two are currently byte-identical; **if you
+  change the backend logic, update both copies** — there's no build step
+  wiring them together yet. Note the embedded copy lives inside a JS template
+  literal, so a backslash there must be written `\\` (a single `﻿`
+  silently becomes an invisible BOM character in the pasted code).
 
 ## Deploying the backend
 
