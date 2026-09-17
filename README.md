@@ -169,12 +169,14 @@ Upload it in **Upload Data → Advice contacts (order-link logins)** from a
 `.xlsx` or `.csv` with these columns, in this order:
 
 ```
-client code | client name | email id | mobile number | risk category | PAN number
+client code | client name | email id | country code | mobile number | risk category | PAN number
 ```
 
-A header row is optional — the columns are matched by name when a header is
-present and by position when it isn't (a headerless file keeps its first
-client rather than losing it to the header). The preview shows how many rows
+The country code goes in its own column and is joined to the mobile on
+import (`91` + `9847012345` -> `+919847012345`); `+91` and `0091` are
+accepted, and a file without the country-code column still reads as the
+original six. A header row is optional — columns are matched by name when a
+header is present and by position when it isn't. The preview shows how many rows
 carry a mobile, how many differ from the WhatsApp number on file, and how
 many client codes aren't recognised, before anything is saved. Rows are
 upserted by client code into the sheet, so re-uploading corrects rows rather

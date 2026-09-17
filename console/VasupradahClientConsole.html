@@ -987,7 +987,10 @@ function normalizeRisk(v) {
 }
 // The order-link login number, falling back to the WhatsApp number when a client
 // has no separate advice contact on file.
-const adviceMobileOf = (db, code) => String(((db && db.adviceContacts || {})[String(code ?? "").trim()] || {}).mobile || "").trim();
+const adviceMobileOf = (db, code) => {
+  const c = (db && db.adviceContacts || {})[String(code ?? "").trim()] || {};
+  return String(c.phone || joinPhone(c.cc, c.mobile) || "").trim();
+};
 const orderPhoneOf = (db, code, whatsapp) => adviceMobileOf(db, code) || String(whatsapp || "");
 const EXEC_MODE_LABEL = { email: "Email approval", gateway: "Execute link" };
 const execModeOf = (db, code) => (db && db.execMode || {})[String(code ?? "").trim()] === "gateway" ? "gateway" : "email";
@@ -1168,35 +1171,63 @@ function parseCombinedRow(row) {
 // Advice contacts: client code, client name, email id, mobile number, risk
 // category, PAN. The mobile here is the number the client uses to open an order
 // link, which is deliberately separate from the WhatsApp number in Holdings.
-const CONTACT_FIELDS = ["code", "name", "email", "mobile", "risk", "pan"];
-const CONTACT_HEADER_KEYS = ["clientcode", "code", "portfoliocode", "clientname", "name", "emailid", "email",
-  "emailaddress", "mobilenumber", "mobile", "phone", "phonenumber", "loginnumber", "loginmobile",
-  "riskcategory", "risk", "category", "riskprofile", "pan", "pannumber", "panno"];
-const looksLikeContactHeader = (keys) => (keys || []).some((k) => CONTACT_HEADER_KEYS.includes(normKey(k)));
-function parseContactRow(row) {
-  const rec = {};
-  const keys = Object.keys(row || {});
-  for (const k of keys) {
-    const n = normKey(k);
-    if (["clientcode", "code", "portfoliocode"].includes(n)) rec.code = row[k];
-    else if (["clientname", "name"].includes(n)) rec.name = row[k];
-    else if (["emailid", "email", "emailaddress"].includes(n)) rec.email = row[k];
-    else if (["mobilenumber", "mobile", "phone", "phonenumber", "loginnumber", "loginmobile"].includes(n)) rec.mobile = row[k];
-    else if (["riskcategory", "risk", "category", "riskprofile"].includes(n)) rec.risk = row[k];
-    else if (["pan", "pannumber", "panno"].includes(n)) rec.pan = row[k];
-  }
-  // No recognisable header: fall back to the documented column order.
-  if (rec.code == null) CONTACT_FIELDS.forEach((f, i) => {
-    if (rec[f] == null && keys[i] != null) rec[f] = row[keys[i]];
-  });
+// Uploaded advice-contact columns. The country code is optional and sits just
+// before the mobile number, so both the 6- and 7-column layouts are read.
+const CONTACT_FIELDS = ["code", "name", "email", "cc", "mobile", "risk", "pan"];
+const CONTACT_FIELDS_NO_CC = ["code", "name", "email", "mobile", "risk", "pan"];
+const contactFieldsFor = (n) => n >= 7 ? CONTACT_FIELDS : CONTACT_FIELDS_NO_CC;
+const CONTACT_HEADER_FIELD = {
+  clientcode: "code", code: "code", portfoliocode: "code",
+  clientname: "name", name: "name",
+  emailid: "email", email: "email", emailaddress: "email",
+  countrycode: "cc", country: "cc", isd: "cc", isdcode: "cc", dialcode: "cc", callingcode: "cc", stdcode: "cc",
+  mobilenumber: "mobile", mobile: "mobile", phone: "mobile", phonenumber: "mobile",
+  loginnumber: "mobile", loginmobile: "mobile",
+  riskcategory: "risk", risk: "risk", category: "risk", riskprofile: "risk",
+  pan: "pan", pannumber: "pan", panno: "pan"
+};
+const looksLikeContactHeader = (cells) => (cells || []).some((c) => !!CONTACT_HEADER_FIELD[normKey(c)]);
+// Country code and mobile arrive in separate columns. Trust the split: the
+// mobile column is the national number, so the two are simply joined.
+function joinPhone(cc, mobile) {
+  const m = String(mobile ?? "").replace(/\D/g, "");
+  const c = String(cc ?? "").replace(/\D/g, "").replace(/^00/, "");
+  if (!m) return "";
+  if (!c) return waDisplay(mobile);
+  return "+" + c + m;
+}
+function parseContactRow(rec) {
+  const cc = String(rec.cc ?? "").trim();
+  const mobile = waDisplay(rec.mobile);
   return {
     code: String(rec.code ?? "").trim(),
     name: String(rec.name ?? "").trim(),
     email: String(rec.email ?? "").trim(),
-    mobile: waDisplay(rec.mobile),
+    cc,
+    mobile,
+    phone: joinPhone(cc, mobile),
     risk: normalizeRisk(rec.risk),
     pan: String(rec.pan ?? "").trim().toUpperCase()
   };
+}
+// Read a sheet given as rows of raw cells. Object keys can't be used for this:
+// a header-less file whose first row holds numbers (a country code, a mobile)
+// gets its columns reordered, because JS hoists integer-like keys.
+function contactsFromGrid(rows) {
+  const grid = (rows || []).filter((r) => Array.isArray(r) && r.some((v) => String(v ?? "").trim() !== ""));
+  if (!grid.length) return [];
+  const header = looksLikeContactHeader(grid[0]);
+  const fields = header
+    ? grid[0].map((h) => CONTACT_HEADER_FIELD[normKey(h)] || null)
+    : contactFieldsFor(grid[0].length);
+  const body = header ? grid.slice(1) : grid;
+  return body.map((arr) => {
+    const rec = {};
+    fields.forEach((f, i) => {
+      if (f) rec[f] = arr[i];
+    });
+    return parseContactRow(rec);
+  }).filter((r) => r.code);
 }
 function parseClientRow(row) {
   const rec = pickFields(row);
@@ -2329,11 +2360,14 @@ function doPost(e) {
   // just rewrites that row.
   // Upsert by client code so a re-upload corrects rows instead of duplicating them.
   if (body.type === "advice_contacts") {
-    var acHdr = ["Client code", "Name", "Email", "Mobile", "Risk category", "PAN", "Updated at"];
+    var acHdr = ["Client code", "Name", "Email", "Country code", "Mobile", "Risk category", "PAN", "Updated at"];
     var acss2 = SpreadsheetApp.getActiveSpreadsheet();
     var acsh2 = acss2.getSheetByName("AdviceContacts");
     if (!acsh2) { acsh2 = acss2.insertSheet("AdviceContacts"); acsh2.getRange(1, 1, 1, acHdr.length).setValues([acHdr]); }
-    if (acsh2.getLastRow() < 1) acsh2.getRange(1, 1, 1, acHdr.length).setValues([acHdr]);
+    // Refresh the header if the tab predates the separate country-code column.
+    if (acsh2.getLastRow() < 1 || String(acsh2.getRange(1, 4).getValue()).toLowerCase().indexOf("country") < 0) {
+      acsh2.getRange(1, 1, 1, acHdr.length).setValues([acHdr]);
+    }
     var acAll = acsh2.getLastRow() > 1 ? acsh2.getRange(2, 1, acsh2.getLastRow() - 1, acHdr.length).getValues() : [];
     var acIn = Array.isArray(body.rows) ? body.rows : [];
     var acAdd = 0, acUpd = 0;
@@ -2341,9 +2375,9 @@ function doPost(e) {
       var ar = acIn[ai] || {};
       var aCode = String(ar.code || "").trim();
       if (!aCode) continue;
-      // Mobile is stored as text so a leading zero or "+" survives the sheet.
-      var aRow = [aCode, String(ar.name || ""), String(ar.email || ""), "'" + String(ar.mobile || ""),
-        String(ar.risk || ""), String(ar.pan || ""), Date.now()];
+      // Country code and mobile are stored as text so a leading zero or "+" survives.
+      var aRow = [aCode, String(ar.name || ""), String(ar.email || ""), "'" + String(ar.cc || ""),
+        "'" + String(ar.mobile || ""), String(ar.risk || ""), String(ar.pan || ""), Date.now()];
       var aHit = -1;
       for (var aj = 0; aj < acAll.length; aj++) if (String(acAll[aj][0]).trim() === aCode) { aHit = aj; break; }
       if (aHit >= 0) { acsh2.getRange(aHit + 2, 1, 1, acHdr.length).setValues([aRow]); acAll[aHit] = aRow; acUpd++; }
@@ -3743,13 +3777,16 @@ async function pullAdviceContacts(url) {
   for (const r of rows.slice(1)) {
     const code = String(r[0] || "").trim();
     if (!code) continue;
+    const cc = String(r[3] || "").trim(), mob = waDisplay(r[4]);
     out[code] = {
       name: String(r[1] || ""),
       email: String(r[2] || "").trim(),
-      mobile: waDisplay(r[3]),
-      risk: String(r[4] || ""),
-      pan: String(r[5] || ""),
-      updatedAt: num(r[6])
+      cc,
+      mobile: mob,
+      phone: joinPhone(cc, mob),
+      risk: String(r[5] || ""),
+      pan: String(r[6] || ""),
+      updatedAt: num(r[7])
     };
   }
   return out;
@@ -6826,6 +6863,41 @@ function UploadTab({ db, commit, showToast }) {
       showToast("Use a .csv or .xlsx file.", "err");
     }
   };
+  // Rows of raw cells, so column order survives regardless of what's in row 1.
+  const readGrid = (file, cb) => {
+    setBusy(true);
+    const ext = file.name.split(".").pop().toLowerCase();
+    const done = (rows) => {
+      setBusy(false);
+      cb(rows);
+    };
+    if (ext === "csv" || ext === "txt") {
+      Papa.parse(file, {
+        header: false,
+        skipEmptyLines: true,
+        complete: (r) => done(r.data),
+        error: () => {
+          setBusy(false);
+          showToast("Could not read the CSV.", "err");
+        }
+      });
+    } else if (["xlsx", "xls", "xlsm"].includes(ext)) {
+      const r = new FileReader();
+      r.onload = (e) => {
+        try {
+          const wb = XLSX.read(e.target.result, { type: "array" });
+          done(XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]], { header: 1, defval: "", blankrows: false }));
+        } catch {
+          setBusy(false);
+          showToast("Could not read the Excel file.", "err");
+        }
+      };
+      r.readAsArrayBuffer(file);
+    } else {
+      setBusy(false);
+      showToast("Use a .csv or .xlsx file.", "err");
+    }
+  };
   const onFile = (file) => {
     if (mode === "combined") {
       readFile(file, (rows) => {
@@ -6864,25 +6936,17 @@ function UploadTab({ db, commit, showToast }) {
         setPending({ kind: "holdings", recs, added, updated, removed, skipped, absent });
       });
     } else if (mode === "contacts") {
-      readFile(file, (rows) => {
-        const keys = Object.keys(rows[0] || {});
-        let source = rows;
-        if (rows.length && !looksLikeContactHeader(keys)) {
-          // No header row, so the parser turned the first client into the column
-          // names. Put that record back and read everything by position.
-          const asRow = (arr) => {
-            const o = {};
-            CONTACT_FIELDS.forEach((f, i) => o[f] = arr[i] ?? "");
-            return o;
-          };
-          source = [asRow(keys), ...rows.map((r) => asRow(keys.map((k) => r[k])))];
+      readGrid(file, (rows) => {
+        const recs = contactsFromGrid(rows);
+        if (!recs.length) {
+          showToast("No client codes found in that file \u2014 check the column order.", "err");
+          return;
         }
-        const recs = source.map(parseContactRow).filter((r) => r.code);
-        const withMobile = recs.filter((r) => waNumber(r.mobile)).length;
+        const withMobile = recs.filter((r) => waNumber(r.phone)).length;
         const unknown = recs.filter((r) => !db.clients[r.code]).length;
         const differs = recs.filter((r) => {
           const c = db.clients[r.code];
-          return c && waNumber(r.mobile) && waNumber(c.whatsapp) && waNumber(r.mobile) !== waNumber(c.whatsapp);
+          return c && waNumber(r.phone) && waNumber(c.whatsapp) && waNumber(r.phone) !== waNumber(c.whatsapp);
         }).length;
         setPending({ kind: "contacts", recs, withMobile, unknown, differs });
       });
@@ -6990,7 +7054,7 @@ function UploadTab({ db, commit, showToast }) {
     const { recs } = pending;
     await commit((d) => {
       const m = { ...d.adviceContacts || {} }, now = Date.now();
-      for (const r of recs) m[r.code] = { name: r.name, email: r.email, mobile: r.mobile, risk: r.risk, pan: r.pan, updatedAt: now };
+      for (const r of recs) m[r.code] = { name: r.name, email: r.email, cc: r.cc, mobile: r.mobile, phone: r.phone, risk: r.risk, pan: r.pan, updatedAt: now };
       d.adviceContacts = m;
     }, "upload advice contacts");
     const ok = await pushAdviceContacts(db, recs);
@@ -7096,8 +7160,11 @@ function UploadTab({ db, commit, showToast }) {
       onApply: applyContacts,
       onCancel: () => setPending(null),
       stats: [["Rows", pending.recs.length], ["With a mobile", pending.withMobile, "pos"], ["Differs from WhatsApp", pending.differs], ["Unknown code", pending.unknown, pending.unknown ? "neg" : null]],
-      headers: ["Code", "Name", "Email", "Order-link mobile", "Risk", "PAN"],
-      rows: pending.recs.slice(0, 200).map((r) => [r.code, r.name, r.email, waDisplay(r.mobile) || "\u2014", r.risk || "\u2014", r.pan || "\u2014", !waNumber(r.mobile)]),
+      headers: ["Code", "Name", "Email", "Country", "Order-link number", "Risk", "PAN"],
+      rows: pending.recs.slice(0, 200).map((r) => {
+        const d = String(r.phone || "").replace(/\D/g, "");
+        return [r.code, r.name, r.email, r.cc || "\u2014", r.phone || "\u2014", r.risk || "\u2014", r.pan || "\u2014", !(d.length >= 8 && d.length <= 15)];
+      }),
       applyLabel: "Save advice contacts"
     }
   ), /* @__PURE__ */ React.createElement(ManualTradePanel, { db, showToast }));

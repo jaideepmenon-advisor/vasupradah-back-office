@@ -632,11 +632,14 @@ function doPost(e) {
   // just rewrites that row.
   // Upsert by client code so a re-upload corrects rows instead of duplicating them.
   if (body.type === "advice_contacts") {
-    var acHdr = ["Client code", "Name", "Email", "Mobile", "Risk category", "PAN", "Updated at"];
+    var acHdr = ["Client code", "Name", "Email", "Country code", "Mobile", "Risk category", "PAN", "Updated at"];
     var acss2 = SpreadsheetApp.getActiveSpreadsheet();
     var acsh2 = acss2.getSheetByName("AdviceContacts");
     if (!acsh2) { acsh2 = acss2.insertSheet("AdviceContacts"); acsh2.getRange(1, 1, 1, acHdr.length).setValues([acHdr]); }
-    if (acsh2.getLastRow() < 1) acsh2.getRange(1, 1, 1, acHdr.length).setValues([acHdr]);
+    // Refresh the header if the tab predates the separate country-code column.
+    if (acsh2.getLastRow() < 1 || String(acsh2.getRange(1, 4).getValue()).toLowerCase().indexOf("country") < 0) {
+      acsh2.getRange(1, 1, 1, acHdr.length).setValues([acHdr]);
+    }
     var acAll = acsh2.getLastRow() > 1 ? acsh2.getRange(2, 1, acsh2.getLastRow() - 1, acHdr.length).getValues() : [];
     var acIn = Array.isArray(body.rows) ? body.rows : [];
     var acAdd = 0, acUpd = 0;
@@ -644,9 +647,9 @@ function doPost(e) {
       var ar = acIn[ai] || {};
       var aCode = String(ar.code || "").trim();
       if (!aCode) continue;
-      // Mobile is stored as text so a leading zero or "+" survives the sheet.
-      var aRow = [aCode, String(ar.name || ""), String(ar.email || ""), "'" + String(ar.mobile || ""),
-        String(ar.risk || ""), String(ar.pan || ""), Date.now()];
+      // Country code and mobile are stored as text so a leading zero or "+" survives.
+      var aRow = [aCode, String(ar.name || ""), String(ar.email || ""), "'" + String(ar.cc || ""),
+        "'" + String(ar.mobile || ""), String(ar.risk || ""), String(ar.pan || ""), Date.now()];
       var aHit = -1;
       for (var aj = 0; aj < acAll.length; aj++) if (String(acAll[aj][0]).trim() === aCode) { aHit = aj; break; }
       if (aHit >= 0) { acsh2.getRange(aHit + 2, 1, 1, acHdr.length).setValues([aRow]); acAll[aHit] = aRow; acUpd++; }
