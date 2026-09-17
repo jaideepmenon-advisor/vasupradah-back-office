@@ -834,8 +834,10 @@ function doPost(e) {
           return out.join("<br>");
         };
         var SP = String.fromCharCode(32), NL = String.fromCharCode(10), CR = String.fromCharCode(13), LT = String.fromCharCode(60);
-        var execAnchor = function (esc) {
-          var marker = "Click Here To Execute the Order: ";
+        // Turns a "<marker>: <url>" line into a styled button, so the client sees the
+        // wording and never the raw URL. Used for the execute link and, for clients who
+        // act on advice by replying, the Approve / Reject mailto links.
+        var btnAnchor = function (esc, marker, label, bg) {
           var out = "", i = 0;
           while (true) {
             var pIdx = esc.indexOf(marker, i);
@@ -847,12 +849,18 @@ function doPost(e) {
               if (ch === SP || ch === NL || ch === CR || ch === LT) break;
               k++;
             }
-            var url = esc.slice(j, k);
-            out += '<a href="' + url + '" style="display:inline-block;background:#2E3192;color:#ffffff;'
-              + 'text-decoration:none;padding:9px 16px;border-radius:8px;font-weight:bold">Click Here To Execute the Order</a>';
+            var url = esc.slice(j, k).split("&").join("&amp;");
+            out += '<a href="' + url + '" style="display:inline-block;background:' + bg + ';color:#ffffff;'
+              + 'text-decoration:none;padding:9px 16px;border-radius:8px;font-weight:bold;margin:2px 8px 2px 0">' + label + '</a>';
             i = k;
           }
           return out;
+        };
+        var execAnchor = function (esc) {
+          esc = btnAnchor(esc, "Click Here To Execute the Order: ", "Click Here To Execute the Order", "#2E3192");
+          esc = btnAnchor(esc, "Approve the order: ", "Approve the order", "#059669");
+          esc = btnAnchor(esc, "Reject the order: ", "Reject the order", "#e11d48");
+          return esc;
         };
         var bodyHtml = function (t) {
           var h = '<div style="font-family:Arial,Helvetica,sans-serif;color:#0f172a;font-size:14px;line-height:1.5">';
@@ -862,6 +870,9 @@ function doPost(e) {
           return h + '</div>';
         };
 
+        // Where a client's plain "Reply" should land (the dealing team, for advice the
+        // client approves by replying). Comma-separated; blank leaves Gmail's default.
+        var replyToAddr = String(body.replyTo || "").trim();
         var quota = MailApp.getRemainingDailyQuota();
         var toAddr = "";
         try { toAddr = Session.getEffectiveUser().getEmail(); } catch (e2) { toAddr = ""; }
@@ -878,8 +889,17 @@ function doPost(e) {
             var rcSubj = rc.subject ? String(rc.subject) : subjectT;
             var opts = { name: fromName, htmlBody: bodyHtml(subName(rcText, rc.name)) };
             if (inlineImages) opts.inlineImages = inlineImages;
+            if (replyToAddr) opts.replyTo = replyToAddr;
             try { MailApp.sendEmail(rc.email, subName(rcSubj, rc.name), subName(rcText, rc.name), opts); sent++; }
-            catch (eSend) { /* skip a bad address, keep going */ }
+            catch (eSend) {
+              // Gmail can reject a multi-address Reply-To. Losing the advice mail over a
+              // header is worse than losing the header, so retry once without it.
+              if (replyToAddr) {
+                delete opts.replyTo;
+                try { MailApp.sendEmail(rc.email, subName(rcSubj, rc.name), subName(rcText, rc.name), opts); sent++; }
+                catch (eSend2) { /* skip a bad address, keep going */ }
+              }
+            }
           }
           if (sent === 0) gres = "error: Gmail's daily send limit is already used up. Try again tomorrow, or broadcast on WhatsApp.";
           else gres = "OK — personalised email sent to " + sent + " client(s)"

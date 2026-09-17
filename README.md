@@ -78,6 +78,37 @@ Risk categories: `Low Risk`, `Medium to Low Risk`, `Medium to High Risk`,
 Client-facing messages (trade alerts, advice, portfolio statements) are
 stamped with the firm's SEBI RIA registration number.
 
+## Two client cohorts: email approval vs execute link
+
+Clients act on advice in one of two ways, set per client in **Settings → How
+each client acts on advice** (bulk-assignable; unset defaults to email
+approval):
+
+- **Email approval** — the advice mail ends with **Approve the order** /
+  **Reject the order** buttons. Approve opens a reply addressed to the
+  dealing team (first address in the setting goes in To, the rest in Cc)
+  with the subject and the approval text — "Place this order as GTC" by
+  default — already filled in, plus the order details. Reject opens a reply
+  to the reject address only, with "REJECTED BY CLIENT" in the subject.
+  The mail's `Reply-To` is also set to the same team list, so a plain
+  "Reply" reaches them too.
+- **Execute link** — the advice mail carries the one-click gateway link
+  instead (see below). No approve/reject buttons.
+
+In Advice orders the **MODEL** control defaults to "By client setting", so a
+mixed batch sends each client their own format in one go; "Email (manual)"
+and "Execution (execute link)" still force one format for everyone. The
+**CLIENTS** filter (All / Email approval / Execute link) narrows the group
+table to one cohort when you want to work them separately, and each row
+shows which cohort the client is in.
+
+The approve/reject links are emitted as plain `Approve the order: <mailto…>`
+marker lines in the message text; the Apps Script backend turns those
+markers into styled buttons in the HTML mail (the same trick already used
+for the execute link), so the client never sees a raw URL. **This needs the
+updated backend deployed** — re-paste `Code.gs` (or Settings → "Copy backend
+code") and deploy a new version, otherwise the links arrive as raw text.
+
 ## Order-link gateway (Advice orders)
 
 The one-click "Click Here To Execute the Order" link sent in Advice orders is
