@@ -62,7 +62,7 @@ function setup() {
 
 function doGet(e) {
   var p = (e && e.parameter) || {};
-  if (!p.prices && !p.alerts && !p.trades && !p.holdings && !p.gridkey && !p.greeting_status && !p.advice_alerts && !p.advice_trace && !p.ping && !p.pipeline && !p.baskets && !p.manual_trades && !p.client_details && !p.shorten && !p.dedupe && !p.gk_probe) {
+  if (!p.prices && !p.alerts && !p.trades && !p.holdings && !p.gridkey && !p.greeting_status && !p.advice_alerts && !p.advice_trace && !p.ping && !p.pipeline && !p.baskets && !p.manual_trades && !p.client_details && !p.exec_modes && !p.shorten && !p.dedupe && !p.gk_probe) {
     return ContentService.createTextOutput("Vasupradah backup endpoint is live (use POST from the console).");
   }
 
@@ -275,6 +275,15 @@ function doGet(e) {
   }
 
   // Stock baskets by risk category, kept in the "Baskets" tab so they survive a device reset.
+  // Per-client order method (email approval vs execute link), kept in "OrderMethod"
+  // so the choice survives a device reset and reaches every staff device.
+  if (p.exec_modes) {
+    var xss = SpreadsheetApp.getActiveSpreadsheet();
+    var xsh = xss.getSheetByName("OrderMethod");
+    if (!xsh || xsh.getLastRow() < 2) return ContentService.createTextOutput(JSON.stringify({ ok: true, rows: [] })).setMimeType(ContentService.MimeType.JSON);
+    return ContentService.createTextOutput(JSON.stringify({ ok: true, rows: xsh.getDataRange().getValues() })).setMimeType(ContentService.MimeType.JSON);
+  }
+
   if (p.baskets) {
     var bss = SpreadsheetApp.getActiveSpreadsheet();
     var bsh = bss.getSheetByName("Baskets");
@@ -610,6 +619,32 @@ function doPost(e) {
 
   // --- Stock baskets. Append/update only: a basket row is removed solely when you delete it
   //     here, never by a reload, a fresh device or an empty local copy. ---
+  // Upsert by client code, so changing a client from one model to the other later
+  // just rewrites that row.
+  if (body.type === "exec_modes") {
+    var xHdr = ["Client code", "Name", "Method", "Updated at"];
+    var xss2 = SpreadsheetApp.getActiveSpreadsheet();
+    var xsh2 = xss2.getSheetByName("OrderMethod");
+    if (!xsh2) { xsh2 = xss2.insertSheet("OrderMethod"); xsh2.getRange(1, 1, 1, xHdr.length).setValues([xHdr]); }
+    if (xsh2.getLastRow() < 1) xsh2.getRange(1, 1, 1, xHdr.length).setValues([xHdr]);
+    var xAll = xsh2.getLastRow() > 1 ? xsh2.getRange(2, 1, xsh2.getLastRow() - 1, xHdr.length).getValues() : [];
+    var xIn = Array.isArray(body.rows) ? body.rows : [];
+    var xAdd = 0, xUpd = 0;
+    for (var xi = 0; xi < xIn.length; xi++) {
+      var xr = xIn[xi] || {};
+      var xCode = String(xr.code || "").trim();
+      if (!xCode) continue;
+      var xMethod = String(xr.method || "").toLowerCase() === "gateway" ? "gateway" : "email";
+      var xRow = [xCode, String(xr.name || ""), xMethod, Date.now()];
+      var xHit = -1;
+      for (var xj = 0; xj < xAll.length; xj++) if (String(xAll[xj][0]).trim() === xCode) { xHit = xj; break; }
+      if (xHit >= 0) { xsh2.getRange(xHit + 2, 1, 1, xHdr.length).setValues([xRow]); xAll[xHit] = xRow; xUpd++; }
+      else { xsh2.appendRow(xRow); xAll.push(xRow); xAdd++; }
+    }
+    SpreadsheetApp.flush();
+    return ContentService.createTextOutput("ok: order methods +" + xAdd + " ~" + xUpd);
+  }
+
   if (body.type === "baskets") {
     var bHdr = ["category", "symbol", "rationale", "suitability", "smallcase", "report", "updatedAt"];
     var bss2 = SpreadsheetApp.getActiveSpreadsheet();

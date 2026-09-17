@@ -58,7 +58,7 @@ order-link-proxy/
   version-controlled normally. The two are currently byte-identical; **if you
   change the backend logic, update both copies** — there's no build step
   wiring them together yet. Note the embedded copy lives inside a JS template
-  literal, so a backslash there must be written `\\` (a single `﻿`
+  literal, so a backslash there must be written `\\` (a single `\uFEFF`
   silently becomes an invisible BOM character in the pasted code).
 
 ## Deploying the backend
@@ -92,11 +92,17 @@ stamped with the firm's SEBI RIA registration number.
 
 Clients act on advice in one of two ways, set per client in **Settings → How
 each client acts on advice** (bulk-assignable; unset defaults to email
-approval):
+approval). The choice is stored in the Google Sheet's **`OrderMethod`** tab
+(`Client code | Name | Method | Updated at`), so it survives a device reset
+and reaches other staff devices on the next team sync — each click saves
+straight away, and "Save all to sheet" / "Load from sheet" cover a bulk
+upload or a restore. Rows are upserted by client code, so moving a client
+from one model to the other later just rewrites their row:
 
 - **Email approval** — the advice mail ends with **Approve the order** /
   **Reject the order** buttons. Approve opens a reply addressed to the
-  dealing team (first address in the setting goes in To, the rest in Cc)
+  dealing desk — `pratheep.kambalath@iiflcapital.com` in To, the advisory
+  team in Cc (first address in the setting is the To, the rest are Cc)
   with the subject and the approval text — "Place this order as GTC" by
   default — already filled in, plus the order details. Reject opens a reply
   to the reject address only, with "REJECTED BY CLIENT" in the subject.
