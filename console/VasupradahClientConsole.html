@@ -871,11 +871,16 @@ async function shortenLink(db, url) {
 }
 let _gwOrderSeq = 0;
 const gwOrderId = (code) => `${String(code || "").trim().replace(/\s+/g, "") || "CL"}-${Date.now()}-${(_gwOrderSeq++).toString(36)}`;
+// Any plausible mobile number worldwide: E.164 allows up to 15 digits, and the
+// shortest national numbers are around 8. Indian numbers are still handed over
+// in their bare 10-digit national form, which is what the gateway expects;
+// everything else is passed through with its country code for the gateway to
+// accept or refuse, rather than being blocked here.
 function gwPhoneDigits(raw) {
-  let d = String(raw || "").replace(/\D/g, "");
+  let d = String(raw || "").replace(/\D/g, "").replace(/^00/, "");
   if (d.length === 12 && d.startsWith("91")) d = d.slice(2);
-  if (d.length === 11 && d.startsWith("0")) d = d.slice(1);
-  return /^[6-9]\d{9}$/.test(d) ? d : "";
+  else if (d.length === 11 && d.startsWith("0")) d = d.slice(1);
+  return d.length >= 8 && d.length <= 15 ? d : "";
 }
 async function gwCreateOrderLink(db, { code, phone, sym, qty, side, orderType, price, triggerPrice }) {
   const proxyUrl = String(db && db.gwProxyUrl || "").trim().replace(/\/$/, "");
@@ -883,7 +888,7 @@ async function gwCreateOrderLink(db, { code, phone, sym, qty, side, orderType, p
   const ticker = String(sym || "").trim().toUpperCase();
   const q = Math.abs(Math.round(num(qty)));
   if (!proxyUrl) return { ok: false, error: "Order-link proxy URL not set in Settings." };
-  if (!phoneNumber) return { ok: false, error: "No valid 10-digit WhatsApp number for this client." };
+  if (!phoneNumber) return { ok: false, error: "No usable mobile number on file for this client." };
   if (!ticker || !q) return { ok: false, error: "Missing ticker/quantity." };
   const body = { orderId: gwOrderId(code), phoneNumber, ticker, quantity: q, type: String(side || "BUY").toUpperCase() === "SELL" ? "SELL" : "BUY" };
   if (orderType) body.orderType = orderType;

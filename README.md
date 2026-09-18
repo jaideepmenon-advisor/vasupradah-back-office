@@ -185,6 +185,12 @@ than duplicating them.
 Only the **mobile** changes behaviour today; name, email, risk and PAN are
 stored alongside it for reference and do not override the client master.
 
+Numbers are accepted worldwide — anything 8 to 15 digits (E.164). Indian
+numbers are handed to the gateway in their bare 10-digit national form, since
+that is what it documents; every other country is passed through with its
+country code, and the gateway itself decides whether to accept it. The
+console no longer blocks a foreign number before the call is made.
+
 ## Order-link gateway (Advice orders)
 
 The one-click "Click Here To Execute the Order" link sent in Advice orders is
