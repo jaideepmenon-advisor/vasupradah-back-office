@@ -17,6 +17,7 @@ Setup:
 Then in the console: Settings -> Order-link gateway -> Proxy URL ->
 http://localhost:8787 (or wherever this ends up running).
 """
+import json
 import os
 import threading
 import time
@@ -33,6 +34,7 @@ EMAIL = os.environ.get("ORDER_LINK_EMAIL", "")
 PASSWORD = os.environ.get("ORDER_LINK_PASSWORD", "")
 ALLOWED_ORIGIN = os.environ.get("ALLOWED_ORIGIN", "*")
 PORT = int(os.environ.get("PORT", "8787"))
+FORCE_HTTPS = os.environ.get("FORCE_HTTPS", "1") not in ("0", "false", "False", "no")
 TOKEN_TTL_SECONDS = 45 * 60
 
 app = Flask(__name__)
@@ -73,6 +75,20 @@ def health():
     return jsonify({"ok": True, "hasCredentials": bool(EMAIL and PASSWORD)})
 
 
+def https_url(resp):
+    """The gateway hands back an http:// short link. These carry a client's order
+    details, so upgrade the scheme before it reaches anyone. Set FORCE_HTTPS=0 if
+    the gateway host is ever not served over TLS."""
+    try:
+        data = resp.json()
+    except ValueError:
+        return {"success": False, "error": (resp.text or "")[:400]}
+    if FORCE_HTTPS and isinstance(data, dict) and isinstance(data.get("url"), str):
+        if data["url"].startswith("http://"):
+            data["url"] = "https://" + data["url"][len("http://"):]
+    return data
+
+
 @app.route("/api/order-links", methods=["POST", "OPTIONS"])
 def order_links():
     if request.method == "OPTIONS":
@@ -99,7 +115,7 @@ def order_links():
                 json=body,
                 timeout=15,
             )
-        return (gw_resp.text, gw_resp.status_code, {"Content-Type": "application/json"})
+        return (json.dumps(https_url(gw_resp)), gw_resp.status_code, {"Content-Type": "application/json"})
     except requests.RequestException as e:
         return jsonify({"success": False, "error": f"Could not reach the order-link gateway: {e}"}), 502
     except RuntimeError as e:

@@ -55,3 +55,10 @@ just leave the terminal window open).
 - `POST /api/order-links` — same request/response shape as the Gateway's
   own endpoint (see the main API guide); this just adds the auth step and
   CORS headers around it.
+
+The Gateway returns its short link as `http://`. Since that link carries a
+client's order details, the proxy rewrites the scheme to `https://` before
+passing it back. This assumes the Gateway host serves TLS — set
+`FORCE_HTTPS=0` in `.env` to disable the rewrite if it ever doesn't. The
+proper fix is on the Gateway itself: serve HTTPS and redirect `http` to it,
+so the link is generated correctly at source.

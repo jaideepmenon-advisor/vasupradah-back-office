@@ -903,7 +903,10 @@ async function gwCreateOrderLink(db, { code, phone, sym, qty, side, orderType, p
     });
     const data = await res.json().catch(() => ({}));
     if (!res.ok || !data.success) return { ok: false, error: data && data.error || `Order-link proxy error (HTTP ${res.status}).` };
-    return { ok: true, url: data.url, orderId: data.orderId, shortCode: data.shortCode };
+    // The gateway returns an http:// short link; these carry a client's order
+    // details, so never hand one out unencrypted.
+    const url = String(data.url || "").replace(/^http:\/\//i, "https://");
+    return { ok: true, url, orderId: data.orderId, shortCode: data.shortCode };
   } catch (e) {
     return { ok: false, error: "Could not reach the order-link proxy — is it running? (" + (e.message || "network error") + ")" };
   }
