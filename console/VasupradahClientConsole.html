@@ -871,16 +871,17 @@ async function shortenLink(db, url) {
 }
 let _gwOrderSeq = 0;
 const gwOrderId = (code) => `${String(code || "").trim().replace(/\s+/g, "") || "CL"}-${Date.now()}-${(_gwOrderSeq++).toString(36)}`;
-// Any plausible mobile number worldwide: E.164 allows up to 15 digits, and the
-// shortest national numbers are around 8. Indian numbers are still handed over
-// in their bare 10-digit national form, which is what the gateway expects;
-// everything else is passed through with its country code for the gateway to
-// accept or refuse, rather than being blocked here.
+// The number handed to the gateway, which is also the number the client types to
+// open their link. Indian numbers keep the bare 10-digit national form they have
+// always been sent in; everything else goes as E.164 with a leading "+", the
+// form the gateway was verified to accept (+97455471305 -> a working link).
 function gwPhoneDigits(raw) {
   let d = String(raw || "").replace(/\D/g, "").replace(/^00/, "");
-  if (d.length === 12 && d.startsWith("91")) d = d.slice(2);
-  else if (d.length === 11 && d.startsWith("0")) d = d.slice(1);
-  return d.length >= 8 && d.length <= 15 ? d : "";
+  if (!d) return "";
+  if (d.length === 12 && d.startsWith("91")) return d.slice(2);
+  if (d.length === 11 && d.startsWith("0")) d = d.slice(1);
+  if (d.length === 10) return d;
+  return d.length >= 8 && d.length <= 15 ? "+" + d : "";
 }
 async function gwCreateOrderLink(db, { code, phone, sym, qty, side, orderType, price, triggerPrice }) {
   const proxyUrl = String(db && db.gwProxyUrl || "").trim().replace(/\/$/, "");

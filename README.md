@@ -185,11 +185,13 @@ than duplicating them.
 Only the **mobile** changes behaviour today; name, email, risk and PAN are
 stored alongside it for reference and do not override the client master.
 
-Numbers are accepted worldwide — anything 8 to 15 digits (E.164). Indian
-numbers are handed to the gateway in their bare 10-digit national form, since
-that is what it documents; every other country is passed through with its
-country code, and the gateway itself decides whether to accept it. The
-console no longer blocks a foreign number before the call is made.
+Numbers are accepted worldwide — anything 8 to 15 digits. Indian numbers are
+handed to the gateway as the bare 10 digits they have always been sent as
+(and that clients type to open their link); every other country goes as
+E.164 with a leading `+`, the form the gateway was verified to accept
+(`+97455471305` returned a working link). Note the number the link is tagged
+with is the number the client must enter, so changing India's format would
+mean re-testing that clients can still open their links.
 
 ## Order-link gateway (Advice orders)
 
