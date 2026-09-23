@@ -62,7 +62,7 @@ function setup() {
 
 function doGet(e) {
   var p = (e && e.parameter) || {};
-  if (!p.prices && !p.alerts && !p.trades && !p.holdings && !p.gridkey && !p.greeting_status && !p.advice_alerts && !p.advice_trace && !p.ping && !p.pipeline && !p.baskets && !p.manual_trades && !p.client_details && !p.exec_modes && !p.advice_contacts && !p.shorten && !p.dedupe && !p.gk_probe && !p.staff) {
+  if (!p.prices && !p.alerts && !p.trades && !p.holdings && !p.gridkey && !p.greeting_status && !p.advice_alerts && !p.advice_trace && !p.ping && !p.pipeline && !p.baskets && !p.manual_trades && !p.client_details && !p.exec_modes && !p.advice_contacts && !p.shorten && !p.dedupe && !p.gk_probe && !p.staff && !p.fee_plans) {
     return ContentService.createTextOutput("Vasupradah backup endpoint is live (use POST from the console).");
   }
 
@@ -298,6 +298,15 @@ function doGet(e) {
     var acsh = acss.getSheetByName("AdviceContacts");
     if (!acsh || acsh.getLastRow() < 2) return ContentService.createTextOutput(JSON.stringify({ ok: true, rows: [] })).setMimeType(ContentService.MimeType.JSON);
     return ContentService.createTextOutput(JSON.stringify({ ok: true, rows: acsh.getDataRange().getValues() })).setMimeType(ContentService.MimeType.JSON);
+  }
+
+  // Billing: the fee plans the firm charges on, kept in "FeePlans" so the list is the
+  // same on every device and survives a device reset.
+  if (p.fee_plans) {
+    var fpss = SpreadsheetApp.getActiveSpreadsheet();
+    var fpsh = fpss.getSheetByName("FeePlans");
+    if (!fpsh || fpsh.getLastRow() < 2) return ContentService.createTextOutput(JSON.stringify({ ok: true, rows: [] })).setMimeType(ContentService.MimeType.JSON);
+    return ContentService.createTextOutput(JSON.stringify({ ok: true, rows: fpsh.getDataRange().getValues() })).setMimeType(ContentService.MimeType.JSON);
   }
 
   if (p.exec_modes) {
@@ -678,6 +687,48 @@ function doPost(e) {
     }
     SpreadsheetApp.flush();
     return ContentService.createTextOutput("ok: advice contacts +" + acAdd + " ~" + acUpd);
+  }
+
+  // --- Billing fee plans. Upsert by id; a plan leaves the sheet only on an explicit
+  //     delete, never because a device turned up with an empty local copy. ---
+  if (body.type === "fee_plans") {
+    var fHdr = ["id", "Name", "Mode", "Amount", "Frequency", "Timing", "GST", "Status", "Notes", "Updated at"];
+    var fss2 = SpreadsheetApp.getActiveSpreadsheet();
+    var fsh2 = fss2.getSheetByName("FeePlans");
+    if (!fsh2) { fsh2 = fss2.insertSheet("FeePlans"); fsh2.getRange(1, 1, 1, fHdr.length).setValues([fHdr]); }
+    if (fsh2.getLastRow() < 1) fsh2.getRange(1, 1, 1, fHdr.length).setValues([fHdr]);
+    var fAll = fsh2.getLastRow() > 1 ? fsh2.getRange(2, 1, fsh2.getLastRow() - 1, fHdr.length).getValues() : [];
+
+    if (body.action === "delete") {
+      var fdId = String(body.id || "").trim();
+      if (!fdId) return ContentService.createTextOutput("error: delete needs an id");
+      for (var fd = 0; fd < fAll.length; fd++) {
+        if (String(fAll[fd][0]).trim() === fdId) {
+          fsh2.deleteRow(fd + 2);
+          SpreadsheetApp.flush();
+          return ContentService.createTextOutput("ok: fee plan deleted");
+        }
+      }
+      return ContentService.createTextOutput("ok: fee plan not found");
+    }
+
+    var fIn = Array.isArray(body.rows) ? body.rows : [];
+    var fAdd = 0, fUpd = 0;
+    for (var fi = 0; fi < fIn.length; fi++) {
+      var fr = fIn[fi] || {};
+      var fId = String(fr.id || "").trim();
+      var fName = String(fr.name || "").trim();
+      if (!fId || !fName) continue;
+      var fRow = [fId, fName, String(fr.mode || ""), Number(fr.amount) || 0, String(fr.frequency || ""),
+        String(fr.timing || ""), String(fr.gst || ""), String(fr.status || ""), String(fr.notes || ""),
+        Number(fr.updatedAt) || Date.now()];
+      var fHit = -1;
+      for (var fj = 0; fj < fAll.length; fj++) if (String(fAll[fj][0]).trim() === fId) { fHit = fj; break; }
+      if (fHit >= 0) { fsh2.getRange(fHit + 2, 1, 1, fHdr.length).setValues([fRow]); fAll[fHit] = fRow; fUpd++; }
+      else { fsh2.appendRow(fRow); fAll.push(fRow); fAdd++; }
+    }
+    SpreadsheetApp.flush();
+    return ContentService.createTextOutput("ok: fee plans +" + fAdd + " ~" + fUpd);
   }
 
   if (body.type === "exec_modes") {

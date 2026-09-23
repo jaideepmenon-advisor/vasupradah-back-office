@@ -123,6 +123,48 @@ Risk categories: `Low Risk`, `Medium to Low Risk`, `Medium to High Risk`,
 Client-facing messages (trade alerts, advice, portfolio statements) are
 stamped with the firm's SEBI RIA registration number.
 
+## Billing — fee plan setup
+
+The **Billing** tab is where the firm's fee plans live. It is the first piece of
+the billing module: everything that comes later (fee calculation, proforma,
+invoice, collection) hangs off a plan, so the list has to exist first and has to
+be the same on every device.
+
+Plans are stored in the Google Sheet's **`FeePlans`** tab
+(`id | Name | Mode | Amount | Frequency | Timing | GST | Status | Notes | Updated at`)
+and mirrored in the browser, so the list survives a device reset and reaches
+other staff on the next team sync. Rows are upserted by `id`, and a plan leaves
+the sheet only when you delete it — never because a device turned up with an
+empty local copy.
+
+Each plan carries:
+
+| Field | What it is |
+| --- | --- |
+| Name | What you'll pick from later, e.g. "Fixed Fee 15000 Per Quarter" |
+| Fee mode | `Fixed fee` or `% of AUA` — the two modes the SEBI IA Regulations allow |
+| Amount | Rupees per period, or the percentage per period |
+| Billing frequency | Monthly / Quarterly / Half-yearly / Annually / One-time |
+| Billed | In advance or in arrears |
+| GST | GST extra / GST inclusive / No GST |
+| Status | Active or Inactive — retired plans stay on file and sort to the bottom |
+| Notes | Anything the team should know before putting a client on the plan |
+
+The list shows each plan's **annualised** figure (amount × periods per year) and
+checks it against the **SEBI fee cap** — ₹1,51,000 a year per family on fixed
+fees, or 2.5% of Assets under Advice. A plan over the cap is flagged, in the
+editor and in the list, but still saves: the cap applies to everything a family
+is charged in a year, not to a single plan, so this is a prompt to check rather
+than a block.
+
+Everyone can see the fee plans; only the Principal Officer can create, edit or
+delete them. On an empty setup there's a one-click button to add the nine plans
+already in use. **Load from sheet** / **Save all to sheet** cover a restore or a
+bulk push.
+
+**This needs the updated backend deployed** — `?fee_plans=1` and the `fee_plans`
+POST live in `Code.gs`.
+
 ## Two client cohorts: email approval vs execute link
 
 Clients act on advice in one of two ways, set per client in **Settings → How
