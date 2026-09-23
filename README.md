@@ -71,6 +71,41 @@ order-link-proxy/
 4. Deploy → Manage deployments → New version, execute as yourself, access
    "Anyone". Paste the resulting Web App URL into the console's Settings tab.
 
+## Signing in: the Principal Officer and staff
+
+The Principal Officer signs in with the admin name plus a PIN. Everyone else
+types the name the Principal Officer enabled for them in **Settings → Staff
+access**; there is no separate password.
+
+How a staff name is checked:
+
+1. **The office Google Sheet is the authority.** When the device is connected,
+   the sign-in screen asks the sheet who is enabled (`?staff=1`) and uses that
+   answer. So a name enabled a minute ago works immediately, and one that has
+   been turned off stops working, on every device.
+2. **If the sheet can't be reached**, it falls back to the list already saved
+   on that device, so a bad connection never strands anyone who has signed in
+   before.
+3. **Names are matched forgivingly** — leading/trailing spaces, repeated
+   spaces, and capitalisation are all ignored. "kavya  jaigopal " signs in
+   against a stored "Kavya Jaigopal".
+
+Every change in Settings → Staff access (add, enable, disable, remove) is
+published to the sheet on the spot. It used to ride along with the next full
+backup, which meant a new joiner could not sign in from their own device until
+one happened, and a name that had just been turned off still could.
+
+A staff member setting up a new device uses **Connect to office sheet** at the
+bottom of the sign-in screen and pastes the Web app URL and Secret from the
+Principal Officer. Until that is done the device has no way to check who is
+enabled, and it says so rather than claiming the name isn't allowed.
+
+**This needs the updated backend deployed.** `?staff=1` and the staff-only POST
+live in `Code.gs` — re-paste it (or Settings → "Copy backend code") and deploy a
+new version. Until then the console falls back to the old, much slower lookup,
+which still works but keeps the sign-in button spinning while it pulls the whole
+trade book.
+
 ## Suitability / risk-category workflow
 
 Risk categories: `Low Risk`, `Medium to Low Risk`, `Medium to High Risk`,

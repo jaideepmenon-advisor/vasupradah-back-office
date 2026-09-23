@@ -1815,7 +1815,7 @@ function setup() {
 
 function doGet(e) {
   var p = (e && e.parameter) || {};
-  if (!p.prices && !p.alerts && !p.trades && !p.holdings && !p.gridkey && !p.greeting_status && !p.advice_alerts && !p.advice_trace && !p.ping && !p.pipeline && !p.baskets && !p.manual_trades && !p.client_details && !p.exec_modes && !p.advice_contacts && !p.shorten && !p.dedupe && !p.gk_probe) {
+  if (!p.prices && !p.alerts && !p.trades && !p.holdings && !p.gridkey && !p.greeting_status && !p.advice_alerts && !p.advice_trace && !p.ping && !p.pipeline && !p.baskets && !p.manual_trades && !p.client_details && !p.exec_modes && !p.advice_contacts && !p.shorten && !p.dedupe && !p.gk_probe && !p.staff) {
     return ContentService.createTextOutput("Vasupradah backup endpoint is live (use POST from the console).");
   }
 
@@ -1825,6 +1825,20 @@ function doGet(e) {
     var pq = 0; try { pq = MailApp.getRemainingDailyQuota(); } catch (ePq) { pq = -1; }
     var pu = ""; try { pu = Session.getEffectiveUser().getEmail(); } catch (ePu) { pu = ""; }
     return ContentService.createTextOutput(JSON.stringify({ ok: true, version: "2026-09-05-pipeline", canSendEmail: pq >= 0, quota: pq, user: pu, tz: Session.getScriptTimeZone(), shortener: String(gkProps_().getProperty("SHORT_PROVIDER") || "isgd") })).setMimeType(ContentService.MimeType.JSON);
+  }
+
+  // Staff list on its own. The sign-in screen asks for this every time someone who
+  // isn't on this device's list types their name, and it used to come back through
+  // ?holdings=1 - which also builds the whole trade book and holdings table, stalls,
+  // and left staff staring at "Checking with office sheet..." until it gave up.
+  if (p.staff) {
+    var stfOut = [];
+    try {
+      var stfJson = PropertiesService.getScriptProperties().getProperty("staff");
+      if (stfJson) { stfOut = JSON.parse(stfJson); }
+    } catch (eStf) { stfOut = []; }
+    if (!(stfOut instanceof Array)) stfOut = [];
+    return ContentService.createTextOutput(JSON.stringify({ ok: true, staff: stfOut })).setMimeType(ContentService.MimeType.JSON);
   }
 
   // Diagnose why a trade is not showing: what does the export actually return, what did the
@@ -2325,6 +2339,13 @@ function doPost(e) {
     try { PropertiesService.getScriptProperties().setProperty("staff", JSON.stringify(body.staff)); } catch (e) { /* ignore */ }
   }
 
+  // ...and the console can publish it on its own, the moment the Principal Officer
+  // enables or disables someone. Waiting for the next full backup meant a new joiner
+  // could not sign in from their own device, and a revoked name still could.
+  if (body.type === "staff") {
+    return ContentService.createTextOutput("ok: staff list saved (" + (Array.isArray(body.staff) ? body.staff.length : 0) + ")");
+  }
+
   // --- GridKey auto-sync: save the token / URLs (token is stored server-side only) ---
   if (body.type === "gridkey_config") {
     var gp2 = PropertiesService.getScriptProperties();
@@ -2766,8 +2787,15 @@ function doPost(e) {
     "P/L amount","P/L %","Invested set","Backed up at"];
   var W = header.length;
 
+  // Anything reaching here is meant to be a full holdings backup, and it replaces the
+  // tab wholesale. A POST that carried no rows at all is not that - it is an unknown
+  // or mistyped request type, and writing it out would empty Holdings.
+  if (!Array.isArray(body.rows)) {
+    return ContentService.createTextOutput("error: this request carried no rows, so Holdings was left untouched.");
+  }
+
   // force every row to exactly W columns so setValues can never fail on width
-  var rows = Array.isArray(body.rows) ? body.rows : [];
+  var rows = body.rows;
   var clean = rows.map(function (r) {
     r = Array.isArray(r) ? r.slice(0, W) : [];
     while (r.length < W) r.push("");
@@ -3729,13 +3757,62 @@ async function pullHoldingsFromSheet(url) {
   const rows = holdingsRowsToObjects(list);
   return { rows, built: clientsFromBackup(rows), dups: scanDuplicates(rows), rowCount: list.length, staff: Array.isArray(data.staff) ? data.staff : null };
 }
+// One person types a staff name into Settings, another types it into the sign-in
+// box on a different device, and a spreadsheet round-trip can leave a stray space
+// behind. Compare names forgivingly so none of that locks anyone out.
+const nameKey = (v) => String(v == null ? "" : v).replace(/\s+/g, " ").trim().toLowerCase();
+const tidyName = (v) => String(v == null ? "" : v).replace(/\s+/g, " ").trim();
+// The Principal Officer's list is the authority on who may sign in, so remote rows
+// overwrite local ones - that is what makes enabling and disabling take effect on
+// everyone else's device. Rows with no name are dropped rather than trusted.
+function mergeStaffLists(local, remote) {
+  const byKey = /* @__PURE__ */ new Map();
+  for (const s of [...local || [], ...remote || []]) {
+    const k = nameKey(s && s.name);
+    if (k) byKey.set(k, { name: tidyName(s.name), enabled: !!(s && s.enabled) });
+  }
+  return [...byKey.values()];
+}
+// Returns the sheet's staff list, or null if the sheet could not be reached.
 async function pullStaffFromSheet(url) {
+  // ?staff=1 returns just the list. It replaced ?holdings=1, which also builds the
+  // whole trade book on the way and left the sign-in screen hanging; the old call is
+  // kept as a fallback so nobody is locked out before the backend is redeployed.
+  const ask = async (q, ms) => {
+    const ctl = typeof AbortController !== "undefined" ? new AbortController() : null;
+    const timer = ctl ? setTimeout(() => ctl.abort(), ms) : null;
+    try {
+      const res = await fetch(url + (url.includes("?") ? "&" : "?") + q, ctl ? { signal: ctl.signal } : void 0);
+      const data = await res.json();
+      return Array.isArray(data.staff) ? data.staff : null;
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  };
   try {
-    const res = await fetch(url + (url.includes("?") ? "&" : "?") + "holdings=1");
-    const data = await res.json();
-    return Array.isArray(data.staff) ? data.staff : [];
+    const quick = await ask("staff=1", 1e4);
+    if (quick) return quick;
+  } catch (e) {
+  }
+  try {
+    return await ask("holdings=1", 3e4) || [];
   } catch (e) {
     return null;
+  }
+}
+// Publishes the staff list on its own, so a name enabled (or disabled) in Settings
+// reaches other devices immediately instead of waiting for the next full backup.
+async function pushStaffToSheet(db) {
+  const url = (db.sheetUrl || "").trim();
+  if (!url) return;
+  try {
+    await fetch(url, {
+      method: "POST",
+      mode: "no-cors",
+      headers: { "Content-Type": "text/plain;charset=utf-8" },
+      body: JSON.stringify({ token: db.sheetToken || "", type: "staff", staff: Array.isArray(db.staff) ? db.staff : [] })
+    });
+  } catch (e) {
   }
 }
 async function logAdviceTrace(db, entries) {
@@ -5555,23 +5632,22 @@ function Login({ db, commit, onLogin }) {
         d.sheetUrl = url;
         if (connTok.trim()) d.sheetToken = connTok.trim();
         d.teamSync = true;
-        const byName = new Map((d.staff || []).map((s) => [String(s.name || "").trim().toLowerCase(), s]));
-        for (const s of remote) {
-          const key = String(s.name || "").trim().toLowerCase();
-          if (!key) continue;
-          if (!byName.has(key)) byName.set(key, { name: s.name, enabled: !!s.enabled });
-        }
-        d.staff = [...byName.values()];
+        d.staff = mergeStaffLists(d.staff, remote);
       }, "connect to office sheet");
       setConnUrl("");
       setConnTok("");
-      setErr("");
+      setErr(remote.length ? "" : "Connected, but the office sheet has no staff list on it yet. Ask the Principal Officer to open Settings and enable your name - it is published the moment they do.");
     } finally {
       setChecking(false);
     }
   };
-  const isAdmin = (n) => n.trim().toLowerCase() === (db.adminName || "").toLowerCase();
-  const enabledStaff = (db.staff || []).filter((s) => s.enabled).map((s) => s.name.toLowerCase());
+  const adminKey = nameKey(db.adminName);
+  const isAdmin = (n) => !!adminKey && nameKey(n) === adminKey;
+  // A row with no name at all used to throw here, which blanked the whole sign-in
+  // screen for everyone - hence the guards rather than a bare s.name.
+  const staffRec = (list, n) => (list || []).find((s) => s && nameKey(s.name) && nameKey(s.name) === nameKey(n));
+  const OFF = "Your access has been turned off. Ask the Principal Officer to enable your name again.";
+  const UNKNOWN = "This name is not on the office list. Ask the Principal Officer to add and enable it in Settings, exactly as you type it here.";
   const submitName = async () => {
     setErr("");
     const n = name.trim();
@@ -5580,40 +5656,45 @@ function Login({ db, commit, onLogin }) {
       setStage(db.adminPin ? "adminpin" : "setpin");
       return;
     }
-    if (enabledStaff.includes(n.toLowerCase())) {
-      onLogin({ name: n, role: "staff" });
-      return;
-    }
     const url = (db.sheetUrl || "").trim();
-    if (!url) {
-      setErr("This name is not enabled. Ask the Principal Officer to enable your access.");
+    const local = staffRec(db.staff, n);
+    // Ask the office sheet first when this device is connected: it is the Principal
+    // Officer's list, so a name enabled minutes ago works straight away and one that
+    // has been turned off stops working. Falls back to this device's own list when
+    // the sheet can't be reached, so a poor connection never strands anyone.
+    if (url) {
+      setChecking(true);
+      let remote = null;
+      try {
+        remote = await pullStaffFromSheet(url);
+      } finally {
+        setChecking(false);
+      }
+      if (remote != null) {
+        await commit((d) => {
+          d.staff = mergeStaffLists(d.staff, remote);
+        }, "sync staff from sheet");
+        const match = staffRec(remote, n);
+        if (match && match.enabled) {
+          onLogin({ name: tidyName(match.name), role: "staff" });
+          return;
+        }
+        setErr(match ? OFF : UNKNOWN);
+        return;
+      }
+      if (local && local.enabled) {
+        onLogin({ name: tidyName(local.name), role: "staff" });
+        return;
+      }
+      setErr(local ? OFF : "Can't reach the office Google Sheet right now, and this name isn't on the list saved on this device. Check your internet and try again.");
       return;
     }
-    setChecking(true);
-    try {
-      const remote = await pullStaffFromSheet(url);
-      if (remote == null) {
-        setErr("Can't reach the office Google Sheet right now \u2014 check your internet, then try again.");
-        return;
-      }
-      const match = remote.find((s) => s && s.enabled && String(s.name || "").trim().toLowerCase() === n.toLowerCase());
-      if (!match) {
-        setErr("This name is not enabled. Ask the Principal Officer to enable your access.");
-        return;
-      }
-      await commit((d) => {
-        const byName = new Map((d.staff || []).map((s) => [String(s.name || "").trim().toLowerCase(), s]));
-        for (const s of remote) {
-          const key = String(s.name || "").trim().toLowerCase();
-          if (!key) continue;
-          if (!byName.has(key)) byName.set(key, { name: s.name, enabled: !!s.enabled });
-        }
-        d.staff = [...byName.values()];
-      }, "sync staff from sheet");
-      onLogin({ name: match.name, role: "staff" });
-    } finally {
-      setChecking(false);
+    if (local) {
+      if (local.enabled) onLogin({ name: tidyName(local.name), role: "staff" });
+      else setErr(OFF);
+      return;
     }
+    setErr("This device isn't connected to the office Google Sheet yet, so it can't check who is enabled. Paste the Web app URL and Secret below and click Connect.");
   };
   const submitPin = async () => {
     setErr("");
@@ -8034,25 +8115,33 @@ function SettingsTab({ db, commit, showToast }) {
     setTeamSync(!!db.teamSync);
     setCl({ default: 10, ...db.concLimits || {} });
   }, [db.version]);
+  // Every change to who may sign in is published to the office sheet straight away.
+  // It used to ride along with the next full backup, so a new joiner could not sign in
+  // from their own device until one happened - and a name you had just turned off could.
+  const publishStaff = async (next) => {
+    await pushStaffToSheet(next);
+    return next;
+  };
   const addStaff = async () => {
-    const n = newStaff.trim();
+    const n = tidyName(newStaff);
     if (!n) return;
-    if ((db.staff || []).some((s) => s.name.toLowerCase() === n.toLowerCase())) {
+    if ((db.staff || []).some((s) => s && nameKey(s.name) === nameKey(n))) {
       showToast("That name already exists.", "err");
       return;
     }
-    await commit((d) => {
+    const next = await commit((d) => {
       d.staff = [...d.staff || [], { name: n, enabled: true }];
     }, "add staff");
+    await publishStaff(next);
     setNewStaff("");
     showToast(`${n} added and enabled.`);
   };
   const toggleStaff = (name) => commit((d) => {
-    d.staff = d.staff.map((s) => s.name === name ? { ...s, enabled: !s.enabled } : s);
-  }, "toggle staff");
+    d.staff = (d.staff || []).map((s) => s && nameKey(s.name) === nameKey(name) ? { ...s, enabled: !s.enabled } : s);
+  }, "toggle staff").then(publishStaff);
   const removeStaff = (name) => commit((d) => {
-    d.staff = d.staff.filter((s) => s.name !== name);
-  }, "remove staff").then(() => showToast("Staff removed."));
+    d.staff = (d.staff || []).filter((s) => s && nameKey(s.name) !== nameKey(name));
+  }, "remove staff").then(publishStaff).then(() => showToast("Staff removed."));
   const saveTemplate = async () => {
     await commit((d) => {
       d.template = tpl;
@@ -8466,7 +8555,7 @@ function SettingsTab({ db, commit, showToast }) {
       placeholder: "Add staff name",
       className: "flex-1 px-3 py-2 text-sm border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500"
     }
-  ), /* @__PURE__ */ React.createElement("button", { onClick: addStaff, className: "bg-indigo-600 hover:bg-indigo-700 text-white text-sm px-3 py-2 rounded-lg flex items-center gap-1" }, /* @__PURE__ */ React.createElement(Plus, { size: 16 }), " Add")), /* @__PURE__ */ React.createElement("div", { className: "space-y-1.5" }, (db.staff || []).map((s) => /* @__PURE__ */ React.createElement("div", { key: s.name, className: "flex items-center gap-2 bg-slate-50 rounded-lg px-3 py-2" }, /* @__PURE__ */ React.createElement("span", { className: "text-sm flex-1" }, s.name), /* @__PURE__ */ React.createElement("button", { onClick: () => toggleStaff(s.name), className: `text-xs px-2 py-1 rounded-md ${s.enabled ? "bg-emerald-100 text-emerald-700" : "bg-slate-200 text-slate-500"}` }, s.enabled ? "Enabled" : "Disabled"), /* @__PURE__ */ React.createElement("button", { onClick: () => removeStaff(s.name), className: "text-slate-400 hover:text-rose-600" }, /* @__PURE__ */ React.createElement(X, { size: 15 })))), !(db.staff || []).length && /* @__PURE__ */ React.createElement("p", { className: "text-xs text-slate-400" }, "No staff added yet."))), /* @__PURE__ */ React.createElement(Card, { title: "WhatsApp message template", icon: MessageCircle }, /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-2 gap-3 mb-3" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("label", { className: "text-xs text-slate-500" }, "Advisor name"), /* @__PURE__ */ React.createElement("input", { value: adv, onChange: (e) => setAdv(e.target.value), className: "w-full mt-1 px-3 py-2 text-sm border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500" })), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("label", { className: "text-xs text-slate-500" }, "SEBI RIA Reg. No."), /* @__PURE__ */ React.createElement("input", { value: sebi, onChange: (e) => setSebi(e.target.value), className: "w-full mt-1 px-3 py-2 text-sm border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500" }))), /* @__PURE__ */ React.createElement("label", { className: "text-xs text-slate-500" }, "Message body (uses ", /* @__PURE__ */ React.createElement("code", { className: "bg-slate-100 px-1 rounded" }, "{holdings}"), " for the stock list)"), /* @__PURE__ */ React.createElement(
+  ), /* @__PURE__ */ React.createElement("button", { onClick: addStaff, className: "bg-indigo-600 hover:bg-indigo-700 text-white text-sm px-3 py-2 rounded-lg flex items-center gap-1" }, /* @__PURE__ */ React.createElement(Plus, { size: 16 }), " Add")), /* @__PURE__ */ React.createElement("div", { className: "space-y-1.5" }, (db.staff || []).filter((s) => s && tidyName(s.name)).map((s) => /* @__PURE__ */ React.createElement("div", { key: nameKey(s.name), className: "flex items-center gap-2 bg-slate-50 rounded-lg px-3 py-2" }, /* @__PURE__ */ React.createElement("span", { className: "text-sm flex-1" }, tidyName(s.name)), /* @__PURE__ */ React.createElement("button", { onClick: () => toggleStaff(s.name), className: `text-xs px-2 py-1 rounded-md ${s.enabled ? "bg-emerald-100 text-emerald-700" : "bg-slate-200 text-slate-500"}` }, s.enabled ? "Enabled" : "Disabled"), /* @__PURE__ */ React.createElement("button", { onClick: () => removeStaff(s.name), className: "text-slate-400 hover:text-rose-600" }, /* @__PURE__ */ React.createElement(X, { size: 15 })))), !(db.staff || []).length && /* @__PURE__ */ React.createElement("p", { className: "text-xs text-slate-400" }, "No staff added yet."))), /* @__PURE__ */ React.createElement(Card, { title: "WhatsApp message template", icon: MessageCircle }, /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-2 gap-3 mb-3" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("label", { className: "text-xs text-slate-500" }, "Advisor name"), /* @__PURE__ */ React.createElement("input", { value: adv, onChange: (e) => setAdv(e.target.value), className: "w-full mt-1 px-3 py-2 text-sm border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500" })), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("label", { className: "text-xs text-slate-500" }, "SEBI RIA Reg. No."), /* @__PURE__ */ React.createElement("input", { value: sebi, onChange: (e) => setSebi(e.target.value), className: "w-full mt-1 px-3 py-2 text-sm border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500" }))), /* @__PURE__ */ React.createElement("label", { className: "text-xs text-slate-500" }, "Message body (uses ", /* @__PURE__ */ React.createElement("code", { className: "bg-slate-100 px-1 rounded" }, "{holdings}"), " for the stock list)"), /* @__PURE__ */ React.createElement(
     "textarea",
     {
       value: tpl,

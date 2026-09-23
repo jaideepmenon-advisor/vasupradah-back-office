@@ -62,7 +62,7 @@ function setup() {
 
 function doGet(e) {
   var p = (e && e.parameter) || {};
-  if (!p.prices && !p.alerts && !p.trades && !p.holdings && !p.gridkey && !p.greeting_status && !p.advice_alerts && !p.advice_trace && !p.ping && !p.pipeline && !p.baskets && !p.manual_trades && !p.client_details && !p.exec_modes && !p.advice_contacts && !p.shorten && !p.dedupe && !p.gk_probe) {
+  if (!p.prices && !p.alerts && !p.trades && !p.holdings && !p.gridkey && !p.greeting_status && !p.advice_alerts && !p.advice_trace && !p.ping && !p.pipeline && !p.baskets && !p.manual_trades && !p.client_details && !p.exec_modes && !p.advice_contacts && !p.shorten && !p.dedupe && !p.gk_probe && !p.staff) {
     return ContentService.createTextOutput("Vasupradah backup endpoint is live (use POST from the console).");
   }
 
@@ -72,6 +72,20 @@ function doGet(e) {
     var pq = 0; try { pq = MailApp.getRemainingDailyQuota(); } catch (ePq) { pq = -1; }
     var pu = ""; try { pu = Session.getEffectiveUser().getEmail(); } catch (ePu) { pu = ""; }
     return ContentService.createTextOutput(JSON.stringify({ ok: true, version: "2026-09-05-pipeline", canSendEmail: pq >= 0, quota: pq, user: pu, tz: Session.getScriptTimeZone(), shortener: String(gkProps_().getProperty("SHORT_PROVIDER") || "isgd") })).setMimeType(ContentService.MimeType.JSON);
+  }
+
+  // Staff list on its own. The sign-in screen asks for this every time someone who
+  // isn't on this device's list types their name, and it used to come back through
+  // ?holdings=1 - which also builds the whole trade book and holdings table, stalls,
+  // and left staff staring at "Checking with office sheet..." until it gave up.
+  if (p.staff) {
+    var stfOut = [];
+    try {
+      var stfJson = PropertiesService.getScriptProperties().getProperty("staff");
+      if (stfJson) { stfOut = JSON.parse(stfJson); }
+    } catch (eStf) { stfOut = []; }
+    if (!(stfOut instanceof Array)) stfOut = [];
+    return ContentService.createTextOutput(JSON.stringify({ ok: true, staff: stfOut })).setMimeType(ContentService.MimeType.JSON);
   }
 
   // Diagnose why a trade is not showing: what does the export actually return, what did the
@@ -572,6 +586,13 @@ function doPost(e) {
     try { PropertiesService.getScriptProperties().setProperty("staff", JSON.stringify(body.staff)); } catch (e) { /* ignore */ }
   }
 
+  // ...and the console can publish it on its own, the moment the Principal Officer
+  // enables or disables someone. Waiting for the next full backup meant a new joiner
+  // could not sign in from their own device, and a revoked name still could.
+  if (body.type === "staff") {
+    return ContentService.createTextOutput("ok: staff list saved (" + (Array.isArray(body.staff) ? body.staff.length : 0) + ")");
+  }
+
   // --- GridKey auto-sync: save the token / URLs (token is stored server-side only) ---
   if (body.type === "gridkey_config") {
     var gp2 = PropertiesService.getScriptProperties();
@@ -1013,8 +1034,15 @@ function doPost(e) {
     "P/L amount","P/L %","Invested set","Backed up at"];
   var W = header.length;
 
+  // Anything reaching here is meant to be a full holdings backup, and it replaces the
+  // tab wholesale. A POST that carried no rows at all is not that - it is an unknown
+  // or mistyped request type, and writing it out would empty Holdings.
+  if (!Array.isArray(body.rows)) {
+    return ContentService.createTextOutput("error: this request carried no rows, so Holdings was left untouched.");
+  }
+
   // force every row to exactly W columns so setValues can never fail on width
-  var rows = Array.isArray(body.rows) ? body.rows : [];
+  var rows = body.rows;
   var clean = rows.map(function (r) {
     r = Array.isArray(r) ? r.slice(0, W) : [];
     while (r.length < W) r.push("");
