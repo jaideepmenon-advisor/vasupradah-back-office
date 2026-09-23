@@ -154,6 +154,33 @@ batch gets `… — 3 orders` instead.
 Note that order **sizing** still uses the live market price, so a limit order
 far from the market will show a quantity based on the market price.
 
+### When there is no live price
+
+Sizing needs a price, and the feed doesn't carry every scrip. Rather than
+leave the quantity blank, you can type the current market price yourself:
+
+- **Risk group** — a "Market price for `<SYMBOL>` (₹)" box sits under the
+  research report link. It shows the live price when there is one (override
+  it if you want) and is the only source of a price when there isn't; the
+  line underneath says which is in use.
+- **Single client** — any symbol in the order lines with no live price gets
+  its own price box in an amber strip above "Add order line".
+
+A price typed here is used for quantity, the order value, the email body and
+the Excel export, exactly as a live price would be. It is not written back to
+the price feed, and it is cleared with the draft.
+
+### The advice being worked on is auto-saved
+
+An advice order in progress is kept in the browser as you type, so moving to
+Portfolio Report (or any other tab) and back, or reloading the page, no
+longer loses it — you'll see "Picked up the advice order you had in
+progress" when it is restored. **Clear draft** in the top-right of Advice
+orders removes it and empties the form. The sizing rules above the order
+(minimum cash, order size %, caps, PIS settings) are standing preferences and
+are left alone by Clear. Nothing is sent to the sheet — the draft lives in
+that one browser only.
+
 ## Advice contacts (order-link login numbers)
 
 A client often opens the order link with a **different mobile from the
