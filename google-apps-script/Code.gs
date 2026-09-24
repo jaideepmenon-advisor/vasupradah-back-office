@@ -62,7 +62,7 @@ function setup() {
 
 function doGet(e) {
   var p = (e && e.parameter) || {};
-  if (!p.prices && !p.alerts && !p.trades && !p.holdings && !p.gridkey && !p.greeting_status && !p.advice_alerts && !p.advice_trace && !p.ping && !p.pipeline && !p.baskets && !p.manual_trades && !p.client_details && !p.exec_modes && !p.advice_contacts && !p.shorten && !p.dedupe && !p.gk_probe && !p.staff && !p.fee_plans && !p.first_trades && !p.billing_profiles && !p.billing_settings && !p.invoices) {
+  if (!p.prices && !p.alerts && !p.trades && !p.holdings && !p.gridkey && !p.greeting_status && !p.advice_alerts && !p.advice_trace && !p.ping && !p.pipeline && !p.baskets && !p.manual_trades && !p.client_details && !p.exec_modes && !p.advice_contacts && !p.shorten && !p.dedupe && !p.gk_probe && !p.staff && !p.fee_plans && !p.first_trades && !p.billing_profiles && !p.billing_settings && !p.invoices && !p.capgains) {
     return ContentService.createTextOutput("Vasupradah backup endpoint is live (use POST from the console).");
   }
 
@@ -370,6 +370,153 @@ function doGet(e) {
       }
     } catch (eFt2) { /* same */ }
     return ContentService.createTextOutput(JSON.stringify({ ok: true, first: ftFirst })).setMimeType(ContentService.MimeType.JSON);
+  }
+
+  // Capital gains. The whole trade book is matched FIFO here, on the sheet, because
+  // shipping ~100k trades to the browser to do it there is not workable. What comes
+  // back is one year's realised gains and the lots still open - small enough to send,
+  // and the browser prices the open lots itself from the live feed.
+  //   ?capgains=1&fy=2026-27          every client, totals only
+  //   ?capgains=1&fy=2026-27&code=X   that client, with every matched sale
+  if (p.capgains) {
+    var cgFy = String(p.fy || "").trim();                       // "2026-27"
+    var cgY = parseInt(cgFy.substring(0, 4), 10);
+    if (!cgY) return ContentService.createTextOutput(JSON.stringify({ ok: false, error: "fy must look like 2026-27" })).setMimeType(ContentService.MimeType.JSON);
+    var cgWant = String(p.code || "").trim();
+    var cgFrom = cgY + "-04-01", cgTo = (cgY + 1) + "-03-31";
+    var cgTz = Session.getScriptTimeZone();
+    var cgToday = Utilities.formatDate(new Date(), cgTz, "yyyy-MM-dd");
+    if (cgTo > cgToday) cgTo = cgToday;                          // a running year stops today
+
+    var cgRows = [];
+    try { cgRows = gkNormalizedTrades_(); } catch (eCg) { cgRows = []; }
+    // Hand-keyed trades count as much as fed ones.
+    try {
+      var cgMs = SpreadsheetApp.getActiveSpreadsheet().getSheetByName("ManualTrades");
+      if (cgMs && cgMs.getLastRow() > 1) {
+        var cgMv = cgMs.getDataRange().getValues();
+        for (var cgi = 1; cgi < cgMv.length; cgi++) {
+          var cgD = cgMv[cgi][1];
+          if (Object.prototype.toString.call(cgD) === "[object Date]") cgD = Utilities.formatDate(cgD, cgTz, "yyyy-MM-dd");
+          cgRows.push([String(cgD), String(cgMv[cgi][2]), String(cgMv[cgi][3]), String(cgMv[cgi][4]),
+            String(cgMv[cgi][5]), Number(cgMv[cgi][6]) || 0, Number(cgMv[cgi][7]) || 0, Number(cgMv[cgi][8]) || 0]);
+        }
+      }
+    } catch (eCg2) { /* a broken manual tab must not sink the report */ }
+
+    // Oldest first, so FIFO means what it says.
+    cgRows.sort(function (a, b) { return String(a[0]) < String(b[0]) ? -1 : String(a[0]) > String(b[0]) ? 1 : 0; });
+
+    // More than twelve months held is long term for listed equity.
+    var cgIsLong = function (buy, sell) {
+      var b = buy.split("-"), sl = sell.split("-");
+      var by = +b[0], bm = +b[1], bd = +b[2];
+      // Same date a year on. Where that date does not exist - 29 February - the
+      // anniversary is the last day of the month; letting JS roll it into March
+      // would read the holding a day short and call a long holding short.
+      var lastDay = new Date(by + 1, bm, 0).getDate();
+      var edge = new Date(by + 1, bm - 1, Math.min(bd, lastDay));
+      var sd = new Date(+sl[0], +sl[1] - 1, +sl[2]);
+      return sd > edge;
+    };
+    var cgBuy = function (act) { return /^(B|BUY|P|PURCHASE)/i.test(String(act || "").trim()); };
+
+    var books = {}, names = {}, realised = [], unmatched = [], totals = {};
+    var tally = function (code) {
+      if (!totals[code]) totals[code] = { code: code, name: names[code] || code, stGain: 0, stLoss: 0, ltGain: 0, ltLoss: 0, sells: 0 };
+      return totals[code];
+    };
+    for (var r = 0; r < cgRows.length; r++) {
+      var tr = cgRows[r];
+      var dt = String(tr[0] || "").trim(), code = String(tr[1] || "").trim();
+      var sym = String(tr[3] || "").trim().toUpperCase();
+      if (!dt || !code || !sym) continue;
+      if (String(tr[2] || "").trim()) names[code] = String(tr[2]).trim();
+      var qty = Math.abs(Number(tr[5]) || 0);
+      if (!qty) continue;
+      var amt = Math.abs(Number(tr[7]) || 0);
+      if (!amt) amt = qty * Math.abs(Number(tr[6]) || 0);
+      var key = code + "\u0001" + sym;
+      if (!books[key]) books[key] = [];
+
+      if (cgBuy(tr[4])) {
+        books[key].push({ date: dt, qty: qty, cost: amt });
+        continue;
+      }
+      // A sale: eat the oldest lots first. The client gets a row in the totals for
+      // any sale inside the window even if nothing matches, so an account that sold
+      // something is never silently missing from the report.
+      if (dt >= cgFrom && dt <= cgTo) tally(code);
+      var left = qty, proceedsRate = amt / qty, book = books[key];
+      while (left > 0 && book.length) {
+        var lot = book[0];
+        var take = Math.min(left, lot.qty);
+        var lotRate = lot.cost / lot.qty;
+        var cost = lotRate * take, proceeds = proceedsRate * take;
+        var gain = proceeds - cost;
+        var isLong = cgIsLong(lot.date, dt);
+        if (dt >= cgFrom && dt <= cgTo) {
+          var t = tally(code);
+          t.sells++;
+          if (isLong) { if (gain >= 0) t.ltGain += gain; else t.ltLoss += -gain; }
+          else { if (gain >= 0) t.stGain += gain; else t.stLoss += -gain; }
+          if (cgWant && code === cgWant) {
+            realised.push({ sym: sym, buyDate: lot.date, sellDate: dt, qty: take,
+              cost: Math.round(cost * 100) / 100, proceeds: Math.round(proceeds * 100) / 100,
+              gain: Math.round(gain * 100) / 100, term: isLong ? "LONG" : "SHORT" });
+          }
+        }
+        lot.qty -= take; lot.cost -= cost; left -= take;
+        if (lot.qty <= 1e-9) book.shift();
+      }
+      // Sold more than the book knows was bought - an opening position carried in,
+      // or a gap in the feed. Never invent a zero cost for it; say so instead.
+      if (left > 1e-9 && dt >= cgFrom && dt <= cgTo) {
+        unmatched.push({ code: code, name: names[code] || code, sym: sym, date: dt, qty: Math.round(left * 1e4) / 1e4 });
+      }
+    }
+
+    // What is still held, bucketed long/short as at today, which is when the browser
+    // will price it. A lot bought before 1 Feb 2018 is marked: s.112A grandfathering
+    // needs the 31 Jan 2018 value, which is not in a trade book.
+    var open = [], lots = [];
+    for (var k in books) {
+      if (!books[k].length) continue;
+      var parts = k.split("\u0001"), oc = parts[0], os = parts[1];
+      if (cgWant && oc !== cgWant) {
+        // still needed for the all-client view, just not lot by lot
+      }
+      var bucket = {};
+      for (var li = 0; li < books[k].length; li++) {
+        var L = books[k][li];
+        if (L.qty <= 1e-9) continue;
+        var term = cgIsLong(L.date, cgToday) ? "LONG" : "SHORT";
+        if (!bucket[term]) bucket[term] = { code: oc, name: names[oc] || oc, sym: os, term: term, qty: 0, cost: 0, oldest: L.date, preGf: 0 };
+        var bk = bucket[term];
+        bk.qty += L.qty; bk.cost += L.cost;
+        if (L.date < bk.oldest) bk.oldest = L.date;
+        if (L.date < "2018-02-01") bk.preGf += L.qty;
+        if (cgWant && oc === cgWant) {
+          lots.push({ sym: os, date: L.date, qty: Math.round(L.qty * 1e4) / 1e4,
+            cost: Math.round(L.cost * 100) / 100, term: term });
+        }
+      }
+      for (var bt in bucket) {
+        bucket[bt].qty = Math.round(bucket[bt].qty * 1e4) / 1e4;
+        bucket[bt].cost = Math.round(bucket[bt].cost * 100) / 100;
+        open.push(bucket[bt]);
+      }
+    }
+    var out2 = { ok: true, fy: cgFy, from: cgFrom, to: cgTo, asOn: cgToday, code: cgWant,
+      clients: [], open: open, unmatched: unmatched.slice(0, 500) };
+    for (var tc in totals) {
+      var tt = totals[tc];
+      tt.stGain = Math.round(tt.stGain * 100) / 100; tt.stLoss = Math.round(tt.stLoss * 100) / 100;
+      tt.ltGain = Math.round(tt.ltGain * 100) / 100; tt.ltLoss = Math.round(tt.ltLoss * 100) / 100;
+      out2.clients.push(tt);
+    }
+    if (cgWant) { out2.realised = realised; out2.lots = lots; }
+    return ContentService.createTextOutput(JSON.stringify(out2)).setMimeType(ContentService.MimeType.JSON);
   }
 
   if (p.exec_modes) {
@@ -843,7 +990,8 @@ function doPost(e) {
     var bsHdr = ["Firm name", "Firm state", "Firm GSTIN", "PAN", "SEBI reg", "Address", "GST rate",
       "Bank name", "Account name", "Account number", "IFSC", "Branch", "UPI id", "UPI QR",
       "Invoice prefix", "Receipt prefix", "Notes", "Updated at",
-      "CIN", "Account type", "Invoice seed FY", "Invoice seed no", "Receipt seed FY", "Receipt seed no", "Number by quarter"];
+      "CIN", "Account type", "Invoice seed FY", "Invoice seed no", "Receipt seed FY", "Receipt seed no", "Number by quarter",
+      "CG short rate", "CG long rate", "CG long exemption", "CG cess"];
     var bsss2 = SpreadsheetApp.getActiveSpreadsheet();
     var bssh2 = bsss2.getSheetByName("BillingSettings");
     if (!bssh2) { bssh2 = bsss2.insertSheet("BillingSettings"); }
@@ -862,7 +1010,11 @@ function doPost(e) {
       String(bsIn.cin || ""), String(bsIn.accountType || ""),
       String(bsIn.invoiceSeedFy || ""), Number(bsIn.invoiceSeedNo) || 0,
       String(bsIn.receiptSeedFy || ""), Number(bsIn.receiptSeedNo) || 0,
-      bsIn.numberByQuarter ? "yes" : "no"];
+      bsIn.numberByQuarter ? "yes" : "no",
+      bsIn.cgStcgRate == null ? "" : Number(bsIn.cgStcgRate),
+      bsIn.cgLtcgRate == null ? "" : Number(bsIn.cgLtcgRate),
+      bsIn.cgLtcgExempt == null ? "" : Number(bsIn.cgLtcgExempt),
+      bsIn.cgCess == null ? "" : Number(bsIn.cgCess)];
     bssh2.clear();
     bssh2.getRange(1, 1, 1, bsHdr.length).setValues([bsHdr]);
     bssh2.getRange(2, 1, 1, bsHdr.length).setValues([bsRow]);

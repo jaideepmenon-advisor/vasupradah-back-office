@@ -123,6 +123,86 @@ Risk categories: `Low Risk`, `Medium to Low Risk`, `Medium to High Risk`,
 Client-facing messages (trade alerts, advice, portfolio statements) are
 stamped with the firm's SEBI RIA registration number.
 
+## Capital gains
+
+The **Capital Gains** tab works out realised and unrealised gains from the trade
+book, estimates the year's tax, and — the point of it — shows which losing
+positions could be sold before 31 March to bring that tax down.
+
+### Where the numbers come from
+
+Trades are matched **first in first out**, which is what the law requires for
+listed shares held in demat. The matching runs on the sheet, not in the browser:
+a `?capgains=1&fy=2026-27[&code=…]` endpoint walks the `Trades` and
+`ManualTrades` tabs and returns one year's realised gains plus the lots still
+open. Shipping ~100k trades to the browser to do it there is not workable.
+
+Open lots come back with their cost and are priced in the browser from the live
+feed, so unrealised figures move with the market. A scrip the feed does not carry
+is shown as "no price" and left out, rather than valued at nil and read as a
+total loss.
+
+Pick any of the last eight financial years. The running year runs **1 April to
+today**; a finished one runs to 31 March.
+
+### Tax
+
+Listed equity with STT paid:
+
+| | Held | Rate | Section |
+| --- | --- | --- | --- |
+| Short term | 12 months or less | 20% | 111A |
+| Long term | more than 12 months | 12.5% over ₹1,25,000 a year | 112A |
+
+Plus 4% cess, and surcharge if it applies. These are the rates for transfers on
+or after 23 July 2024; all four are editable in **Billing → Bank & GST → Capital
+gains tax rates**, so a Budget change is a field rather than a rebuild, and an
+earlier year can be worked out on the old basis (15% / 10% over ₹1,00,000).
+
+Losses are set off the way the law allows, and the screen shows each step:
+
+- a **long-term loss** only against long-term gain;
+- a **short-term loss** against either — taken against short-term gain first,
+  that being the dearer of the two to leave standing;
+- the ₹1,25,000 exemption against what long-term gain is left;
+- anything unabsorbed shown as carried forward.
+
+Brought-forward losses and a surcharge rate can be typed in for the working.
+They are not saved — the estimate is a planning tool, recomputed each time.
+
+### Booking losses before 31 March
+
+**Losses worth booking** lists every position standing at a loss today, with what
+selling it would actually save in tax this year — computed by re-running the
+whole set-off with that loss added, not by multiplying by a rate. Short-term
+losers usually come first, since short-term gain is taxed higher. Tick several to
+see what the year's tax becomes.
+
+The screen says plainly that this is a tax decision and not an investment one:
+only sell where it also suits the client's risk profile, and note that buying the
+stock back starts a fresh holding period, so a long-term holding becomes short
+term again.
+
+### What it does not do
+
+Stated on the screen as well as here, because a capital gains figure that quietly
+omits something is worse than none:
+
+- **Sales with no purchase on record** — an opening position carried in from
+  before the trade book starts, or a gap in the feed — are **not** given a zero
+  cost and a phantom gain. They are listed by name, and the totals are flagged as
+  understated.
+- **Grandfathering** under s.112A (shares bought before 1 February 2018 may take
+  the 31 January 2018 value as cost) is not applied, because that value is not in
+  a trade book. Affected holdings are marked `pre-2018`.
+- **Bonus issues, splits and demergers** are not adjusted for.
+- Cost and proceeds are the trade amounts, so brokerage is included and STT is
+  not separated out.
+- Only what is in these accounts is counted.
+
+It is an estimate for planning. Check it against the broker's own statement
+before anything goes into a return.
+
 ## Billing
 
 The **Billing** tab runs the quarterly fee cycle end to end: fee plans, who is on

@@ -2821,6 +2821,7 @@ const Bell = mkIcon("<path d=\"M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9\"/><pat
 const TrendingUp = mkIcon("<polyline points=\"22 7 13.5 15.5 8.5 10.5 2 17\"/><polyline points=\"16 7 22 7 22 13\"/>");
 const Calendar = mkIcon("<path d=\"M8 2v4\"/><path d=\"M16 2v4\"/><rect width=\"18\" height=\"18\" x=\"3\" y=\"4\" rx=\"2\"/><path d=\"M3 10h18\"/>");
 const Share2 = mkIcon("<circle cx=\"18\" cy=\"5\" r=\"3\"/><circle cx=\"6\" cy=\"12\" r=\"3\"/><circle cx=\"18\" cy=\"19\" r=\"3\"/><line x1=\"8.59\" x2=\"15.42\" y1=\"13.51\" y2=\"17.49\"/><line x1=\"15.41\" x2=\"8.59\" y1=\"6.51\" y2=\"10.49\"/>");
+const Scale = mkIcon("<path d=\"M12 3v18\"/><path d=\"M5 7h14\"/><path d=\"m5 7-3 6a4 4 0 0 0 6 0Z\"/><path d=\"m19 7 3 6a4 4 0 0 1-6 0Z\"/><path d=\"M8 21h8\"/>");
 const Receipt = mkIcon("<path d=\"M4 2v20l2.5-1.5L9 22l2.5-1.5L14 22l2.5-1.5L19 22V2l-2.5 1.5L14 2l-2.5 1.5L9 2 6.5 3.5Z\"/><path d=\"M8 7h8\"/><path d=\"M8 11h5\"/><path d=\"M8 15h3\"/>");
 const FileText = mkIcon("<path d=\"M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z\"/><path d=\"M14 2v4a2 2 0 0 0 2 2h4\"/><path d=\"M16 13H8\"/><path d=\"M16 17H8\"/><path d=\"M10 9H8\"/>");
 
@@ -4117,7 +4118,7 @@ function setup() {
 
 function doGet(e) {
   var p = (e && e.parameter) || {};
-  if (!p.prices && !p.alerts && !p.trades && !p.holdings && !p.gridkey && !p.greeting_status && !p.advice_alerts && !p.advice_trace && !p.ping && !p.pipeline && !p.baskets && !p.manual_trades && !p.client_details && !p.exec_modes && !p.advice_contacts && !p.shorten && !p.dedupe && !p.gk_probe && !p.staff && !p.fee_plans && !p.first_trades && !p.billing_profiles && !p.billing_settings && !p.invoices) {
+  if (!p.prices && !p.alerts && !p.trades && !p.holdings && !p.gridkey && !p.greeting_status && !p.advice_alerts && !p.advice_trace && !p.ping && !p.pipeline && !p.baskets && !p.manual_trades && !p.client_details && !p.exec_modes && !p.advice_contacts && !p.shorten && !p.dedupe && !p.gk_probe && !p.staff && !p.fee_plans && !p.first_trades && !p.billing_profiles && !p.billing_settings && !p.invoices && !p.capgains) {
     return ContentService.createTextOutput("Vasupradah backup endpoint is live (use POST from the console).");
   }
 
@@ -4425,6 +4426,153 @@ function doGet(e) {
       }
     } catch (eFt2) { /* same */ }
     return ContentService.createTextOutput(JSON.stringify({ ok: true, first: ftFirst })).setMimeType(ContentService.MimeType.JSON);
+  }
+
+  // Capital gains. The whole trade book is matched FIFO here, on the sheet, because
+  // shipping ~100k trades to the browser to do it there is not workable. What comes
+  // back is one year's realised gains and the lots still open - small enough to send,
+  // and the browser prices the open lots itself from the live feed.
+  //   ?capgains=1&fy=2026-27          every client, totals only
+  //   ?capgains=1&fy=2026-27&code=X   that client, with every matched sale
+  if (p.capgains) {
+    var cgFy = String(p.fy || "").trim();                       // "2026-27"
+    var cgY = parseInt(cgFy.substring(0, 4), 10);
+    if (!cgY) return ContentService.createTextOutput(JSON.stringify({ ok: false, error: "fy must look like 2026-27" })).setMimeType(ContentService.MimeType.JSON);
+    var cgWant = String(p.code || "").trim();
+    var cgFrom = cgY + "-04-01", cgTo = (cgY + 1) + "-03-31";
+    var cgTz = Session.getScriptTimeZone();
+    var cgToday = Utilities.formatDate(new Date(), cgTz, "yyyy-MM-dd");
+    if (cgTo > cgToday) cgTo = cgToday;                          // a running year stops today
+
+    var cgRows = [];
+    try { cgRows = gkNormalizedTrades_(); } catch (eCg) { cgRows = []; }
+    // Hand-keyed trades count as much as fed ones.
+    try {
+      var cgMs = SpreadsheetApp.getActiveSpreadsheet().getSheetByName("ManualTrades");
+      if (cgMs && cgMs.getLastRow() > 1) {
+        var cgMv = cgMs.getDataRange().getValues();
+        for (var cgi = 1; cgi < cgMv.length; cgi++) {
+          var cgD = cgMv[cgi][1];
+          if (Object.prototype.toString.call(cgD) === "[object Date]") cgD = Utilities.formatDate(cgD, cgTz, "yyyy-MM-dd");
+          cgRows.push([String(cgD), String(cgMv[cgi][2]), String(cgMv[cgi][3]), String(cgMv[cgi][4]),
+            String(cgMv[cgi][5]), Number(cgMv[cgi][6]) || 0, Number(cgMv[cgi][7]) || 0, Number(cgMv[cgi][8]) || 0]);
+        }
+      }
+    } catch (eCg2) { /* a broken manual tab must not sink the report */ }
+
+    // Oldest first, so FIFO means what it says.
+    cgRows.sort(function (a, b) { return String(a[0]) < String(b[0]) ? -1 : String(a[0]) > String(b[0]) ? 1 : 0; });
+
+    // More than twelve months held is long term for listed equity.
+    var cgIsLong = function (buy, sell) {
+      var b = buy.split("-"), sl = sell.split("-");
+      var by = +b[0], bm = +b[1], bd = +b[2];
+      // Same date a year on. Where that date does not exist - 29 February - the
+      // anniversary is the last day of the month; letting JS roll it into March
+      // would read the holding a day short and call a long holding short.
+      var lastDay = new Date(by + 1, bm, 0).getDate();
+      var edge = new Date(by + 1, bm - 1, Math.min(bd, lastDay));
+      var sd = new Date(+sl[0], +sl[1] - 1, +sl[2]);
+      return sd > edge;
+    };
+    var cgBuy = function (act) { return /^(B|BUY|P|PURCHASE)/i.test(String(act || "").trim()); };
+
+    var books = {}, names = {}, realised = [], unmatched = [], totals = {};
+    var tally = function (code) {
+      if (!totals[code]) totals[code] = { code: code, name: names[code] || code, stGain: 0, stLoss: 0, ltGain: 0, ltLoss: 0, sells: 0 };
+      return totals[code];
+    };
+    for (var r = 0; r < cgRows.length; r++) {
+      var tr = cgRows[r];
+      var dt = String(tr[0] || "").trim(), code = String(tr[1] || "").trim();
+      var sym = String(tr[3] || "").trim().toUpperCase();
+      if (!dt || !code || !sym) continue;
+      if (String(tr[2] || "").trim()) names[code] = String(tr[2]).trim();
+      var qty = Math.abs(Number(tr[5]) || 0);
+      if (!qty) continue;
+      var amt = Math.abs(Number(tr[7]) || 0);
+      if (!amt) amt = qty * Math.abs(Number(tr[6]) || 0);
+      var key = code + "\\u0001" + sym;
+      if (!books[key]) books[key] = [];
+
+      if (cgBuy(tr[4])) {
+        books[key].push({ date: dt, qty: qty, cost: amt });
+        continue;
+      }
+      // A sale: eat the oldest lots first. The client gets a row in the totals for
+      // any sale inside the window even if nothing matches, so an account that sold
+      // something is never silently missing from the report.
+      if (dt >= cgFrom && dt <= cgTo) tally(code);
+      var left = qty, proceedsRate = amt / qty, book = books[key];
+      while (left > 0 && book.length) {
+        var lot = book[0];
+        var take = Math.min(left, lot.qty);
+        var lotRate = lot.cost / lot.qty;
+        var cost = lotRate * take, proceeds = proceedsRate * take;
+        var gain = proceeds - cost;
+        var isLong = cgIsLong(lot.date, dt);
+        if (dt >= cgFrom && dt <= cgTo) {
+          var t = tally(code);
+          t.sells++;
+          if (isLong) { if (gain >= 0) t.ltGain += gain; else t.ltLoss += -gain; }
+          else { if (gain >= 0) t.stGain += gain; else t.stLoss += -gain; }
+          if (cgWant && code === cgWant) {
+            realised.push({ sym: sym, buyDate: lot.date, sellDate: dt, qty: take,
+              cost: Math.round(cost * 100) / 100, proceeds: Math.round(proceeds * 100) / 100,
+              gain: Math.round(gain * 100) / 100, term: isLong ? "LONG" : "SHORT" });
+          }
+        }
+        lot.qty -= take; lot.cost -= cost; left -= take;
+        if (lot.qty <= 1e-9) book.shift();
+      }
+      // Sold more than the book knows was bought - an opening position carried in,
+      // or a gap in the feed. Never invent a zero cost for it; say so instead.
+      if (left > 1e-9 && dt >= cgFrom && dt <= cgTo) {
+        unmatched.push({ code: code, name: names[code] || code, sym: sym, date: dt, qty: Math.round(left * 1e4) / 1e4 });
+      }
+    }
+
+    // What is still held, bucketed long/short as at today, which is when the browser
+    // will price it. A lot bought before 1 Feb 2018 is marked: s.112A grandfathering
+    // needs the 31 Jan 2018 value, which is not in a trade book.
+    var open = [], lots = [];
+    for (var k in books) {
+      if (!books[k].length) continue;
+      var parts = k.split("\\u0001"), oc = parts[0], os = parts[1];
+      if (cgWant && oc !== cgWant) {
+        // still needed for the all-client view, just not lot by lot
+      }
+      var bucket = {};
+      for (var li = 0; li < books[k].length; li++) {
+        var L = books[k][li];
+        if (L.qty <= 1e-9) continue;
+        var term = cgIsLong(L.date, cgToday) ? "LONG" : "SHORT";
+        if (!bucket[term]) bucket[term] = { code: oc, name: names[oc] || oc, sym: os, term: term, qty: 0, cost: 0, oldest: L.date, preGf: 0 };
+        var bk = bucket[term];
+        bk.qty += L.qty; bk.cost += L.cost;
+        if (L.date < bk.oldest) bk.oldest = L.date;
+        if (L.date < "2018-02-01") bk.preGf += L.qty;
+        if (cgWant && oc === cgWant) {
+          lots.push({ sym: os, date: L.date, qty: Math.round(L.qty * 1e4) / 1e4,
+            cost: Math.round(L.cost * 100) / 100, term: term });
+        }
+      }
+      for (var bt in bucket) {
+        bucket[bt].qty = Math.round(bucket[bt].qty * 1e4) / 1e4;
+        bucket[bt].cost = Math.round(bucket[bt].cost * 100) / 100;
+        open.push(bucket[bt]);
+      }
+    }
+    var out2 = { ok: true, fy: cgFy, from: cgFrom, to: cgTo, asOn: cgToday, code: cgWant,
+      clients: [], open: open, unmatched: unmatched.slice(0, 500) };
+    for (var tc in totals) {
+      var tt = totals[tc];
+      tt.stGain = Math.round(tt.stGain * 100) / 100; tt.stLoss = Math.round(tt.stLoss * 100) / 100;
+      tt.ltGain = Math.round(tt.ltGain * 100) / 100; tt.ltLoss = Math.round(tt.ltLoss * 100) / 100;
+      out2.clients.push(tt);
+    }
+    if (cgWant) { out2.realised = realised; out2.lots = lots; }
+    return ContentService.createTextOutput(JSON.stringify(out2)).setMimeType(ContentService.MimeType.JSON);
   }
 
   if (p.exec_modes) {
@@ -4898,7 +5046,8 @@ function doPost(e) {
     var bsHdr = ["Firm name", "Firm state", "Firm GSTIN", "PAN", "SEBI reg", "Address", "GST rate",
       "Bank name", "Account name", "Account number", "IFSC", "Branch", "UPI id", "UPI QR",
       "Invoice prefix", "Receipt prefix", "Notes", "Updated at",
-      "CIN", "Account type", "Invoice seed FY", "Invoice seed no", "Receipt seed FY", "Receipt seed no", "Number by quarter"];
+      "CIN", "Account type", "Invoice seed FY", "Invoice seed no", "Receipt seed FY", "Receipt seed no", "Number by quarter",
+      "CG short rate", "CG long rate", "CG long exemption", "CG cess"];
     var bsss2 = SpreadsheetApp.getActiveSpreadsheet();
     var bssh2 = bsss2.getSheetByName("BillingSettings");
     if (!bssh2) { bssh2 = bsss2.insertSheet("BillingSettings"); }
@@ -4917,7 +5066,11 @@ function doPost(e) {
       String(bsIn.cin || ""), String(bsIn.accountType || ""),
       String(bsIn.invoiceSeedFy || ""), Number(bsIn.invoiceSeedNo) || 0,
       String(bsIn.receiptSeedFy || ""), Number(bsIn.receiptSeedNo) || 0,
-      bsIn.numberByQuarter ? "yes" : "no"];
+      bsIn.numberByQuarter ? "yes" : "no",
+      bsIn.cgStcgRate == null ? "" : Number(bsIn.cgStcgRate),
+      bsIn.cgLtcgRate == null ? "" : Number(bsIn.cgLtcgRate),
+      bsIn.cgLtcgExempt == null ? "" : Number(bsIn.cgLtcgExempt),
+      bsIn.cgCess == null ? "" : Number(bsIn.cgCess)];
     bssh2.clear();
     bssh2.getRange(1, 1, 1, bsHdr.length).setValues([bsHdr]);
     bssh2.getRange(2, 1, 1, bsHdr.length).setValues([bsRow]);
@@ -6762,7 +6915,9 @@ function billingFieldWarning(key, v) {
 const DEFAULT_BILLING_SETTINGS = () => ({
   firmName: "Vasupradah Investment Advisory Services P Ltd",
   firmState: "Kerala", firmGstin: "32AAICV4624L1Z5", pan: "AAICV4624L", cin: "U6712OKL2021PTC073050",
-  sebiReg: "", address: "Kochi, Kerala", gstRate: 18,
+  sebiReg: "",
+  address: "Regd Office: G32, Ground Floor, Pioneer Towers, Marine Drive, Kochi 682031",
+  gstRate: 18,
   bankName: "ICICI Bank", accountName: "Vasupradah Investment Advisory Services P Ltd",
   accountNo: "635105600988", accountType: "Current", ifsc: "ICIC00063515", branch: "",
   upiId: "vasupradah.ia@validicici", upiQr: "",
@@ -6861,7 +7016,11 @@ async function pullBillingSettings(url) {
     invoicePrefix: String(r[14] || ""), receiptPrefix: String(r[15] || ""), notes: String(r[16] || ""),
     updatedAt: num(r[17]), cin: String(r[18] || ""), accountType: String(r[19] || ""),
     invoiceSeedFy: String(r[20] || ""), invoiceSeedNo: num(r[21]),
-    receiptSeedFy: String(r[22] || ""), receiptSeedNo: num(r[23]), numberByQuarter: String(r[24] || "") === "yes"
+    receiptSeedFy: String(r[22] || ""), receiptSeedNo: num(r[23]), numberByQuarter: String(r[24] || "") === "yes",
+    cgStcgRate: r[25] === "" || r[25] == null ? null : num(r[25]),
+    cgLtcgRate: r[26] === "" || r[26] == null ? null : num(r[26]),
+    cgLtcgExempt: r[27] === "" || r[27] == null ? null : num(r[27]),
+    cgCess: r[28] === "" || r[28] == null ? null : num(r[28])
   };
 }
 async function pushBillingSettings(db, row) {
@@ -7158,6 +7317,81 @@ function buildQuarterRun(opts) {
   }
   return { bills, skipped, repeats, quarter, issueFy, issuedAt: issuedAtDay.getTime(), settings: st };
 }
+// ---- Capital gains ----------------------------------------------------------
+// Listed equity with STT paid, which is all this console deals in:
+//   short term (held 12 months or less)  - s.111A, 20% for transfers on or after
+//     23 July 2024 (15% before that);
+//   long term (held more than 12 months) - s.112A, 12.5% on the excess over
+//     Rs 1,25,000 in the year (10% over Rs 1,00,000 before 23 July 2024).
+// Rates are settings rather than constants so a Budget change is a field, not a
+// rebuild.
+const CG_DEFAULTS = {
+  cgStcgRate: 20, cgLtcgRate: 12.5, cgLtcgExempt: 125000, cgCess: 4, cgSurcharge: 0
+};
+const cgSettingsOf = (db) => {
+  const b = db.billingSettings || {};
+  const out = { ...CG_DEFAULTS };
+  for (const k of Object.keys(CG_DEFAULTS)) if (b[k] != null && b[k] !== "") out[k] = num(b[k]);
+  return out;
+};
+// Sets losses off against gains and works out the tax. Order matters: a long-term
+// loss may only go against long-term gain, while a short-term loss may go against
+// either - and it is taken against short-term gain first, that being the dearer of
+// the two to leave standing.
+function cgSetOff(g, rates) {
+  const r = { ...CG_DEFAULTS, ...rates || {} };
+  let stGain = Math.max(0, num(g.stGain)), ltGain = Math.max(0, num(g.ltGain));
+  let stLoss = Math.max(0, num(g.stLoss)) + Math.max(0, num(g.bfStcl));
+  let ltLoss = Math.max(0, num(g.ltLoss)) + Math.max(0, num(g.bfLtcl));
+  const usedLtOnLt = Math.min(ltLoss, ltGain);
+  ltGain -= usedLtOnLt; ltLoss -= usedLtOnLt;
+  const usedStOnSt = Math.min(stLoss, stGain);
+  stGain -= usedStOnSt; stLoss -= usedStOnSt;
+  const usedStOnLt = Math.min(stLoss, ltGain);
+  ltGain -= usedStOnLt; stLoss -= usedStOnLt;
+  const exempt = Math.min(ltGain, Math.max(0, r.cgLtcgExempt));
+  const taxableLt = round2(ltGain - exempt);
+  const taxableSt = round2(stGain);
+  const stTax = round2(taxableSt * r.cgStcgRate / 100);
+  const ltTax = round2(taxableLt * r.cgLtcgRate / 100);
+  const base = round2(stTax + ltTax);
+  const surcharge = round2(base * Math.max(0, r.cgSurcharge) / 100);
+  const cess = round2((base + surcharge) * Math.max(0, r.cgCess) / 100);
+  return {
+    taxableSt, taxableLt, exemptUsed: round2(exempt), stTax, ltTax, base, surcharge, cess,
+    total: round2(base + surcharge + cess),
+    carrySt: round2(stLoss), carryLt: round2(ltLoss),
+    usedLtOnLt: round2(usedLtOnLt), usedStOnSt: round2(usedStOnSt), usedStOnLt: round2(usedStOnLt)
+  };
+}
+// What selling a losing position now would save in tax this year: the difference
+// between the bill as it stands and the bill with that loss booked.
+function cgHarvestSaving(g, rates, stclAdd, ltclAdd) {
+  const before = cgSetOff(g, rates).total;
+  const after = cgSetOff({ ...g, stLoss: num(g.stLoss) + num(stclAdd), ltLoss: num(g.ltLoss) + num(ltclAdd) }, rates).total;
+  return round2(before - after);
+}
+async function pullCapGains(url, fy, code) {
+  const q = "capgains=1&fy=" + encodeURIComponent(fy) + (code ? "&code=" + encodeURIComponent(code) : "");
+  const res = await fetch(url + (url.includes("?") ? "&" : "?") + q);
+  const data = await res.json();
+  if (!data || data.ok !== true) throw new Error((data && data.error) || "The sheet could not work out the gains.");
+  return data;
+}
+// The financial years worth offering: this one and the seven before it.
+function cgYears(today) {
+  const q = fyQuarter(today || new Date());
+  const out = [];
+  for (let i = 0; i < 8; i++) {
+    const y = q.fyStart - i;
+    out.push(`${y}-${String((y + 1) % 100).padStart(2, "0")}`);
+  }
+  return out;
+}
+const cgFyRange = (fy) => {
+  const y = parseInt(String(fy).slice(0, 4), 10);
+  return { from: `${y}-04-01`, to: `${y + 1}-03-31` };
+};
 async function pullExecModes(url) {
   const res = await fetch(url + (url.includes("?") ? "&" : "?") + "exec_modes=1");
   const data = await res.json();
@@ -8942,7 +9176,9 @@ function BillingSettingsSection({ db, user, commit, showToast }) {
     rd.readAsDataURL(file);
   };
   const save = async () => {
-    const row = { ...f, gstRate: num(f.gstRate), invoiceSeedNo: num(f.invoiceSeedNo), receiptSeedNo: num(f.receiptSeedNo), updatedAt: Date.now() };
+    const row = { ...f, gstRate: num(f.gstRate), invoiceSeedNo: num(f.invoiceSeedNo), receiptSeedNo: num(f.receiptSeedNo),
+      cgStcgRate: num(f.cgStcgRate), cgLtcgRate: num(f.cgLtcgRate), cgLtcgExempt: num(f.cgLtcgExempt), cgCess: num(f.cgCess),
+      updatedAt: Date.now() };
     setBusy(true);
     try {
       const next = await commit((d) => { d.billingSettings = row; }, "billing settings");
@@ -9009,6 +9245,21 @@ function BillingSettingsSection({ db, user, commit, showToast }) {
       /* @__PURE__ */ React.createElement("label", { className: "flex items-center gap-2 text-[12px] text-slate-600 mt-3" },
         /* @__PURE__ */ React.createElement("input", { type: "checkbox", checked: !!f.numberByQuarter, onChange: (e) => set("numberByQuarter", e.target.checked), disabled: !isAdmin }),
         "Put the quarter in the number too (", f.invoicePrefix || "VIAS", "/", thisFy, "/Q1/001 instead of ", f.invoicePrefix || "VIAS", "/", thisFy, "/001)")),
+    /* @__PURE__ */ React.createElement(Card, { title: "Capital gains tax rates", icon: Scale },
+      /* @__PURE__ */ React.createElement("p", { className: "text-[12px] text-slate-500 mb-3" }, "Used by the Capital Gains tab. The rates below are those for transfers on or after 23 July 2024 \u2014 change them here if a Budget moves them, or to work out an earlier year on the old basis."),
+      /* @__PURE__ */ React.createElement("div", { className: "grid md:grid-cols-3 gap-3" },
+        /* @__PURE__ */ React.createElement("div", null,
+          /* @__PURE__ */ React.createElement("label", { className: lbl }, "Short term, s.111A (%)"),
+          /* @__PURE__ */ React.createElement("input", { type: "number", step: "0.5", value: f.cgStcgRate == null ? CG_DEFAULTS.cgStcgRate : f.cgStcgRate, onChange: (e) => set("cgStcgRate", e.target.value), disabled: !isAdmin, className: inCls })),
+        /* @__PURE__ */ React.createElement("div", null,
+          /* @__PURE__ */ React.createElement("label", { className: lbl }, "Long term, s.112A (%)"),
+          /* @__PURE__ */ React.createElement("input", { type: "number", step: "0.5", value: f.cgLtcgRate == null ? CG_DEFAULTS.cgLtcgRate : f.cgLtcgRate, onChange: (e) => set("cgLtcgRate", e.target.value), disabled: !isAdmin, className: inCls })),
+        /* @__PURE__ */ React.createElement("div", null,
+          /* @__PURE__ */ React.createElement("label", { className: lbl }, "Long-term exemption a year (\u20B9)"),
+          /* @__PURE__ */ React.createElement("input", { type: "number", step: "1000", value: f.cgLtcgExempt == null ? CG_DEFAULTS.cgLtcgExempt : f.cgLtcgExempt, onChange: (e) => set("cgLtcgExempt", e.target.value), disabled: !isAdmin, className: inCls })),
+        /* @__PURE__ */ React.createElement("div", null,
+          /* @__PURE__ */ React.createElement("label", { className: lbl }, "Health & education cess (%)"),
+          /* @__PURE__ */ React.createElement("input", { type: "number", step: "0.5", value: f.cgCess == null ? CG_DEFAULTS.cgCess : f.cgCess, onChange: (e) => set("cgCess", e.target.value), disabled: !isAdmin, className: inCls })))),
     /* @__PURE__ */ React.createElement(Card, { title: "Where clients pay", icon: Receipt },
       /* @__PURE__ */ React.createElement("p", { className: "text-[12px] text-slate-500 mb-3" }, "These details are printed on every bill and repeated in the WhatsApp note, with a line telling the client to pay nowhere else."),
       /* @__PURE__ */ React.createElement("div", { className: "grid md:grid-cols-2 gap-3" },
@@ -9048,6 +9299,288 @@ function BillingSettingsSection({ db, user, commit, showToast }) {
         igst: 0, total: round2(15e3 * (1 + num(f.gstRate) / 100)), issuedAt: Date.now()
       }, { ...f, gstRate: num(f.gstRate) })
     })
+  );
+}
+// ====================== CAPITAL GAINS ===================================
+// Realised gains for a financial year, what is still open and what it is worth
+// today, and - the point of the thing - which losing positions could be sold
+// before 31 March to bring the year's tax down.
+function CapitalGainsTab({ db, user, showToast }) {
+  const rates = cgSettingsOf(db);
+  const years = useMemo(() => cgYears(new Date()), []);
+  const [fy, setFy] = useState(years[0]);
+  const [code, setCode] = useState("");
+  const [data, setData] = useState(null);
+  const [state, setState] = useState("idle");
+  const [err, setErr] = useState("");
+  const [bfStcl, setBfStcl] = useState("");
+  const [bfLtcl, setBfLtcl] = useState("");
+  const [surcharge, setSurcharge] = useState(String(rates.cgSurcharge || 0));
+  const [view, setView] = useState("harvest");
+  const [picked, setPicked] = useState(() => /* @__PURE__ */ new Set());
+
+  const clientList = useMemo(() => Object.values(db.clients || {})
+    .map((c) => ({ code: c.code, name: c.name || c.code }))
+    .sort((a, b) => String(a.name).localeCompare(String(b.name))), [db.clients]);
+  const url = (db.sheetUrl || "").trim();
+  const load = async () => {
+    if (!url) { setErr("Connect the office Google Sheet in Settings first — the gains are worked out from the trade book on the sheet."); setState("error"); return; }
+    setState("loading"); setErr("");
+    try {
+      const d = await pullCapGains(url, fy, code);
+      setData(d); setState("ready"); setPicked(/* @__PURE__ */ new Set());
+    } catch (e) {
+      setErr(String(e && e.message || e)); setState("error");
+    }
+  };
+  useEffect(() => { load(); }, [fy, code, url]);
+
+  const priceOf = (sym) => num((db.prices || {})[String(sym || "").toUpperCase()]);
+  // Open lots priced at the live feed. A scrip the feed does not carry is kept
+  // separate rather than valued at nil, which would read as a total loss.
+  const open = useMemo(() => {
+    const rows = ((data || {}).open || []).filter((o) => !code || o.code === code);
+    return rows.map((o) => {
+      const px = priceOf(o.sym);
+      const value = px > 0 ? round2(num(o.qty) * px) : null;
+      return { ...o, px, value, gain: value == null ? null : round2(value - num(o.cost)) };
+    }).sort((a, b) => (a.gain == null ? 1 : b.gain == null ? -1 : a.gain - b.gain));
+  }, [data, db.prices, code]);
+  const unpriced = open.filter((o) => o.value == null);
+  const unrealGain = round2(open.reduce((a, o) => a + (o.gain > 0 ? o.gain : 0), 0));
+  const unrealLoss = round2(open.reduce((a, o) => a + (o.gain < 0 ? -o.gain : 0), 0));
+  const preGf = open.filter((o) => num(o.preGf) > 0);
+
+  const tot = useMemo(() => {
+    const list = ((data || {}).clients || []).filter((c) => !code || c.code === code);
+    return list.reduce((a, c) => ({
+      stGain: a.stGain + num(c.stGain), stLoss: a.stLoss + num(c.stLoss),
+      ltGain: a.ltGain + num(c.ltGain), ltLoss: a.ltLoss + num(c.ltLoss), sells: a.sells + num(c.sells)
+    }), { stGain: 0, stLoss: 0, ltGain: 0, ltLoss: 0, sells: 0 });
+  }, [data, code]);
+  const useRates = { ...rates, cgSurcharge: num(surcharge) };
+  const gains = { ...tot, bfStcl: num(bfStcl), bfLtcl: num(bfLtcl) };
+  const tax = cgSetOff(gains, useRates);
+
+  // Losing positions, dearest saving first. Selling a short-term loser usually
+  // saves more, because short-term gain is taxed higher.
+  const harvest = useMemo(() => open.filter((o) => o.gain != null && o.gain < 0).map((o) => ({
+    ...o,
+    saving: cgHarvestSaving(gains, useRates, o.term === "SHORT" ? -o.gain : 0, o.term === "LONG" ? -o.gain : 0)
+  })).sort((a, b) => b.saving - a.saving || a.gain - b.gain), [open, tot, bfStcl, bfLtcl, surcharge]);
+  const pickedRows = harvest.filter((o) => picked.has(o.code + "|" + o.sym + "|" + o.term));
+  const pickedSt = round2(pickedRows.filter((o) => o.term === "SHORT").reduce((a, o) => a - o.gain, 0));
+  const pickedLt = round2(pickedRows.filter((o) => o.term === "LONG").reduce((a, o) => a - o.gain, 0));
+  const pickedSaving = pickedRows.length ? cgHarvestSaving(gains, useRates, pickedSt, pickedLt) : 0;
+  const afterTax = cgSetOff({ ...gains, stLoss: gains.stLoss + pickedSt, ltLoss: gains.ltLoss + pickedLt }, useRates);
+  const toggle = (k) => setPicked((s2) => { const n = new Set(s2); n.has(k) ? n.delete(k) : n.add(k); return n; });
+
+  const range = cgFyRange(fy);
+  const running = fy === years[0];
+  const exportAll = () => {
+    const rows = [];
+    for (const r of ((data || {}).realised || [])) rows.push({ Sheet: "Realised", Symbol: r.sym, "Bought": r.buyDate, "Sold": r.sellDate, Qty: r.qty, Cost: r.cost, Proceeds: r.proceeds, Gain: r.gain, Term: r.term });
+    for (const o of open) rows.push({ Sheet: "Open", Client: o.name, Symbol: o.sym, Term: o.term, Qty: o.qty, Cost: o.cost, "Price": o.px || "", Value: o.value == null ? "" : o.value, "Unrealised": o.gain == null ? "" : o.gain, "Oldest lot": o.oldest });
+    if (!rows.length) { showToast("Nothing to export yet.", "err"); return; }
+    downloadExcelRows(rows, `capital-gains-${fy}${code ? "-" + code : ""}`);
+  };
+  const card = (label, value, tone) => /* @__PURE__ */ React.createElement("div", { key: label, className: "bg-white border border-slate-200 rounded-xl px-3 py-2" },
+    /* @__PURE__ */ React.createElement("div", { className: "text-[10px] uppercase text-slate-400" }, label),
+    /* @__PURE__ */ React.createElement("div", { className: `text-sm font-semibold tabular-nums ${tone || "text-slate-800"}` }, value));
+  const th = "text-left font-medium px-3 py-2";
+  const thr = "text-right font-medium px-3 py-2";
+
+  return /* @__PURE__ */ React.createElement("div", { className: "space-y-4" },
+    /* @__PURE__ */ React.createElement("div", { className: "flex items-start justify-between gap-3 flex-wrap" },
+      /* @__PURE__ */ React.createElement("div", null,
+        /* @__PURE__ */ React.createElement("h2", { className: "text-lg font-semibold text-slate-800" }, "Capital gains"),
+        /* @__PURE__ */ React.createElement("p", { className: "text-[12px] text-slate-500 max-w-3xl" },
+          "Worked out from the trade book, matched first in first out. ",
+          running ? `This year so far — 1 April ${range.from.slice(0, 4)} to ${data ? fmtDay(data.to) : "today"}.` : `Year ended 31 March ${range.to.slice(0, 4)}.`,
+          " Open positions are priced as they stand today.")),
+      /* @__PURE__ */ React.createElement("div", { className: "flex gap-2 flex-wrap items-center" },
+        /* @__PURE__ */ React.createElement("select", { value: fy, onChange: (e) => setFy(e.target.value), className: "px-3 py-2 text-sm border border-slate-200 rounded-lg bg-white" },
+          years.map((y) => /* @__PURE__ */ React.createElement("option", { key: y, value: y }, y, y === years[0] ? " (running)" : ""))),
+        /* @__PURE__ */ React.createElement("select", { value: code, onChange: (e) => setCode(e.target.value), className: "px-3 py-2 text-sm border border-slate-200 rounded-lg bg-white max-w-[240px]" },
+          /* @__PURE__ */ React.createElement("option", { value: "" }, "All clients"),
+          clientList.map((c) => /* @__PURE__ */ React.createElement("option", { key: c.code, value: c.code }, c.name, " (", c.code, ")"))),
+        /* @__PURE__ */ React.createElement("button", { onClick: load, disabled: state === "loading", className: "text-sm px-3 py-2 rounded-lg border border-slate-200 text-slate-600 hover:bg-slate-50 flex items-center gap-1.5 disabled:opacity-50" },
+          /* @__PURE__ */ React.createElement(RefreshCw, { size: 15 }), " ", state === "loading" ? "Working…" : "Refresh"),
+        /* @__PURE__ */ React.createElement("button", { onClick: exportAll, className: "text-sm px-3 py-2 rounded-lg border border-slate-200 text-slate-600 hover:bg-slate-50 flex items-center gap-1.5" },
+          /* @__PURE__ */ React.createElement(Download, { size: 15 }), " Excel"))),
+
+    state === "error" && /* @__PURE__ */ React.createElement("div", { className: "text-[12px] text-rose-800 bg-rose-50 border border-rose-200 rounded-lg px-3 py-2" }, err),
+    state === "loading" && /* @__PURE__ */ React.createElement("div", { className: "text-[12px] text-slate-500 bg-slate-50 border border-slate-200 rounded-lg px-3 py-2" }, "Matching the trade book… a large book takes a few seconds."),
+
+    state === "ready" && /* @__PURE__ */ React.createElement(React.Fragment, null,
+      /* @__PURE__ */ React.createElement("div", { className: "grid sm:grid-cols-3 lg:grid-cols-6 gap-2" },
+        card("Realised short term", rupee(tot.stGain - tot.stLoss), tot.stGain - tot.stLoss < 0 ? "text-rose-600" : "text-slate-800"),
+        card("Realised long term", rupee(tot.ltGain - tot.ltLoss), tot.ltGain - tot.ltLoss < 0 ? "text-rose-600" : "text-slate-800"),
+        card("Unrealised gain", rupee(unrealGain), "text-emerald-700"),
+        card("Unrealised loss", rupee(unrealLoss), "text-rose-600"),
+        card("Taxable", rupee(tax.taxableSt + tax.taxableLt)),
+        card("Tax estimate", rupee(tax.total), "text-indigo-700")),
+
+      /* @__PURE__ */ React.createElement("div", { className: "bg-white border border-slate-200 rounded-xl p-4" },
+        /* @__PURE__ */ React.createElement("div", { className: "text-sm font-medium text-slate-700 mb-2" }, "How the tax works out"),
+        /* @__PURE__ */ React.createElement("div", { className: "text-[12px] max-w-2xl" },
+          [["Short-term gain", rupee(tot.stGain)], ["Short-term loss", "(" + rupee(tot.stLoss) + ")"],
+           ["Long-term gain", rupee(tot.ltGain)], ["Long-term loss", "(" + rupee(tot.ltLoss) + ")"],
+           ["Long-term loss set against long-term gain", "(" + rupee(tax.usedLtOnLt) + ")"],
+           ["Short-term loss set against short-term gain", "(" + rupee(tax.usedStOnSt) + ")"],
+           ["Short-term loss set against long-term gain", "(" + rupee(tax.usedStOnLt) + ")"],
+           [`Exemption used (s.112A, ${rupee(useRates.cgLtcgExempt)} a year)`, "(" + rupee(tax.exemptUsed) + ")"],
+           [`Taxable short term @ ${useRates.cgStcgRate}%`, rupee(tax.taxableSt) + "  →  " + rupee(tax.stTax)],
+           [`Taxable long term @ ${useRates.cgLtcgRate}%`, rupee(tax.taxableLt) + "  →  " + rupee(tax.ltTax)],
+           ...(tax.surcharge > 0 ? [[`Surcharge @ ${useRates.cgSurcharge}%`, rupee(tax.surcharge)]] : []),
+           [`Cess @ ${useRates.cgCess}%`, rupee(tax.cess)],
+           ["Loss carried to later years", rupee(tax.carrySt + tax.carryLt)]
+          ].map(([k, v]) => /* @__PURE__ */ React.createElement("div", { key: k, className: "flex justify-between gap-6 border-b border-slate-100 py-1" },
+            /* @__PURE__ */ React.createElement("span", { className: "text-slate-500" }, k),
+            /* @__PURE__ */ React.createElement("span", { className: "text-slate-800 tabular-nums" }, v)))),
+        /* @__PURE__ */ React.createElement("div", { className: "flex justify-between gap-6 mt-2 pt-2 border-t-2 border-slate-300 text-sm max-w-2xl" },
+          /* @__PURE__ */ React.createElement("span", { className: "font-medium text-slate-700" }, "Estimated capital gains tax"),
+          /* @__PURE__ */ React.createElement("span", { className: "font-semibold text-indigo-700 tabular-nums" }, rupee(tax.total))),
+        /* @__PURE__ */ React.createElement("div", { className: "grid sm:grid-cols-3 gap-3 mt-4 pt-3 border-t border-slate-100" },
+          [["Brought-forward short-term loss", bfStcl, setBfStcl], ["Brought-forward long-term loss", bfLtcl, setBfLtcl], ["Surcharge %", surcharge, setSurcharge]]
+            .map(([label, val, setter]) => /* @__PURE__ */ React.createElement("div", { key: label },
+              /* @__PURE__ */ React.createElement("label", { className: "text-[11px] text-slate-500 block mb-1" }, label),
+              /* @__PURE__ */ React.createElement("input", { type: "number", value: val, onChange: (e) => setter(e.target.value), placeholder: "0", className: "w-full px-3 py-1.5 text-sm border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500" })))),
+        /* @__PURE__ */ React.createElement("p", { className: "text-[11px] text-slate-400 mt-2" }, "Brought-forward losses and surcharge are typed in here for the working and are not saved. Surcharge on gains under s.111A and s.112A is capped at 15%.")),
+
+      /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-1 flex-wrap border-b border-slate-200" },
+        [["harvest", `Losses worth booking (${harvest.length})`], ["open", `Open positions (${open.length})`],
+         ["realised", code ? `Every sale (${((data || {}).realised || []).length})` : `By client (${((data || {}).clients || []).length})`]]
+          .map(([id, label]) => /* @__PURE__ */ React.createElement("button", { key: id, onClick: () => setView(id),
+            className: `px-3 py-2 text-sm -mb-px border-b-2 ${view === id ? "border-indigo-600 text-indigo-700 font-medium" : "border-transparent text-slate-500 hover:text-slate-700"}` }, label))),
+
+      view === "harvest" && /* @__PURE__ */ React.createElement("div", { className: "space-y-3" },
+        /* @__PURE__ */ React.createElement("p", { className: "text-[12px] text-slate-500" },
+          "Positions standing at a loss today. Selling before 31 March books the loss into this year and sets it against the gains above. Tick the ones you are considering to see what the year's tax would become."),
+        pickedRows.length > 0 && /* @__PURE__ */ React.createElement("div", { className: "bg-emerald-50 border border-emerald-200 rounded-xl px-4 py-3 flex flex-wrap items-center text-[13px]", style: { columnGap: "2rem", rowGap: "0.25rem" } },
+          /* @__PURE__ */ React.createElement("span", null, /* @__PURE__ */ React.createElement("b", null, pickedRows.length), " selected · loss booked ", /* @__PURE__ */ React.createElement("b", null, rupee(pickedSt + pickedLt))),
+          /* @__PURE__ */ React.createElement("span", null, "Tax now ", rupee(tax.total), " → ", /* @__PURE__ */ React.createElement("b", { className: "text-emerald-800" }, rupee(afterTax.total))),
+          /* @__PURE__ */ React.createElement("span", null, "Saving ", /* @__PURE__ */ React.createElement("b", { className: "text-emerald-800" }, rupee(pickedSaving))),
+          /* @__PURE__ */ React.createElement("button", { onClick: () => setPicked(/* @__PURE__ */ new Set()), className: "ml-auto text-[12px] text-slate-500 hover:underline" }, "Clear")),
+        /* @__PURE__ */ React.createElement("div", { className: "bg-white border border-slate-200 rounded-xl overflow-hidden" },
+          /* @__PURE__ */ React.createElement("table", { className: "w-full text-sm" },
+            /* @__PURE__ */ React.createElement("thead", { className: "bg-slate-50 text-slate-500 text-[11px] uppercase" },
+              /* @__PURE__ */ React.createElement("tr", null,
+                /* @__PURE__ */ React.createElement("th", { className: "w-8 px-3 py-2" }),
+                !code && /* @__PURE__ */ React.createElement("th", { className: th }, "Client"),
+                /* @__PURE__ */ React.createElement("th", { className: th }, "Stock"),
+                /* @__PURE__ */ React.createElement("th", { className: th }, "Term"),
+                /* @__PURE__ */ React.createElement("th", { className: thr }, "Qty"),
+                /* @__PURE__ */ React.createElement("th", { className: thr }, "Cost"),
+                /* @__PURE__ */ React.createElement("th", { className: thr }, "Value"),
+                /* @__PURE__ */ React.createElement("th", { className: thr }, "Loss"),
+                /* @__PURE__ */ React.createElement("th", { className: thr }, "Tax saved"))),
+            /* @__PURE__ */ React.createElement("tbody", { className: "divide-y divide-slate-100" },
+              harvest.map((o) => {
+                const k = o.code + "|" + o.sym + "|" + o.term;
+                return /* @__PURE__ */ React.createElement("tr", { key: k, className: picked.has(k) ? "bg-emerald-50/50" : "" },
+                  /* @__PURE__ */ React.createElement("td", { className: "px-3 py-2" }, /* @__PURE__ */ React.createElement("input", { type: "checkbox", checked: picked.has(k), onChange: () => toggle(k) })),
+                  !code && /* @__PURE__ */ React.createElement("td", { className: "px-3 py-2 text-[12px] text-slate-600" }, o.name),
+                  /* @__PURE__ */ React.createElement("td", { className: "px-3 py-2 text-slate-800" }, o.sym),
+                  /* @__PURE__ */ React.createElement("td", { className: "px-3 py-2" },
+                    /* @__PURE__ */ React.createElement("span", { className: `text-[10px] px-1.5 py-0.5 rounded ${o.term === "SHORT" ? "bg-amber-50 text-amber-700" : "bg-slate-100 text-slate-600"}` }, o.term === "SHORT" ? "Short" : "Long"),
+                    /* @__PURE__ */ React.createElement("div", { className: "text-[10px] text-slate-400" }, "since ", fmtDay(o.oldest))),
+                  /* @__PURE__ */ React.createElement("td", { className: "px-3 py-2 text-right tabular-nums text-slate-600" }, o.qty),
+                  /* @__PURE__ */ React.createElement("td", { className: "px-3 py-2 text-right tabular-nums text-slate-600" }, rupee(o.cost)),
+                  /* @__PURE__ */ React.createElement("td", { className: "px-3 py-2 text-right tabular-nums text-slate-600" }, rupee(o.value)),
+                  /* @__PURE__ */ React.createElement("td", { className: "px-3 py-2 text-right tabular-nums text-rose-600" }, rupee(o.gain)),
+                  /* @__PURE__ */ React.createElement("td", { className: "px-3 py-2 text-right tabular-nums font-medium text-emerald-700" }, o.saving > 0 ? rupee(o.saving) : "—"));
+              }),
+              !harvest.length && /* @__PURE__ */ React.createElement("tr", null, /* @__PURE__ */ React.createElement("td", { colSpan: code ? 8 : 9, className: "px-3 py-10 text-center text-slate-400 text-sm" }, "No position is standing at a loss today."))))),
+        harvest.length > 0 && /* @__PURE__ */ React.createElement("div", { className: "text-[11px] text-amber-800 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2 flex gap-2" },
+          /* @__PURE__ */ React.createElement(AlertTriangle, { size: 14, className: "shrink-0 mt-0.5" }),
+          /* @__PURE__ */ React.createElement("span", null, "Booking a loss is a tax decision, not an investment one. Only sell where it also suits the client's risk profile and the position no longer earns its place — and remember that buying the stock back starts a fresh holding period, so a long-term holding becomes short term again.")),
+        tax.total <= 0 && harvest.length > 0 && /* @__PURE__ */ React.createElement("p", { className: "text-[11px] text-slate-400" }, "There is no tax to save this year, so a loss booked now would only be carried forward — for eight years, and a long-term loss only against long-term gain.")),
+
+      view === "open" && /* @__PURE__ */ React.createElement("div", { className: "bg-white border border-slate-200 rounded-xl overflow-hidden" },
+        /* @__PURE__ */ React.createElement("div", { style: { maxHeight: "60vh", overflowY: "auto" } },
+          /* @__PURE__ */ React.createElement("table", { className: "w-full text-sm" },
+            /* @__PURE__ */ React.createElement("thead", { className: "bg-slate-50 text-slate-500 text-[11px] uppercase sticky top-0" },
+              /* @__PURE__ */ React.createElement("tr", null,
+                !code && /* @__PURE__ */ React.createElement("th", { className: th }, "Client"),
+                /* @__PURE__ */ React.createElement("th", { className: th }, "Stock"),
+                /* @__PURE__ */ React.createElement("th", { className: th }, "Term"),
+                /* @__PURE__ */ React.createElement("th", { className: thr }, "Qty"),
+                /* @__PURE__ */ React.createElement("th", { className: thr }, "Cost"),
+                /* @__PURE__ */ React.createElement("th", { className: thr }, "Value"),
+                /* @__PURE__ */ React.createElement("th", { className: thr }, "Unrealised"))),
+            /* @__PURE__ */ React.createElement("tbody", { className: "divide-y divide-slate-100" },
+              open.map((o) => /* @__PURE__ */ React.createElement("tr", { key: o.code + o.sym + o.term },
+                !code && /* @__PURE__ */ React.createElement("td", { className: "px-3 py-2 text-[12px] text-slate-600" }, o.name),
+                /* @__PURE__ */ React.createElement("td", { className: "px-3 py-2 text-slate-800" }, o.sym,
+                  num(o.preGf) > 0 && /* @__PURE__ */ React.createElement("span", { title: "Bought before 1 Feb 2018 - grandfathering under s.112A applies", className: "ml-1.5 text-[10px] px-1 py-0.5 rounded bg-amber-100 text-amber-700" }, "pre-2018")),
+                /* @__PURE__ */ React.createElement("td", { className: "px-3 py-2 text-[12px] text-slate-500" }, o.term === "SHORT" ? "Short" : "Long",
+                  /* @__PURE__ */ React.createElement("div", { className: "text-[10px] text-slate-400" }, "since ", fmtDay(o.oldest))),
+                /* @__PURE__ */ React.createElement("td", { className: "px-3 py-2 text-right tabular-nums text-slate-600" }, o.qty),
+                /* @__PURE__ */ React.createElement("td", { className: "px-3 py-2 text-right tabular-nums text-slate-600" }, rupee(o.cost)),
+                /* @__PURE__ */ React.createElement("td", { className: "px-3 py-2 text-right tabular-nums text-slate-600" }, o.value == null ? /* @__PURE__ */ React.createElement("span", { className: "text-slate-300" }, "no price") : rupee(o.value)),
+                /* @__PURE__ */ React.createElement("td", { className: `px-3 py-2 text-right tabular-nums ${o.gain == null ? "text-slate-300" : o.gain < 0 ? "text-rose-600" : "text-emerald-700"}` }, o.gain == null ? "—" : rupee(o.gain)))),
+              !open.length && /* @__PURE__ */ React.createElement("tr", null, /* @__PURE__ */ React.createElement("td", { colSpan: code ? 6 : 7, className: "px-3 py-10 text-center text-slate-400 text-sm" }, "Nothing open on the trade book.")))))),
+
+      view === "realised" && /* @__PURE__ */ React.createElement("div", { className: "bg-white border border-slate-200 rounded-xl overflow-hidden" },
+        /* @__PURE__ */ React.createElement("div", { style: { maxHeight: "60vh", overflowY: "auto" } },
+          code
+            ? /* @__PURE__ */ React.createElement("table", { className: "w-full text-sm" },
+                /* @__PURE__ */ React.createElement("thead", { className: "bg-slate-50 text-slate-500 text-[11px] uppercase sticky top-0" },
+                  /* @__PURE__ */ React.createElement("tr", null,
+                    /* @__PURE__ */ React.createElement("th", { className: th }, "Stock"),
+                    /* @__PURE__ */ React.createElement("th", { className: th }, "Bought"),
+                    /* @__PURE__ */ React.createElement("th", { className: th }, "Sold"),
+                    /* @__PURE__ */ React.createElement("th", { className: thr }, "Qty"),
+                    /* @__PURE__ */ React.createElement("th", { className: thr }, "Cost"),
+                    /* @__PURE__ */ React.createElement("th", { className: thr }, "Proceeds"),
+                    /* @__PURE__ */ React.createElement("th", { className: thr }, "Gain"),
+                    /* @__PURE__ */ React.createElement("th", { className: th }, "Term"))),
+                /* @__PURE__ */ React.createElement("tbody", { className: "divide-y divide-slate-100" },
+                  ((data || {}).realised || []).map((r, i) => /* @__PURE__ */ React.createElement("tr", { key: i },
+                    /* @__PURE__ */ React.createElement("td", { className: "px-3 py-2 text-slate-800" }, r.sym),
+                    /* @__PURE__ */ React.createElement("td", { className: "px-3 py-2 text-[12px] text-slate-500" }, fmtDay(r.buyDate)),
+                    /* @__PURE__ */ React.createElement("td", { className: "px-3 py-2 text-[12px] text-slate-500" }, fmtDay(r.sellDate)),
+                    /* @__PURE__ */ React.createElement("td", { className: "px-3 py-2 text-right tabular-nums text-slate-600" }, r.qty),
+                    /* @__PURE__ */ React.createElement("td", { className: "px-3 py-2 text-right tabular-nums text-slate-600" }, rupee(r.cost)),
+                    /* @__PURE__ */ React.createElement("td", { className: "px-3 py-2 text-right tabular-nums text-slate-600" }, rupee(r.proceeds)),
+                    /* @__PURE__ */ React.createElement("td", { className: `px-3 py-2 text-right tabular-nums ${num(r.gain) < 0 ? "text-rose-600" : "text-emerald-700"}` }, rupee(r.gain)),
+                    /* @__PURE__ */ React.createElement("td", { className: "px-3 py-2 text-[12px] text-slate-500" }, r.term === "SHORT" ? "Short" : "Long"))),
+                  !((data || {}).realised || []).length && /* @__PURE__ */ React.createElement("tr", null, /* @__PURE__ */ React.createElement("td", { colSpan: 8, className: "px-3 py-10 text-center text-slate-400 text-sm" }, "No sale in this year."))))
+            : /* @__PURE__ */ React.createElement("table", { className: "w-full text-sm" },
+                /* @__PURE__ */ React.createElement("thead", { className: "bg-slate-50 text-slate-500 text-[11px] uppercase sticky top-0" },
+                  /* @__PURE__ */ React.createElement("tr", null,
+                    /* @__PURE__ */ React.createElement("th", { className: th }, "Client"),
+                    /* @__PURE__ */ React.createElement("th", { className: thr }, "Short-term net"),
+                    /* @__PURE__ */ React.createElement("th", { className: thr }, "Long-term net"),
+                    /* @__PURE__ */ React.createElement("th", { className: thr }, "Tax estimate"),
+                    /* @__PURE__ */ React.createElement("th", { className: thr }, ""))),
+                /* @__PURE__ */ React.createElement("tbody", { className: "divide-y divide-slate-100" },
+                  ((data || {}).clients || []).slice().sort((x, y) => cgSetOff(y, useRates).total - cgSetOff(x, useRates).total)
+                    .map((c) => /* @__PURE__ */ React.createElement("tr", { key: c.code },
+                      /* @__PURE__ */ React.createElement("td", { className: "px-3 py-2" },
+                        /* @__PURE__ */ React.createElement("div", { className: "text-slate-800" }, c.name),
+                        /* @__PURE__ */ React.createElement("div", { className: "text-[11px] text-slate-400" }, c.code, " · ", c.sells, " matched sale(s)")),
+                      /* @__PURE__ */ React.createElement("td", { className: `px-3 py-2 text-right tabular-nums ${c.stGain - c.stLoss < 0 ? "text-rose-600" : "text-slate-700"}` }, rupee(c.stGain - c.stLoss)),
+                      /* @__PURE__ */ React.createElement("td", { className: `px-3 py-2 text-right tabular-nums ${c.ltGain - c.ltLoss < 0 ? "text-rose-600" : "text-slate-700"}` }, rupee(c.ltGain - c.ltLoss)),
+                      /* @__PURE__ */ React.createElement("td", { className: "px-3 py-2 text-right tabular-nums font-medium text-indigo-700" }, rupee(cgSetOff(c, useRates).total)),
+                      /* @__PURE__ */ React.createElement("td", { className: "px-3 py-2 text-right" },
+                        /* @__PURE__ */ React.createElement("button", { onClick: () => setCode(c.code), className: "text-[12px] text-indigo-600 hover:underline" }, "Open")))),
+                  !((data || {}).clients || []).length && /* @__PURE__ */ React.createElement("tr", null, /* @__PURE__ */ React.createElement("td", { colSpan: 5, className: "px-3 py-10 text-center text-slate-400 text-sm" }, "No sale by anyone in this year.")))))),
+
+      ((data || {}).unmatched || []).length > 0 && /* @__PURE__ */ React.createElement("div", { className: "text-[12px] text-rose-800 bg-rose-50 border border-rose-200 rounded-lg px-3 py-2" },
+        /* @__PURE__ */ React.createElement("b", null, ((data || {}).unmatched || []).length, " sale(s) had no purchase on record"),
+        " — an opening position carried in from before the trade book starts, or a gap in the feed. No gain has been worked out for those, so the figures above are understated. ",
+        ((data || {}).unmatched || []).slice(0, 6).map((u) => `${u.name} ${u.sym} ${u.qty} on ${fmtDay(u.date)}`).join("; "),
+        ((data || {}).unmatched || []).length > 6 ? " …" : ""),
+      preGf.length > 0 && /* @__PURE__ */ React.createElement("div", { className: "text-[12px] text-amber-800 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2" },
+        /* @__PURE__ */ React.createElement("b", null, preGf.length, " holding(s) bought before 1 February 2018"),
+        " — grandfathering under s.112A lets the cost be stepped up to the 31 January 2018 market value, which is not in the trade book. The long-term gain on those will usually be lower than shown."),
+      unpriced.length > 0 && /* @__PURE__ */ React.createElement("div", { className: "text-[12px] text-slate-600 bg-slate-50 border border-slate-200 rounded-lg px-3 py-2" },
+        unpriced.length, " holding(s) have no live price, so they are left out of the unrealised figures: ", unpriced.slice(0, 8).map((o) => o.sym).join(", "), unpriced.length > 8 ? "…" : ""),
+      /* @__PURE__ */ React.createElement("p", { className: "text-[11px] text-slate-400" },
+        "An estimate for planning, not a tax computation. It covers listed equity with STT paid, matched first in first out from the trade book, and does not adjust for bonus issues, splits or demergers, nor for anything held outside these accounts. Cost and proceeds are taken as the trade amounts, so brokerage is included and STT is not separated out. Have it checked against the broker's own statement before it goes into a return.")
+    )
   );
 }
 function FeePlanSetup({ db, user, commit, showToast }) {
@@ -10259,6 +10792,8 @@ function Console({ db, user, commit, undo, refreshPrices, onLogout }) {
     // The dot says a closed quarter has not been billed yet, so it is noticed without
     // having to remember to open the tab on the first of the month.
     { id: "billing", label: "Billing", icon: Receipt, dot: user.role === "admin" && Object.keys(db.billingProfiles || {}).length > 0 && (db.lastBillRun || "") !== billableQuarter(new Date()).key },
+    // Capital gains: a read of the trade book, so staff can see it too.
+    { id: "capgains", label: "Capital Gains", icon: Scale },
     // Upload Data and Settings change the shared data, so they are admin-only. Staff are view-only.
     ...user.role === "admin" ? [{ id: "upload", label: "Upload Data", icon: Upload }] : [],
     ...user.role === "admin" ? [{ id: "settings", label: "Settings", icon: Settings }] : []
@@ -10297,7 +10832,7 @@ function Console({ db, user, commit, undo, refreshPrices, onLogout }) {
     /* @__PURE__ */ React.createElement(t.icon, { size: 16 }),
     " ",
     t.label.split(" ")[0]
-  ))), db.lastAction && /* @__PURE__ */ React.createElement("div", { className: "bg-slate-50 border-t border-slate-100 px-4 py-1 text-[11px] text-slate-400 text-center" }, "Last: ", /* @__PURE__ */ React.createElement("b", { className: "text-slate-500" }, db.lastAction.type), " by ", db.lastAction.by, " \xB7 ", new Date(db.lastAction.at).toLocaleTimeString("en-IN"))), /* @__PURE__ */ React.createElement("main", { className: "max-w-[1760px] mx-auto px-3 py-5" }, tab === "report" && /* @__PURE__ */ React.createElement(Report, { db, user, commit, showToast, refreshPrices }), tab === "advice" && /* @__PURE__ */ React.createElement(AdviceTab, { db, user, commit, showToast }), tab === "performance" && /* @__PURE__ */ React.createElement(PerformanceTab, { db, showToast }), tab === "orders" && user.role === "admin" && /* @__PURE__ */ React.createElement(AdviceOrders, { db, commit, showToast }), tab === "pipeline" && /* @__PURE__ */ React.createElement(PipelineTab, { db, user, commit, showToast }), tab === "billing" && /* @__PURE__ */ React.createElement(BillingTab, { db, user, commit, showToast }), tab === "upload" && user.role === "admin" && /* @__PURE__ */ React.createElement(UploadTab, { db, commit, showToast }), tab === "settings" && user.role === "admin" && /* @__PURE__ */ React.createElement(SettingsTab, { db, commit, showToast })), toast && /* @__PURE__ */ React.createElement("div", { className: `fixed bottom-5 left-1/2 -translate-x-1/2 px-4 py-2.5 rounded-lg text-sm text-white shadow-lg z-50 flex items-center gap-2 ${toast.kind === "err" ? "bg-rose-600" : "bg-slate-800"}` }, toast.kind === "err" ? /* @__PURE__ */ React.createElement(AlertTriangle, { size: 15 }) : /* @__PURE__ */ React.createElement(Check, { size: 15 }), " ", toast.m));
+  ))), db.lastAction && /* @__PURE__ */ React.createElement("div", { className: "bg-slate-50 border-t border-slate-100 px-4 py-1 text-[11px] text-slate-400 text-center" }, "Last: ", /* @__PURE__ */ React.createElement("b", { className: "text-slate-500" }, db.lastAction.type), " by ", db.lastAction.by, " \xB7 ", new Date(db.lastAction.at).toLocaleTimeString("en-IN"))), /* @__PURE__ */ React.createElement("main", { className: "max-w-[1760px] mx-auto px-3 py-5" }, tab === "report" && /* @__PURE__ */ React.createElement(Report, { db, user, commit, showToast, refreshPrices }), tab === "advice" && /* @__PURE__ */ React.createElement(AdviceTab, { db, user, commit, showToast }), tab === "performance" && /* @__PURE__ */ React.createElement(PerformanceTab, { db, showToast }), tab === "orders" && user.role === "admin" && /* @__PURE__ */ React.createElement(AdviceOrders, { db, commit, showToast }), tab === "pipeline" && /* @__PURE__ */ React.createElement(PipelineTab, { db, user, commit, showToast }), tab === "billing" && /* @__PURE__ */ React.createElement(BillingTab, { db, user, commit, showToast }), tab === "capgains" && /* @__PURE__ */ React.createElement(CapitalGainsTab, { db, user, showToast }), tab === "upload" && user.role === "admin" && /* @__PURE__ */ React.createElement(UploadTab, { db, commit, showToast }), tab === "settings" && user.role === "admin" && /* @__PURE__ */ React.createElement(SettingsTab, { db, commit, showToast })), toast && /* @__PURE__ */ React.createElement("div", { className: `fixed bottom-5 left-1/2 -translate-x-1/2 px-4 py-2.5 rounded-lg text-sm text-white shadow-lg z-50 flex items-center gap-2 ${toast.kind === "err" ? "bg-rose-600" : "bg-slate-800"}` }, toast.kind === "err" ? /* @__PURE__ */ React.createElement(AlertTriangle, { size: 15 }) : /* @__PURE__ */ React.createElement(Check, { size: 15 }), " ", toast.m));
 }
 function TradeHistoryModal({ db, code, name, symbol, onClose }) {
   const [store, setStore] = useState(null);
