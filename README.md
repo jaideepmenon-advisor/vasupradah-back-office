@@ -131,10 +131,23 @@ lands. Five sections, in the order you use them.
 
 ### How a quarter is billed
 
-Fees are billed **at the start of a quarter for the quarter just finished** —
-Apr–Jun is billed on 1 July. Quarters are Indian financial-year quarters
-(Q1 Apr–Jun, Q2 Jul–Sep, Q3 Oct–Dec, Q4 Jan–Mar) and invoice numbers run
-`VIAS/2026-27/Q1/001`, continuing across the year.
+Fees are billed for a quarter once it has run. Quarters are Indian
+financial-year quarters, and each has its own **bill date**, which is the date
+the invoice carries:
+
+| Quarter | Period | Billed on |
+| --- | --- | --- |
+| Q1 | Apr–Jun | 1 July |
+| Q2 | Jul–Sep | 1 October |
+| Q3 | Oct–Dec | 1 January |
+| Q4 | Jan–Mar | **31 March** |
+
+The year's last quarter is billed on 31 March itself rather than 1 April, so
+that bill stays inside the financial year it belongs to — its number, its GST
+return and the books all fall in the right year.
+
+A bill is dated its quarter's bill date, not the day you press the button, so
+running a quarter a few days late does not drift the date or the series.
 
 Two kinds of client:
 
@@ -172,10 +185,27 @@ because that Indian address is what the place-of-supply rules look to. An NRI
 genuinely outside India can be marked as such and is zero-rated instead. A client
 with no state set is flagged rather than silently billed at nil.
 
+### Invoice numbers
+
+One unbroken series per financial year, starting again at 1 each April:
+`VIAS/2026-27/001`. The series follows the **year the invoice is dated in**,
+which is what GST Rule 46 requires — so the Q4 bill dated 31 March is the last
+number of the old year, and Q1 dated 1 July starts the new one.
+
+Moving over from an existing series? In **Bank & GST → Invoice and receipt
+numbers**, enter the next number to use and the financial year it applies to. If
+your last bill this year was 47, put 48 and the first bill from the console takes
+it. The seed applies to that one year only; the next April starts at 1 by itself.
+It can never pull the series backwards. Receipts have their own seed. The screen
+shows what the next number will be.
+
+If you would rather see the quarter in the number too
+(`VIAS/2026-27/Q1/001`), there is a switch for it on the same screen.
+
 ### Auto-generation
 
-The first time the console is opened after a quarter closes, that quarter's bills
-generate on their own — no click. A dot appears on the **Billing** tab in the nav
+The first time the console is opened on or after a quarter's bill date, that
+quarter's bills generate on their own — no click. A dot appears on the **Billing** tab in the nav
 until it has happened. Generating does **not** send anything: the bills sit there
 for you to look at, and nothing leaves until you press the email button.
 
@@ -187,8 +217,10 @@ emailed is **cancelled** instead, keeping its number on record.
 ### Sending
 
 - **Email all unsent** sends every bill in one click, one personalised mail per
-  client, each with its own amount, GST split and payment details. Individual
-  bills can be re-sent any time from the row or the preview.
+  client, each with its own amount, GST split and payment details. **The bill is
+  the body of the mail**, so the client sees it without opening anything, and the
+  same bill is attached as a **PDF** to keep. Individual bills can be re-sent any
+  time from the row or the preview.
 - **WhatsApp** opens each client's chat with a short note: the amount, that the
   bill has gone to their registered email and on what date, and how to pay. It
   deliberately does not repeat the bill itself.
@@ -197,10 +229,21 @@ emailed is **cancelled** instead, keeping its number on record.
 ### Where clients pay
 
 **Bank & GST** holds the one account clients may pay into — account name, bank,
-number, IFSC, branch, UPI id and an uploaded **UPI QR**. It is printed on every
-bill and repeated in the WhatsApp note, each time with a line telling the client
-to pay nowhere else. The QR is shrunk to 420px and sent as an **inline image**,
-because Gmail strips `data:` URLs out of `<img src>`.
+account number and type, IFSC, branch and UPI id. It is printed on every bill and
+repeated in the WhatsApp note, each time with a line telling the client to pay
+nowhere else.
+
+Each bill carries its **own UPI QR, already filled in with that client's amount
+and invoice number** — they scan and pay, with nothing to type and no chance of
+paying the wrong sum against the wrong bill. The QR is a standard
+`upi://pay?pa=…&am=…&tn=…&cu=INR` intent, drawn in the browser (the QR encoder is
+bundled into the file, so nothing is fetched at runtime) and sent as an **inline
+image**, because Gmail strips `data:` URLs out of `<img src>`. A static QR can
+still be uploaded as a fallback for a firm with no UPI id; if there is neither,
+the bill simply shows no QR.
+
+Format checks warn — but never block — on the GSTIN, PAN, CIN, IFSC and UPI id,
+since a wrong one is painful to discover from a client.
 
 ### Payment and receipts
 

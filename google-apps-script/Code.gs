@@ -839,9 +839,11 @@ function doPost(e) {
   //     One row, rewritten each time. The UPI QR is held as a data URL so the same
   //     image reaches every device and can be inlined into the bill mail. ---
   if (body.type === "billing_settings") {
+    // Appended to, never reordered, so a sheet written by an older console still reads.
     var bsHdr = ["Firm name", "Firm state", "Firm GSTIN", "PAN", "SEBI reg", "Address", "GST rate",
       "Bank name", "Account name", "Account number", "IFSC", "Branch", "UPI id", "UPI QR",
-      "Invoice prefix", "Receipt prefix", "Notes", "Updated at"];
+      "Invoice prefix", "Receipt prefix", "Notes", "Updated at",
+      "CIN", "Account type", "Invoice seed FY", "Invoice seed no", "Receipt seed FY", "Receipt seed no", "Number by quarter"];
     var bsss2 = SpreadsheetApp.getActiveSpreadsheet();
     var bssh2 = bsss2.getSheetByName("BillingSettings");
     if (!bssh2) { bssh2 = bsss2.insertSheet("BillingSettings"); }
@@ -856,7 +858,11 @@ function doPost(e) {
       String(bsIn.bankName || ""), String(bsIn.accountName || ""), "'" + String(bsIn.accountNo || ""),
       String(bsIn.ifsc || ""), String(bsIn.branch || ""), String(bsIn.upiId || ""), bsQr,
       String(bsIn.invoicePrefix || ""), String(bsIn.receiptPrefix || ""), String(bsIn.notes || ""),
-      Number(bsIn.updatedAt) || Date.now()];
+      Number(bsIn.updatedAt) || Date.now(),
+      String(bsIn.cin || ""), String(bsIn.accountType || ""),
+      String(bsIn.invoiceSeedFy || ""), Number(bsIn.invoiceSeedNo) || 0,
+      String(bsIn.receiptSeedFy || ""), Number(bsIn.receiptSeedNo) || 0,
+      bsIn.numberByQuarter ? "yes" : "no"];
     bssh2.clear();
     bssh2.getRange(1, 1, 1, bsHdr.length).setValues([bsHdr]);
     bssh2.getRange(2, 1, 1, bsHdr.length).setValues([bsRow]);
@@ -922,15 +928,18 @@ function doPost(e) {
     var beList = Array.isArray(body.recipients) ? body.recipients : [];
     var beFrom = String(body.fromName || "Vasupradah Investment Advisory");
     var beReply = String(body.replyTo || "").trim();
-    var beQr = String(body.qr || "");
-    var beInline = null;
-    var beCut = beQr.indexOf("base64,");
-    if (beCut >= 0) {
-      var beMime = "image/png", beSemi = beQr.indexOf(";");
-      if (beQr.indexOf("data:") === 0 && beSemi > 5) beMime = beQr.substring(5, beSemi);
-      try { beInline = { upiqr: Utilities.newBlob(Utilities.base64Decode(beQr.substring(beCut + 7)), beMime, "upiqr") }; }
-      catch (eQr) { beInline = null; }
-    }
+    // The QR differs per bill now - it carries that client's amount and invoice
+    // number - so it is built per recipient, with body.qr left as a shared fallback.
+    var beQrOf = function (raw) {
+      var q = String(raw || "");
+      var cut = q.indexOf("base64,");
+      if (cut < 0) return null;
+      var mime = "image/png", semi = q.indexOf(";");
+      if (q.indexOf("data:") === 0 && semi > 5) mime = q.substring(5, semi);
+      try { return { upiqr: Utilities.newBlob(Utilities.base64Decode(q.substring(cut + 7)), mime, "upiqr.png") }; }
+      catch (eQr) { return null; }
+    };
+    var beShared = beQrOf(body.qr);
     var beQuota = 0;
     try { beQuota = MailApp.getRemainingDailyQuota(); } catch (eQ) { beQuota = 0; }
     // Which addresses actually took the mail, so the console marks only those as
@@ -942,9 +951,22 @@ function doPost(e) {
       if (!beTo || beTo.indexOf("@") < 1 || beSeen[beTo]) { beSkipped++; continue; }
       if (beSent >= beQuota) { beSkipped++; continue; }
       beSeen[beTo] = true;
-      var beOpts = { name: beFrom, htmlBody: String(be.html || "") };
-      if (beInline) beOpts.inlineImages = beInline;
+      var beHtml = String(be.html || "");
+      var beOpts = { name: beFrom, htmlBody: beHtml };
+      var beImg = beQrOf(be.qr) || beShared;
+      if (beImg) beOpts.inlineImages = beImg;
       if (beReply) beOpts.replyTo = beReply;
+      // The bill is the mail body AND a PDF to keep, since a body cannot be filed.
+      // The QR is inlined as a real image in the PDF, cid: being a mail-only thing.
+      if (be.pdfName) {
+        try {
+          var bePdfHtml = beImg && be.qr
+            ? beHtml.split('src="cid:upiqr"').join('src="' + String(be.qr) + '"')
+            : beHtml;
+          beOpts.attachments = [Utilities.newBlob(bePdfHtml, "text/html", String(be.pdfName) + ".html")
+            .getAs("application/pdf").setName(String(be.pdfName) + ".pdf")];
+        } catch (ePdf) { /* a bill that cannot be rendered still goes out as the body */ }
+      }
       try { MailApp.sendEmail(beTo, String(be.subject || "Your invoice"), String(be.text || ""), beOpts); beSentTo.push(beTo); beSent++; }
       catch (eBe) {
         if (beReply) {
