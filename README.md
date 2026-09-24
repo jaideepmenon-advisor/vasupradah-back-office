@@ -61,6 +61,59 @@ order-link-proxy/
   literal, so a backslash there must be written `\\` (a single `\uFEFF`
   silently becomes an invisible BOM character in the pasted code).
 
+## Data health — is the spreadsheet still the right store?
+
+**Settings → Data health** measures the two limits that would eventually force
+this data out of a Google Sheet, rather than leaving it to guesswork:
+
+- a spreadsheet holds **10 million cells**, counting every cell in the allocated
+  grid, not only the filled ones;
+- Apps Script gets **6 minutes** for one run, and six code paths read the whole
+  trade book — capital gains, missing purchases, the first-trade lookup and the
+  GridKey sync all spend it.
+
+The check reports cells allocated per tab against the ceiling, how long one full
+read of the trade book actually takes, the trades-a-month run rate, and how many
+months of headroom that leaves. **Also time the gains match** adds the FIFO pass
+on top, for the true cost of opening the Capital Gains tab. It also flags cells
+that are **allocated but empty** — an over-sized grid burns quota while looking
+empty, and deleting unused rows and columns is a free win.
+
+It ends in a verdict:
+
+| | Meaning |
+| --- | --- |
+| **Healthy** | under 40% of cells and under 45s a read — the sheet is fine, and easier to live with than a database because you can open it and fix a typo |
+| **Worth watching** | past either of those, or a ceiling within three years |
+| **Time to move the trade book** | past 70% of cells, over two minutes a read, or a ceiling within a year |
+
+### If it says move
+
+The recommendation is **not** to migrate everything. Move the **trade book and
+its derived state** to a real database and leave the small, human-edited tabs
+(Pipeline, FeePlans, BillingProfiles, BillingSettings, ClientDetails) on the
+sheet — those are a few hundred rows at most, and being able to open the sheet
+and correct something by hand is worth more than schema.
+
+The endpoints that read trades (`?capgains=1`, `?gap_scan=1`, `?first_trades=1`,
+`?trades=1`) already aggregate server-side and return small payloads, so the
+console does not care what sits behind them. Swapping the store is a change to
+those handlers, not to the app.
+
+Two candidates, both reasonable:
+
+- **The PocketBase instance already running at `equity.vasupradah.com`** — SQLite,
+  REST API, admin UI, infrastructure the firm already controls, no new vendor or
+  bill. Backups become the firm's job.
+- **Supabase** — managed Postgres with an India region and handled backups, at
+  the cost of another dependency.
+
+Whichever, migrate by **dual-writing** for a few weeks and reading from the new
+store with a fallback to the sheet, never by a single cutover. And settle where
+the data is allowed to sit — SEBI's cloud framework for regulated entities sets
+expectations on region and on having an exit plan — before picking a host rather
+than after.
+
 ## Deploying the backend
 
 1. Open the "ADVISORY CLIENT DATA" Google Sheet → Extensions → Apps Script.

@@ -4118,7 +4118,7 @@ function setup() {
 
 function doGet(e) {
   var p = (e && e.parameter) || {};
-  if (!p.prices && !p.alerts && !p.trades && !p.holdings && !p.gridkey && !p.greeting_status && !p.advice_alerts && !p.advice_trace && !p.ping && !p.pipeline && !p.baskets && !p.manual_trades && !p.client_details && !p.exec_modes && !p.advice_contacts && !p.shorten && !p.dedupe && !p.gk_probe && !p.staff && !p.fee_plans && !p.first_trades && !p.billing_profiles && !p.billing_settings && !p.invoices && !p.capgains && !p.gap_scan && !p.mis) {
+  if (!p.prices && !p.alerts && !p.trades && !p.holdings && !p.gridkey && !p.greeting_status && !p.advice_alerts && !p.advice_trace && !p.ping && !p.pipeline && !p.baskets && !p.manual_trades && !p.client_details && !p.exec_modes && !p.advice_contacts && !p.shorten && !p.dedupe && !p.gk_probe && !p.staff && !p.fee_plans && !p.first_trades && !p.billing_profiles && !p.billing_settings && !p.invoices && !p.capgains && !p.gap_scan && !p.mis && !p.dbhealth) {
     return ContentService.createTextOutput("Vasupradah backup endpoint is live (use POST from the console).");
   }
 
@@ -4720,6 +4720,115 @@ function doGet(e) {
     return ContentService.createTextOutput(JSON.stringify({
       ok: true, mis: misData, html: misHtml_(misData), text: misText_(misData),
       config: misConfig_(), tz: Session.getScriptTimeZone(), scheduled: misTriggerInfo_()
+    })).setMimeType(ContentService.MimeType.JSON);
+  }
+
+  // How close this spreadsheet is to being the wrong place to keep the data.
+  // Measures what a Google Sheet actually limits - the 10 million cell ceiling and
+  // the 6 minute cap on one Apps Script run - against what the trade book costs to
+  // read today, and how fast it is growing. ?dbhealth=1 (add &deep=1 to also time
+  // the FIFO match on top of the read).
+  if (p.dbhealth) {
+    var SHEET_CELL_CAP = 1e7, RUN_MS_CAP = 360000;
+    var dhStart = new Date().getTime();
+    var ss = SpreadsheetApp.getActiveSpreadsheet();
+    var sheets = ss.getSheets();
+    var tabs = [], gridCells = 0, usedCells = 0;
+    for (var i = 0; i < sheets.length; i++) {
+      var sh = sheets[i];
+      // The cap counts every cell in the grid, not just the ones with something in
+      // them, so an over-allocated tab burns quota while looking empty.
+      var mr = sh.getMaxRows(), mc = sh.getMaxColumns();
+      var lr = sh.getLastRow(), lc = sh.getLastColumn();
+      var grid = mr * mc, used = lr * lc;
+      gridCells += grid; usedCells += used;
+      tabs.push({ name: sh.getName(), rows: lr, cols: lc, maxRows: mr, maxCols: mc,
+        gridCells: grid, usedCells: used, wasted: grid - used });
+    }
+    tabs.sort(function (a, b) { return b.gridCells - a.gridCells; });
+
+    // The read everything downstream pays for, timed once and reused.
+    var tRaw = 0, tNorm = 0, tFifo = 0, tradeRows = 0, rawRows = 0, normRows = [];
+    var tSh = ss.getSheetByName("Trades");
+    if (tSh) {
+      var t0 = new Date().getTime();
+      var rawVals = tSh.getDataRange().getValues();
+      tRaw = new Date().getTime() - t0;
+      rawRows = rawVals.length;
+      rawVals = null;
+      var t1 = new Date().getTime();
+      try { normRows = gkNormalizedTrades_(); } catch (eN) { normRows = []; }
+      tNorm = new Date().getTime() - t1;
+      tradeRows = normRows.length;
+    }
+    if (String(p.deep || "") === "1" && normRows.length) {
+      var t2 = new Date().getTime();
+      var book = {}, legs = 0;
+      for (var r = 0; r < normRows.length; r++) {
+        var tr = normRows[r];
+        var k = String(tr[1]) + "\\u0001" + String(tr[3]).toUpperCase();
+        if (!book[k]) book[k] = [];
+        var q = Math.abs(Number(tr[5]) || 0);
+        if (/^(B|BUY|P|PURCHASE)/i.test(String(tr[4]))) book[k].push(q);
+        else { var left = q; while (left > 0 && book[k].length) { var take = Math.min(left, book[k][0]); book[k][0] -= take; left -= take; legs++; if (book[k][0] <= 0) book[k].shift(); } }
+      }
+      tFifo = new Date().getTime() - t2;
+    }
+
+    // Trades a month over the last two years, which is what says when the ceiling
+    // arrives rather than how close it is today.
+    var byMonth = {}, order = [];
+    for (var g = 0; g < normRows.length; g++) {
+      var mkey = String(normRows[g][0] || "").slice(0, 7);
+      if (!/^\\d{4}-\\d{2}$/.test(mkey)) continue;
+      if (!byMonth[mkey]) { byMonth[mkey] = 0; order.push(mkey); }
+      byMonth[mkey]++;
+    }
+    order.sort();
+    var growth = [];
+    for (var o = Math.max(0, order.length - 24); o < order.length; o++) growth.push({ month: order[o], trades: byMonth[order[o]] });
+    var recent = growth.slice(Math.max(0, growth.length - 6));
+    var perMonth = 0;
+    for (var rr = 0; rr < recent.length; rr++) perMonth += recent[rr].trades;
+    perMonth = recent.length ? Math.round(perMonth / recent.length) : 0;
+    var tradeCols = tSh ? Math.max(1, tSh.getLastColumn()) : 1;
+    var headroom = SHEET_CELL_CAP - gridCells;
+    var monthsToCap = perMonth > 0 ? Math.floor(headroom / (perMonth * tradeCols)) : -1;
+
+    // What it would take to blow the 6 minute limit: the read is the shared cost of
+    // every trade-reading endpoint, so that is the number that matters.
+    var heaviest = tNorm + tFifo;
+    var pctOfRun = Math.round(heaviest / RUN_MS_CAP * 1000) / 10;
+    var pctOfCells = Math.round(gridCells / SHEET_CELL_CAP * 1000) / 10;
+
+    var reasons = [], level = "fine";
+    var raise = function (lvl, why) {
+      reasons.push(why);
+      if (lvl === "move" || level === "move") level = "move";
+      else if (lvl === "watch") level = "watch";
+    };
+    if (pctOfCells >= 70) raise("move", pctOfCells + "% of the 10 million cell ceiling is already allocated.");
+    else if (pctOfCells >= 40) raise("watch", pctOfCells + "% of the cell ceiling is allocated.");
+    if (heaviest >= 120000) raise("move", "Reading the trade book takes " + Math.round(heaviest / 1000) + "s of the 360s an Apps Script run gets.");
+    else if (heaviest >= 45000) raise("watch", "Reading the trade book takes " + Math.round(heaviest / 1000) + "s, " + pctOfRun + "% of one run's budget.");
+    if (monthsToCap >= 0 && monthsToCap <= 12) raise("move", "At " + perMonth + " trades a month the cell ceiling is about " + monthsToCap + " month(s) away.");
+    else if (monthsToCap > 12 && monthsToCap <= 36) raise("watch", "At " + perMonth + " trades a month the ceiling is roughly " + monthsToCap + " month(s) away.");
+    var wasteTotal = 0;
+    for (var w = 0; w < tabs.length; w++) wasteTotal += tabs[w].wasted;
+    if (wasteTotal > 1e6) raise("watch", Math.round(wasteTotal / 1e5) / 10 + "M cells are allocated but empty - deleting unused rows and columns frees them.");
+    if (!reasons.length) reasons.push("Nothing is close to a limit. The spreadsheet is a reasonable place to keep this for now.");
+
+    return ContentService.createTextOutput(JSON.stringify({
+      ok: true, at: Utilities.formatDate(new Date(), Session.getScriptTimeZone(), "yyyy-MM-dd HH:mm"),
+      tz: Session.getScriptTimeZone(), deep: String(p.deep || "") === "1",
+      cellCap: SHEET_CELL_CAP, runMsCap: RUN_MS_CAP,
+      gridCells: gridCells, usedCells: usedCells, wastedCells: wasteTotal, pctOfCells: pctOfCells,
+      tabCount: tabs.length, tabs: tabs,
+      trades: { rawRows: rawRows, normalisedRows: tradeRows, cols: tradeCols },
+      timings: { rawReadMs: tRaw, normaliseMs: tNorm, fifoMs: tFifo, totalMs: heaviest, pctOfRun: pctOfRun,
+        diagnosticMs: new Date().getTime() - dhStart },
+      growth: { byMonth: growth, perMonth: perMonth, monthsToCap: monthsToCap },
+      verdict: { level: level, reasons: reasons }
     })).setMimeType(ContentService.MimeType.JSON);
   }
 
@@ -8087,6 +8196,15 @@ async function saveMisSchedule(db, cfg) {
     catch (e) { return { ok: false, msg: txt.slice(0, 200) }; }
   } catch (e) { return { ok: false, msg: "Could not reach the office Google Sheet." }; }
 }
+// How close the spreadsheet is to the limits that would force a move to a real
+// database. Measured on the sheet, because that is the only place the timings mean
+// anything.
+async function pullDbHealth(url, deep) {
+  const res = await fetch(url + (url.includes("?") ? "&" : "?") + "dbhealth=1" + (deep ? "&deep=1" : ""));
+  const data = await res.json();
+  if (!data || data.ok !== true) throw new Error((data && data.error) || "The sheet could not run the check.");
+  return data;
+}
 async function pullExecModes(url) {
   const res = await fetch(url + (url.includes("?") ? "&" : "?") + "exec_modes=1");
   const data = await res.json();
@@ -10599,6 +10717,96 @@ function MisModal({ db, user, showToast, onClose }) {
             /* @__PURE__ */ React.createElement("div", { className: "text-[11px] text-slate-400 mb-2" }, "This is exactly what lands in the inbox."),
             /* @__PURE__ */ React.createElement("div", { className: "bg-white p-5 rounded-lg border border-slate-200 overflow-x-auto", dangerouslySetInnerHTML: { __html: (data || {}).html || "" } }))))
     )
+  );
+}
+// Is the Google Sheet still the right place for this data? Two things decide it:
+// the 10 million cell ceiling on a spreadsheet, and the 6 minutes Apps Script gets
+// for one run. Both are measured here rather than guessed at.
+function DataHealthCard({ db, showToast }) {
+  const [state, setState] = useState("idle");
+  const [err, setErr] = useState("");
+  const [d, setD] = useState(null);
+  const [deep, setDeep] = useState(false);
+  const url = (db.sheetUrl || "").trim();
+  const run = async (withFifo) => {
+    if (!url) { setErr("Connect the office Google Sheet in Settings first."); setState("error"); return; }
+    setState("loading"); setErr("");
+    try { setD(await pullDbHealth(url, withFifo)); setDeep(!!withFifo); setState("ready"); }
+    catch (e) { setErr(String(e && e.message || e)); setState("error"); }
+  };
+  const secs = (ms) => num(ms) >= 1000 ? (num(ms) / 1000).toFixed(1) + "s" : Math.round(num(ms)) + "ms";
+  const mil = (n) => (num(n) / 1e6).toFixed(2) + "M";
+  const TONE = { fine: ["bg-emerald-50 border-emerald-200 text-emerald-900", "Healthy"],
+                 watch: ["bg-amber-50 border-amber-200 text-amber-900", "Worth watching"],
+                 move: ["bg-rose-50 border-rose-200 text-rose-900", "Time to move the trade book"] };
+  const v = ((d || {}).verdict || {});
+  const tone = TONE[v.level] || TONE.fine;
+  const bar = (pct, danger) => /* @__PURE__ */ React.createElement("div", { className: "h-2 rounded-full bg-slate-100 overflow-hidden" },
+    /* @__PURE__ */ React.createElement("div", { className: `h-full ${danger ? "bg-rose-500" : pct >= 40 ? "bg-amber-500" : "bg-emerald-500"}`, style: { width: Math.min(100, Math.max(1, pct)) + "%" } }));
+
+  return /* @__PURE__ */ React.createElement(Card, { title: "Data health — is the spreadsheet still big enough?", icon: AlertTriangle },
+    /* @__PURE__ */ React.createElement("p", { className: "text-[12px] text-slate-500 mb-3" },
+      "A Google Sheet holds 10 million cells and Apps Script gets 6 minutes for one run. Everything that reads the trade book — capital gains, missing purchases, the first-trade lookup — spends both. This measures how much is left before the data would be better off in a proper database."),
+    /* @__PURE__ */ React.createElement("div", { className: "flex gap-2 flex-wrap items-center mb-3" },
+      /* @__PURE__ */ React.createElement("button", { onClick: () => run(false), disabled: state === "loading", className: "text-sm px-3 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-700 text-white flex items-center gap-1.5 disabled:opacity-50" },
+        /* @__PURE__ */ React.createElement(RefreshCw, { size: 15 }), " ", state === "loading" ? "Measuring…" : "Run the check"),
+      /* @__PURE__ */ React.createElement("button", { onClick: () => run(true), disabled: state === "loading", className: "text-sm px-3 py-2 rounded-lg border border-slate-200 text-slate-600 hover:bg-slate-50 disabled:opacity-50" }, "Also time the gains match"),
+      d && /* @__PURE__ */ React.createElement("span", { className: "text-[11px] text-slate-400" }, "measured ", d.at, " ", d.tz)),
+
+    state === "error" && /* @__PURE__ */ React.createElement("div", { className: "text-[12px] text-rose-800 bg-rose-50 border border-rose-200 rounded-lg px-3 py-2" }, err),
+    state === "loading" && /* @__PURE__ */ React.createElement("div", { className: "text-[12px] text-slate-500 bg-slate-50 border border-slate-200 rounded-lg px-3 py-2" }, "Reading every tab and timing the trade book… this is deliberately the slow path, so give it a moment."),
+
+    state === "ready" && /* @__PURE__ */ React.createElement(React.Fragment, null,
+      /* @__PURE__ */ React.createElement("div", { className: `border rounded-xl px-4 py-3 mb-3 ${tone[0]}` },
+        /* @__PURE__ */ React.createElement("div", { className: "text-sm font-semibold mb-1" }, tone[1]),
+        ((v.reasons) || []).map((r, i) => /* @__PURE__ */ React.createElement("div", { key: i, className: "text-[12px]" }, "• ", r))),
+
+      /* @__PURE__ */ React.createElement("div", { className: "grid sm:grid-cols-2 gap-4 mb-3" },
+        /* @__PURE__ */ React.createElement("div", { className: "border border-slate-200 rounded-xl p-3" },
+          /* @__PURE__ */ React.createElement("div", { className: "flex justify-between text-[12px] mb-1" },
+            /* @__PURE__ */ React.createElement("span", { className: "text-slate-500" }, "Cells used of the 10 million ceiling"),
+            /* @__PURE__ */ React.createElement("b", { className: "text-slate-800" }, d.pctOfCells, "%")),
+          bar(d.pctOfCells, d.pctOfCells >= 70),
+          /* @__PURE__ */ React.createElement("div", { className: "text-[11px] text-slate-400 mt-1.5" },
+            mil(d.gridCells), " allocated across ", d.tabCount, " tabs · ", mil(d.usedCells), " actually filled",
+            num(d.wastedCells) > 1e6 ? ` · ${mil(d.wastedCells)} allocated but empty` : "")),
+        /* @__PURE__ */ React.createElement("div", { className: "border border-slate-200 rounded-xl p-3" },
+          /* @__PURE__ */ React.createElement("div", { className: "flex justify-between text-[12px] mb-1" },
+            /* @__PURE__ */ React.createElement("span", { className: "text-slate-500" }, "One trade-book read, of the 6 minutes a run gets"),
+            /* @__PURE__ */ React.createElement("b", { className: "text-slate-800" }, secs(d.timings.totalMs))),
+          bar(Math.max(1, d.timings.pctOfRun), d.timings.pctOfRun >= 33),
+          /* @__PURE__ */ React.createElement("div", { className: "text-[11px] text-slate-400 mt-1.5" },
+            d.timings.pctOfRun, "% of the budget · raw read ", secs(d.timings.rawReadMs), ", normalise ", secs(d.timings.normaliseMs),
+            deep ? `, gains match ${secs(d.timings.fifoMs)}` : ""))),
+
+      /* @__PURE__ */ React.createElement("div", { className: "grid sm:grid-cols-3 gap-3 mb-3 text-[12px]" },
+        [["Trades on the book", Number(d.trades.normalisedRows).toLocaleString("en-IN")],
+         ["New trades a month", d.growth.perMonth ? Number(d.growth.perMonth).toLocaleString("en-IN") : "—"],
+         ["Headroom at that rate", d.growth.monthsToCap < 0 ? "—" : d.growth.monthsToCap > 120 ? "10 years or more" : `${d.growth.monthsToCap} month(s)`]]
+          .map(([k, val]) => /* @__PURE__ */ React.createElement("div", { key: k, className: "border border-slate-200 rounded-lg px-3 py-2" },
+            /* @__PURE__ */ React.createElement("div", { className: "text-[10px] uppercase text-slate-400" }, k),
+            /* @__PURE__ */ React.createElement("div", { className: "text-sm font-semibold text-slate-800 tabular-nums" }, val)))),
+
+      /* @__PURE__ */ React.createElement("div", { className: "border border-slate-200 rounded-xl overflow-hidden" },
+        /* @__PURE__ */ React.createElement("div", { style: { maxHeight: "34vh", overflowY: "auto" } },
+          /* @__PURE__ */ React.createElement("table", { className: "w-full text-sm" },
+            /* @__PURE__ */ React.createElement("thead", { className: "bg-slate-50 text-slate-500 text-[11px] uppercase sticky top-0" },
+              /* @__PURE__ */ React.createElement("tr", null,
+                /* @__PURE__ */ React.createElement("th", { className: "text-left font-medium px-3 py-2" }, "Tab"),
+                /* @__PURE__ */ React.createElement("th", { className: "text-right font-medium px-3 py-2" }, "Rows"),
+                /* @__PURE__ */ React.createElement("th", { className: "text-right font-medium px-3 py-2" }, "Cells"),
+                /* @__PURE__ */ React.createElement("th", { className: "text-right font-medium px-3 py-2" }, "Empty but allocated"),
+                /* @__PURE__ */ React.createElement("th", { className: "text-right font-medium px-3 py-2" }, "Share"))),
+            /* @__PURE__ */ React.createElement("tbody", { className: "divide-y divide-slate-100" },
+              (d.tabs || []).map((t) => /* @__PURE__ */ React.createElement("tr", { key: t.name },
+                /* @__PURE__ */ React.createElement("td", { className: "px-3 py-1.5 text-slate-800" }, t.name),
+                /* @__PURE__ */ React.createElement("td", { className: "px-3 py-1.5 text-right tabular-nums text-slate-600" }, Number(t.rows).toLocaleString("en-IN")),
+                /* @__PURE__ */ React.createElement("td", { className: "px-3 py-1.5 text-right tabular-nums text-slate-600" }, Number(t.gridCells).toLocaleString("en-IN")),
+                /* @__PURE__ */ React.createElement("td", { className: `px-3 py-1.5 text-right tabular-nums ${t.wasted > 5e5 ? "text-amber-600" : "text-slate-400"}` }, Number(t.wasted).toLocaleString("en-IN")),
+                /* @__PURE__ */ React.createElement("td", { className: "px-3 py-1.5 text-right tabular-nums text-slate-500" }, (t.gridCells / num(d.cellCap) * 100).toFixed(1), "%")))))))
+    ),
+    /* @__PURE__ */ React.createElement("p", { className: "text-[11px] text-slate-400 mt-2" },
+      "Rule of thumb: under 40% of cells and under 45 seconds a read, the spreadsheet is fine and easier to live with than a database, because you can open it and fix a typo. Past 70% of cells, or over two minutes a read, the trade book should move to a real database and the small human-edited tabs should stay where they are.")
   );
 }
 function FeePlanSetup({ db, user, commit, showToast }) {
@@ -14562,7 +14770,7 @@ function SettingsTab({ db, commit, showToast }) {
       onChange: (e) => setCl((s) => ({ ...s, [rc]: e.target.value })),
       className: "px-3 py-2 text-sm border border-slate-300 rounded-lg w-24"
     }
-  ), /* @__PURE__ */ React.createElement("span", { className: "text-sm text-slate-500" }, "%"))))), /* @__PURE__ */ React.createElement("div", { className: "flex gap-2 mt-4" }, /* @__PURE__ */ React.createElement("button", { onClick: saveLimits, className: "bg-indigo-600 hover:bg-indigo-700 text-white text-sm px-4 py-2 rounded-lg" }, "Save limits"), /* @__PURE__ */ React.createElement("button", { onClick: () => setCl({ default: 10 }), className: "text-slate-600 text-sm px-3 py-2 rounded-lg border border-slate-200 hover:bg-slate-50" }, "Reset to 10% for all"))), /* @__PURE__ */ React.createElement(Card, { title: "Staff access", icon: Users }, /* @__PURE__ */ React.createElement("p", { className: "text-xs text-slate-500 mb-3" }, "Only the names listed and enabled here can sign in (besides the Principal Officer)."), /* @__PURE__ */ React.createElement("div", { className: "flex gap-2 mb-3" }, /* @__PURE__ */ React.createElement(
+  ), /* @__PURE__ */ React.createElement("span", { className: "text-sm text-slate-500" }, "%"))))), /* @__PURE__ */ /* @__PURE__ */ React.createElement("div", { className: "flex gap-2 mt-4" }, /* @__PURE__ */ React.createElement("button", { onClick: saveLimits, className: "bg-indigo-600 hover:bg-indigo-700 text-white text-sm px-4 py-2 rounded-lg" }, "Save limits"), /* @__PURE__ */ React.createElement("button", { onClick: () => setCl({ default: 10 }), className: "text-slate-600 text-sm px-3 py-2 rounded-lg border border-slate-200 hover:bg-slate-50" }, "Reset to 10% for all"))), /* @__PURE__ */ React.createElement(DataHealthCard, { db, showToast }), /* @__PURE__ */ React.createElement(Card, { title: "Staff access", icon: Users }, /* @__PURE__ */ React.createElement("p", { className: "text-xs text-slate-500 mb-3" }, "Only the names listed and enabled here can sign in (besides the Principal Officer)."), /* @__PURE__ */ React.createElement("div", { className: "flex gap-2 mb-3" }, /* @__PURE__ */ React.createElement(
     "input",
     {
       value: newStaff,

@@ -62,7 +62,7 @@ function setup() {
 
 function doGet(e) {
   var p = (e && e.parameter) || {};
-  if (!p.prices && !p.alerts && !p.trades && !p.holdings && !p.gridkey && !p.greeting_status && !p.advice_alerts && !p.advice_trace && !p.ping && !p.pipeline && !p.baskets && !p.manual_trades && !p.client_details && !p.exec_modes && !p.advice_contacts && !p.shorten && !p.dedupe && !p.gk_probe && !p.staff && !p.fee_plans && !p.first_trades && !p.billing_profiles && !p.billing_settings && !p.invoices && !p.capgains && !p.gap_scan && !p.mis) {
+  if (!p.prices && !p.alerts && !p.trades && !p.holdings && !p.gridkey && !p.greeting_status && !p.advice_alerts && !p.advice_trace && !p.ping && !p.pipeline && !p.baskets && !p.manual_trades && !p.client_details && !p.exec_modes && !p.advice_contacts && !p.shorten && !p.dedupe && !p.gk_probe && !p.staff && !p.fee_plans && !p.first_trades && !p.billing_profiles && !p.billing_settings && !p.invoices && !p.capgains && !p.gap_scan && !p.mis && !p.dbhealth) {
     return ContentService.createTextOutput("Vasupradah backup endpoint is live (use POST from the console).");
   }
 
@@ -664,6 +664,115 @@ function doGet(e) {
     return ContentService.createTextOutput(JSON.stringify({
       ok: true, mis: misData, html: misHtml_(misData), text: misText_(misData),
       config: misConfig_(), tz: Session.getScriptTimeZone(), scheduled: misTriggerInfo_()
+    })).setMimeType(ContentService.MimeType.JSON);
+  }
+
+  // How close this spreadsheet is to being the wrong place to keep the data.
+  // Measures what a Google Sheet actually limits - the 10 million cell ceiling and
+  // the 6 minute cap on one Apps Script run - against what the trade book costs to
+  // read today, and how fast it is growing. ?dbhealth=1 (add &deep=1 to also time
+  // the FIFO match on top of the read).
+  if (p.dbhealth) {
+    var SHEET_CELL_CAP = 1e7, RUN_MS_CAP = 360000;
+    var dhStart = new Date().getTime();
+    var ss = SpreadsheetApp.getActiveSpreadsheet();
+    var sheets = ss.getSheets();
+    var tabs = [], gridCells = 0, usedCells = 0;
+    for (var i = 0; i < sheets.length; i++) {
+      var sh = sheets[i];
+      // The cap counts every cell in the grid, not just the ones with something in
+      // them, so an over-allocated tab burns quota while looking empty.
+      var mr = sh.getMaxRows(), mc = sh.getMaxColumns();
+      var lr = sh.getLastRow(), lc = sh.getLastColumn();
+      var grid = mr * mc, used = lr * lc;
+      gridCells += grid; usedCells += used;
+      tabs.push({ name: sh.getName(), rows: lr, cols: lc, maxRows: mr, maxCols: mc,
+        gridCells: grid, usedCells: used, wasted: grid - used });
+    }
+    tabs.sort(function (a, b) { return b.gridCells - a.gridCells; });
+
+    // The read everything downstream pays for, timed once and reused.
+    var tRaw = 0, tNorm = 0, tFifo = 0, tradeRows = 0, rawRows = 0, normRows = [];
+    var tSh = ss.getSheetByName("Trades");
+    if (tSh) {
+      var t0 = new Date().getTime();
+      var rawVals = tSh.getDataRange().getValues();
+      tRaw = new Date().getTime() - t0;
+      rawRows = rawVals.length;
+      rawVals = null;
+      var t1 = new Date().getTime();
+      try { normRows = gkNormalizedTrades_(); } catch (eN) { normRows = []; }
+      tNorm = new Date().getTime() - t1;
+      tradeRows = normRows.length;
+    }
+    if (String(p.deep || "") === "1" && normRows.length) {
+      var t2 = new Date().getTime();
+      var book = {}, legs = 0;
+      for (var r = 0; r < normRows.length; r++) {
+        var tr = normRows[r];
+        var k = String(tr[1]) + "\u0001" + String(tr[3]).toUpperCase();
+        if (!book[k]) book[k] = [];
+        var q = Math.abs(Number(tr[5]) || 0);
+        if (/^(B|BUY|P|PURCHASE)/i.test(String(tr[4]))) book[k].push(q);
+        else { var left = q; while (left > 0 && book[k].length) { var take = Math.min(left, book[k][0]); book[k][0] -= take; left -= take; legs++; if (book[k][0] <= 0) book[k].shift(); } }
+      }
+      tFifo = new Date().getTime() - t2;
+    }
+
+    // Trades a month over the last two years, which is what says when the ceiling
+    // arrives rather than how close it is today.
+    var byMonth = {}, order = [];
+    for (var g = 0; g < normRows.length; g++) {
+      var mkey = String(normRows[g][0] || "").slice(0, 7);
+      if (!/^\d{4}-\d{2}$/.test(mkey)) continue;
+      if (!byMonth[mkey]) { byMonth[mkey] = 0; order.push(mkey); }
+      byMonth[mkey]++;
+    }
+    order.sort();
+    var growth = [];
+    for (var o = Math.max(0, order.length - 24); o < order.length; o++) growth.push({ month: order[o], trades: byMonth[order[o]] });
+    var recent = growth.slice(Math.max(0, growth.length - 6));
+    var perMonth = 0;
+    for (var rr = 0; rr < recent.length; rr++) perMonth += recent[rr].trades;
+    perMonth = recent.length ? Math.round(perMonth / recent.length) : 0;
+    var tradeCols = tSh ? Math.max(1, tSh.getLastColumn()) : 1;
+    var headroom = SHEET_CELL_CAP - gridCells;
+    var monthsToCap = perMonth > 0 ? Math.floor(headroom / (perMonth * tradeCols)) : -1;
+
+    // What it would take to blow the 6 minute limit: the read is the shared cost of
+    // every trade-reading endpoint, so that is the number that matters.
+    var heaviest = tNorm + tFifo;
+    var pctOfRun = Math.round(heaviest / RUN_MS_CAP * 1000) / 10;
+    var pctOfCells = Math.round(gridCells / SHEET_CELL_CAP * 1000) / 10;
+
+    var reasons = [], level = "fine";
+    var raise = function (lvl, why) {
+      reasons.push(why);
+      if (lvl === "move" || level === "move") level = "move";
+      else if (lvl === "watch") level = "watch";
+    };
+    if (pctOfCells >= 70) raise("move", pctOfCells + "% of the 10 million cell ceiling is already allocated.");
+    else if (pctOfCells >= 40) raise("watch", pctOfCells + "% of the cell ceiling is allocated.");
+    if (heaviest >= 120000) raise("move", "Reading the trade book takes " + Math.round(heaviest / 1000) + "s of the 360s an Apps Script run gets.");
+    else if (heaviest >= 45000) raise("watch", "Reading the trade book takes " + Math.round(heaviest / 1000) + "s, " + pctOfRun + "% of one run's budget.");
+    if (monthsToCap >= 0 && monthsToCap <= 12) raise("move", "At " + perMonth + " trades a month the cell ceiling is about " + monthsToCap + " month(s) away.");
+    else if (monthsToCap > 12 && monthsToCap <= 36) raise("watch", "At " + perMonth + " trades a month the ceiling is roughly " + monthsToCap + " month(s) away.");
+    var wasteTotal = 0;
+    for (var w = 0; w < tabs.length; w++) wasteTotal += tabs[w].wasted;
+    if (wasteTotal > 1e6) raise("watch", Math.round(wasteTotal / 1e5) / 10 + "M cells are allocated but empty - deleting unused rows and columns frees them.");
+    if (!reasons.length) reasons.push("Nothing is close to a limit. The spreadsheet is a reasonable place to keep this for now.");
+
+    return ContentService.createTextOutput(JSON.stringify({
+      ok: true, at: Utilities.formatDate(new Date(), Session.getScriptTimeZone(), "yyyy-MM-dd HH:mm"),
+      tz: Session.getScriptTimeZone(), deep: String(p.deep || "") === "1",
+      cellCap: SHEET_CELL_CAP, runMsCap: RUN_MS_CAP,
+      gridCells: gridCells, usedCells: usedCells, wastedCells: wasteTotal, pctOfCells: pctOfCells,
+      tabCount: tabs.length, tabs: tabs,
+      trades: { rawRows: rawRows, normalisedRows: tradeRows, cols: tradeCols },
+      timings: { rawReadMs: tRaw, normaliseMs: tNorm, fifoMs: tFifo, totalMs: heaviest, pctOfRun: pctOfRun,
+        diagnosticMs: new Date().getTime() - dhStart },
+      growth: { byMonth: growth, perMonth: perMonth, monthsToCap: monthsToCap },
+      verdict: { level: level, reasons: reasons }
     })).setMimeType(ContentService.MimeType.JSON);
   }
 
