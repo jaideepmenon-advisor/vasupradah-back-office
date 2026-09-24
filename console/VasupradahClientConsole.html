@@ -628,6 +628,12 @@ const defaultDB = () => ({
   adviceContacts: {},
   // Billing: fee plans keyed by id. See BillingTab.
   feePlans: {},
+  // Billing: per-client setup (plan, state, resident/NRI), issued invoices keyed by
+  // id, and the firm's own GST + bank details. See BillingTab.
+  billingProfiles: {},
+  invoices: {},
+  billingSettings: {},
+  lastBillRun: "",
   waOpenMode: "auto",
   approveTo: DEFAULT_APPROVE_TO,
   rejectTo: DEFAULT_REJECT_TO,
@@ -1818,7 +1824,7 @@ function setup() {
 
 function doGet(e) {
   var p = (e && e.parameter) || {};
-  if (!p.prices && !p.alerts && !p.trades && !p.holdings && !p.gridkey && !p.greeting_status && !p.advice_alerts && !p.advice_trace && !p.ping && !p.pipeline && !p.baskets && !p.manual_trades && !p.client_details && !p.exec_modes && !p.advice_contacts && !p.shorten && !p.dedupe && !p.gk_probe && !p.staff && !p.fee_plans) {
+  if (!p.prices && !p.alerts && !p.trades && !p.holdings && !p.gridkey && !p.greeting_status && !p.advice_alerts && !p.advice_trace && !p.ping && !p.pipeline && !p.baskets && !p.manual_trades && !p.client_details && !p.exec_modes && !p.advice_contacts && !p.shorten && !p.dedupe && !p.gk_probe && !p.staff && !p.fee_plans && !p.first_trades && !p.billing_profiles && !p.billing_settings && !p.invoices) {
     return ContentService.createTextOutput("Vasupradah backup endpoint is live (use POST from the console).");
   }
 
@@ -2063,6 +2069,69 @@ function doGet(e) {
     var fpsh = fpss.getSheetByName("FeePlans");
     if (!fpsh || fpsh.getLastRow() < 2) return ContentService.createTextOutput(JSON.stringify({ ok: true, rows: [] })).setMimeType(ContentService.MimeType.JSON);
     return ContentService.createTextOutput(JSON.stringify({ ok: true, rows: fpsh.getDataRange().getValues() })).setMimeType(ContentService.MimeType.JSON);
+  }
+
+  // Billing: per-client billing setup (which plan, which state, resident or NRI).
+  if (p.billing_profiles) {
+    var bpss = SpreadsheetApp.getActiveSpreadsheet();
+    var bpsh = bpss.getSheetByName("BillingProfiles");
+    if (!bpsh || bpsh.getLastRow() < 2) return ContentService.createTextOutput(JSON.stringify({ ok: true, rows: [] })).setMimeType(ContentService.MimeType.JSON);
+    return ContentService.createTextOutput(JSON.stringify({ ok: true, rows: bpsh.getDataRange().getValues() })).setMimeType(ContentService.MimeType.JSON);
+  }
+
+  // Billing: the firm's own GST registration and the ONE account clients may pay into.
+  if (p.billing_settings) {
+    var bsss = SpreadsheetApp.getActiveSpreadsheet();
+    var bssh = bsss.getSheetByName("BillingSettings");
+    if (!bssh || bssh.getLastRow() < 2) return ContentService.createTextOutput(JSON.stringify({ ok: true, rows: [] })).setMimeType(ContentService.MimeType.JSON);
+    return ContentService.createTextOutput(JSON.stringify({ ok: true, rows: bssh.getDataRange().getValues() })).setMimeType(ContentService.MimeType.JSON);
+  }
+
+  // Billing: issued invoices and their receipts. Optional ?period= narrows to one quarter.
+  if (p.invoices) {
+    var inss = SpreadsheetApp.getActiveSpreadsheet();
+    var insh = inss.getSheetByName("Invoices");
+    if (!insh || insh.getLastRow() < 2) return ContentService.createTextOutput(JSON.stringify({ ok: true, rows: [] })).setMimeType(ContentService.MimeType.JSON);
+    var inAll = insh.getDataRange().getValues();
+    var inWant = String(p.period || "").trim();
+    if (inWant) {
+      var inKeep = [inAll[0]];
+      for (var ii = 1; ii < inAll.length; ii++) if (String(inAll[ii][2]).trim() === inWant) inKeep.push(inAll[ii]);
+      inAll = inKeep;
+    }
+    return ContentService.createTextOutput(JSON.stringify({ ok: true, rows: inAll })).setMimeType(ContentService.MimeType.JSON);
+  }
+
+  // Billing: the earliest executed trade on each account, which is what a first
+  // quarter's fee is charged from. Scanning the whole book here and returning one
+  // date per client keeps this to a few KB instead of shipping ~100k trade rows.
+  if (p.first_trades) {
+    var ftFirst = {};
+    var ftNote = function (code, date) {
+      var c = String(code || "").trim();
+      var d = String(date || "").trim();
+      if (!c || !/^\\d{4}-\\d{2}-\\d{2}$/.test(d)) return;
+      if (!ftFirst[c] || d < ftFirst[c]) ftFirst[c] = d;
+    };
+    try {
+      var ftRows = gkNormalizedTrades_();
+      for (var fti = 0; fti < ftRows.length; fti++) ftNote(ftRows[fti][1], ftRows[fti][0]);
+    } catch (eFt) { /* a broken Trades tab must not take the endpoint down */ }
+    // Trades keyed in by hand live in their own tab and count just the same.
+    try {
+      var ftss = SpreadsheetApp.getActiveSpreadsheet();
+      var ftsh = ftss.getSheetByName("ManualTrades");
+      if (ftsh && ftsh.getLastRow() > 1) {
+        var ftMv = ftsh.getDataRange().getValues();
+        var ftTz = Session.getScriptTimeZone();
+        for (var ftj = 1; ftj < ftMv.length; ftj++) {
+          var ftD = ftMv[ftj][1];
+          if (Object.prototype.toString.call(ftD) === "[object Date]") ftD = Utilities.formatDate(ftD, ftTz, "yyyy-MM-dd");
+          ftNote(ftMv[ftj][2], ftD);
+        }
+      }
+    } catch (eFt2) { /* same */ }
+    return ContentService.createTextOutput(JSON.stringify({ ok: true, first: ftFirst })).setMimeType(ContentService.MimeType.JSON);
   }
 
   if (p.exec_modes) {
@@ -2485,6 +2554,169 @@ function doPost(e) {
     }
     SpreadsheetApp.flush();
     return ContentService.createTextOutput("ok: fee plans +" + fAdd + " ~" + fUpd);
+  }
+
+  // --- Billing: per-client setup. Upsert by client code. ---
+  if (body.type === "billing_profiles") {
+    var bpHdr = ["Client code", "Name", "Fee plan id", "Fee plan", "Residency", "State", "Permanent state",
+      "GSTIN", "Billing start", "Billing email", "Status", "Notes", "Updated at"];
+    var bpss2 = SpreadsheetApp.getActiveSpreadsheet();
+    var bpsh2 = bpss2.getSheetByName("BillingProfiles");
+    if (!bpsh2) { bpsh2 = bpss2.insertSheet("BillingProfiles"); bpsh2.getRange(1, 1, 1, bpHdr.length).setValues([bpHdr]); }
+    if (bpsh2.getLastRow() < 1) bpsh2.getRange(1, 1, 1, bpHdr.length).setValues([bpHdr]);
+    var bpAll = bpsh2.getLastRow() > 1 ? bpsh2.getRange(2, 1, bpsh2.getLastRow() - 1, bpHdr.length).getValues() : [];
+
+    if (body.action === "delete") {
+      var bpDel = String(body.code || "").trim();
+      if (!bpDel) return ContentService.createTextOutput("error: delete needs a client code");
+      for (var bpd = 0; bpd < bpAll.length; bpd++) {
+        if (String(bpAll[bpd][0]).trim() === bpDel) {
+          bpsh2.deleteRow(bpd + 2); SpreadsheetApp.flush();
+          return ContentService.createTextOutput("ok: billing profile deleted");
+        }
+      }
+      return ContentService.createTextOutput("ok: billing profile not found");
+    }
+
+    var bpIn = Array.isArray(body.rows) ? body.rows : [];
+    var bpAdd = 0, bpUpd = 0;
+    for (var bpi = 0; bpi < bpIn.length; bpi++) {
+      var bpr = bpIn[bpi] || {};
+      var bpCode = String(bpr.code || "").trim();
+      if (!bpCode) continue;
+      var bpRow = [bpCode, String(bpr.name || ""), String(bpr.planId || ""), String(bpr.planName || ""),
+        String(bpr.residency || ""), String(bpr.state || ""), String(bpr.permanentState || ""),
+        String(bpr.gstin || ""), String(bpr.billingStart || ""), String(bpr.email || ""),
+        String(bpr.status || ""), String(bpr.notes || ""), Number(bpr.updatedAt) || Date.now()];
+      var bpHit = -1;
+      for (var bpj = 0; bpj < bpAll.length; bpj++) if (String(bpAll[bpj][0]).trim() === bpCode) { bpHit = bpj; break; }
+      if (bpHit >= 0) { bpsh2.getRange(bpHit + 2, 1, 1, bpHdr.length).setValues([bpRow]); bpAll[bpHit] = bpRow; bpUpd++; }
+      else { bpsh2.appendRow(bpRow); bpAll.push(bpRow); bpAdd++; }
+    }
+    SpreadsheetApp.flush();
+    return ContentService.createTextOutput("ok: billing profiles +" + bpAdd + " ~" + bpUpd);
+  }
+
+  // --- Billing: the firm's GST details and the single account clients pay into.
+  //     One row, rewritten each time. The UPI QR is held as a data URL so the same
+  //     image reaches every device and can be inlined into the bill mail. ---
+  if (body.type === "billing_settings") {
+    var bsHdr = ["Firm name", "Firm state", "Firm GSTIN", "PAN", "SEBI reg", "Address", "GST rate",
+      "Bank name", "Account name", "Account number", "IFSC", "Branch", "UPI id", "UPI QR",
+      "Invoice prefix", "Receipt prefix", "Notes", "Updated at"];
+    var bsss2 = SpreadsheetApp.getActiveSpreadsheet();
+    var bssh2 = bsss2.getSheetByName("BillingSettings");
+    if (!bssh2) { bssh2 = bsss2.insertSheet("BillingSettings"); }
+    var bsIn = body.row || {};
+    var bsQr = String(bsIn.upiQr || "");
+    // A Google Sheets cell tops out at 50,000 characters. Rather than fail the whole
+    // save, drop an oversized QR and say so - the rest of the settings still land.
+    var bsQrNote = "";
+    if (bsQr.length > 45000) { bsQr = ""; bsQrNote = " (UPI QR too large to store - use a smaller image)"; }
+    var bsRow = [String(bsIn.firmName || ""), String(bsIn.firmState || ""), String(bsIn.firmGstin || ""),
+      String(bsIn.pan || ""), String(bsIn.sebiReg || ""), String(bsIn.address || ""), Number(bsIn.gstRate) || 0,
+      String(bsIn.bankName || ""), String(bsIn.accountName || ""), "'" + String(bsIn.accountNo || ""),
+      String(bsIn.ifsc || ""), String(bsIn.branch || ""), String(bsIn.upiId || ""), bsQr,
+      String(bsIn.invoicePrefix || ""), String(bsIn.receiptPrefix || ""), String(bsIn.notes || ""),
+      Number(bsIn.updatedAt) || Date.now()];
+    bssh2.clear();
+    bssh2.getRange(1, 1, 1, bsHdr.length).setValues([bsHdr]);
+    bssh2.getRange(2, 1, 1, bsHdr.length).setValues([bsRow]);
+    SpreadsheetApp.flush();
+    return ContentService.createTextOutput("ok: billing settings saved" + bsQrNote);
+  }
+
+  // --- Billing: issued invoices. Upsert by invoice id; an invoice is never removed
+  //     by a sync, only by an explicit delete (which is for a mistaken run, not for
+  //     cancelling a real bill - cancel sets the status instead). ---
+  if (body.type === "invoices") {
+    var ivHdr = ["id", "Invoice no", "Period", "Client code", "Client name", "Email", "Fee plan",
+      "From", "To", "Days billed", "Days in quarter", "Basis", "Fee", "GST mode", "CGST", "SGST", "IGST",
+      "Total", "Place of supply", "Status", "Issued at", "Emailed at", "WhatsApp at",
+      "Receipt no", "Paid on", "Paid mode", "Paid ref", "Receipt at", "Receipt by", "Updated at"];
+    var ivss2 = SpreadsheetApp.getActiveSpreadsheet();
+    var ivsh2 = ivss2.getSheetByName("Invoices");
+    if (!ivsh2) { ivsh2 = ivss2.insertSheet("Invoices"); ivsh2.getRange(1, 1, 1, ivHdr.length).setValues([ivHdr]); }
+    if (ivsh2.getLastRow() < 1) ivsh2.getRange(1, 1, 1, ivHdr.length).setValues([ivHdr]);
+    var ivAll = ivsh2.getLastRow() > 1 ? ivsh2.getRange(2, 1, ivsh2.getLastRow() - 1, ivHdr.length).getValues() : [];
+
+    if (body.action === "delete") {
+      var ivDel = String(body.id || "").trim();
+      if (!ivDel) return ContentService.createTextOutput("error: delete needs an id");
+      for (var ivd = 0; ivd < ivAll.length; ivd++) {
+        if (String(ivAll[ivd][0]).trim() === ivDel) {
+          ivsh2.deleteRow(ivd + 2); SpreadsheetApp.flush();
+          return ContentService.createTextOutput("ok: invoice deleted");
+        }
+      }
+      return ContentService.createTextOutput("ok: invoice not found");
+    }
+
+    var ivIn = Array.isArray(body.rows) ? body.rows : [];
+    var ivAdd = 0, ivUpd = 0;
+    for (var ivi = 0; ivi < ivIn.length; ivi++) {
+      var iv = ivIn[ivi] || {};
+      var ivId = String(iv.id || "").trim();
+      if (!ivId) continue;
+      var rcp = iv.receipt || {};
+      var ivRow = [ivId, String(iv.no || ""), String(iv.period || ""), String(iv.code || ""), String(iv.name || ""),
+        String(iv.email || ""), String(iv.planName || ""), String(iv.from || ""), String(iv.to || ""),
+        Number(iv.days) || 0, Number(iv.daysInQuarter) || 0, String(iv.basis || ""), Number(iv.fee) || 0,
+        String(iv.gstMode || ""), Number(iv.cgst) || 0, Number(iv.sgst) || 0, Number(iv.igst) || 0,
+        Number(iv.total) || 0, String(iv.placeOfSupply || ""), String(iv.status || ""),
+        Number(iv.issuedAt) || 0, Number(iv.emailedAt) || 0, Number(iv.waAt) || 0,
+        String(rcp.no || ""), String(rcp.paidOn || ""), String(rcp.mode || ""), String(rcp.ref || ""),
+        Number(rcp.at) || 0, String(rcp.by || ""), Number(iv.updatedAt) || Date.now()];
+      var ivHit = -1;
+      for (var ivj = 0; ivj < ivAll.length; ivj++) if (String(ivAll[ivj][0]).trim() === ivId) { ivHit = ivj; break; }
+      if (ivHit >= 0) { ivsh2.getRange(ivHit + 2, 1, 1, ivHdr.length).setValues([ivRow]); ivAll[ivHit] = ivRow; ivUpd++; }
+      else { ivsh2.appendRow(ivRow); ivAll.push(ivRow); ivAdd++; }
+    }
+    SpreadsheetApp.flush();
+    return ContentService.createTextOutput("ok: invoices +" + ivAdd + " ~" + ivUpd);
+  }
+
+  // --- Billing mail. Unlike the advice mail this takes ready-made HTML per
+  //     recipient, because a bill is a table (fee, CGST/SGST or IGST, total) rather
+  //     than a paragraph. The UPI QR rides along as an inline image, since Gmail
+  //     strips data: URLs out of <img src>. ---
+  if (body.type === "billing_email") {
+    var beList = Array.isArray(body.recipients) ? body.recipients : [];
+    var beFrom = String(body.fromName || "Vasupradah Investment Advisory");
+    var beReply = String(body.replyTo || "").trim();
+    var beQr = String(body.qr || "");
+    var beInline = null;
+    var beCut = beQr.indexOf("base64,");
+    if (beCut >= 0) {
+      var beMime = "image/png", beSemi = beQr.indexOf(";");
+      if (beQr.indexOf("data:") === 0 && beSemi > 5) beMime = beQr.substring(5, beSemi);
+      try { beInline = { upiqr: Utilities.newBlob(Utilities.base64Decode(beQr.substring(beCut + 7)), beMime, "upiqr") }; }
+      catch (eQr) { beInline = null; }
+    }
+    var beQuota = 0;
+    try { beQuota = MailApp.getRemainingDailyQuota(); } catch (eQ) { beQuota = 0; }
+    // Which addresses actually took the mail, so the console marks only those as
+    // sent. Marking a bill "mailed" when Gmail refused it would quietly lose it.
+    var beSentTo = [], beSkipped = 0, beFailed = 0, beSeen = {}, beSent = 0;
+    for (var bei = 0; bei < beList.length; bei++) {
+      var be = beList[bei] || {};
+      var beTo = String(be.email || "").trim().toLowerCase();
+      if (!beTo || beTo.indexOf("@") < 1 || beSeen[beTo]) { beSkipped++; continue; }
+      if (beSent >= beQuota) { beSkipped++; continue; }
+      beSeen[beTo] = true;
+      var beOpts = { name: beFrom, htmlBody: String(be.html || "") };
+      if (beInline) beOpts.inlineImages = beInline;
+      if (beReply) beOpts.replyTo = beReply;
+      try { MailApp.sendEmail(beTo, String(be.subject || "Your invoice"), String(be.text || ""), beOpts); beSentTo.push(beTo); beSent++; }
+      catch (eBe) {
+        if (beReply) {
+          delete beOpts.replyTo;
+          try { MailApp.sendEmail(beTo, String(be.subject || "Your invoice"), String(be.text || ""), beOpts); beSentTo.push(beTo); beSent++; }
+          catch (eBe2) { beFailed++; }
+        } else beFailed++;
+      }
+    }
+    return ContentService.createTextOutput(JSON.stringify({ ok: beSent > 0, sent: beSent, sentTo: beSentTo, skipped: beSkipped, failed: beFailed, quota: beQuota }));
   }
 
   if (body.type === "exec_modes") {
@@ -4044,6 +4276,463 @@ async function deleteFeePlanOnSheet(db, id) {
     return false;
   }
 }
+// ---- Billing: quarters, GST and the fee for one client for one quarter ------
+// Fees are billed on the first day of a quarter for the quarter just finished, so
+// everything here works on a CLOSED period: Apr-Jun is billed on 1 July.
+const DAY_MS = 864e5;
+const OUTSIDE_INDIA = "Outside India (export of service)";
+const INDIAN_STATES = [
+  "Andaman and Nicobar Islands", "Andhra Pradesh", "Arunachal Pradesh", "Assam", "Bihar",
+  "Chandigarh", "Chhattisgarh", "Dadra and Nagar Haveli and Daman and Diu", "Delhi", "Goa",
+  "Gujarat", "Haryana", "Himachal Pradesh", "Jammu and Kashmir", "Jharkhand", "Karnataka",
+  "Kerala", "Ladakh", "Lakshadweep", "Madhya Pradesh", "Maharashtra", "Manipur", "Meghalaya",
+  "Mizoram", "Nagaland", "Odisha", "Puducherry", "Punjab", "Rajasthan", "Sikkim", "Tamil Nadu",
+  "Telangana", "Tripura", "Uttar Pradesh", "Uttarakhand", "West Bengal"
+];
+const round2 = (n) => Math.round((Number(n) || 0) * 100) / 100;
+const ymd = (d) => {
+  const x = d instanceof Date ? d : new Date(d);
+  return `${x.getFullYear()}-${String(x.getMonth() + 1).padStart(2, "0")}-${String(x.getDate()).padStart(2, "0")}`;
+};
+// A yyyy-mm-dd string as a LOCAL midnight Date. new Date("2026-04-01") is UTC
+// midnight, which in IST is the previous day - that would misprice a client whose
+// first trade lands on the first or last day of a quarter.
+const dayOf = (v) => {
+  // Duck-typed rather than `instanceof Date`, which is false for a Date made in
+  // another realm (an iframe, a worker) and would silently blank out the date.
+  if (v && typeof v.getTime === "function" && !isNaN(v.getTime())) return new Date(v.getFullYear(), v.getMonth(), v.getDate());
+  if (typeof v === "number" && isFinite(v) && v > 0) { const d = new Date(v); return new Date(d.getFullYear(), d.getMonth(), d.getDate()); }
+  const m = String(v || "").trim().match(/^(\d{4})-(\d{2})-(\d{2})/);
+  return m ? new Date(+m[1], +m[2] - 1, +m[3]) : null;
+};
+const daysBetween = (a, b) => Math.round((dayOf(b) - dayOf(a)) / DAY_MS) + 1;
+// Indian financial-year quarters: Q1 Apr-Jun, Q2 Jul-Sep, Q3 Oct-Dec, Q4 Jan-Mar.
+function fyQuarter(anyDate) {
+  const d = dayOf(anyDate) || new Date();
+  const qi = Math.floor(((d.getMonth() + 9) % 12) / 3);
+  const startMonth = [3, 6, 9, 0][qi];
+  const fyStart = d.getMonth() >= 3 ? d.getFullYear() : d.getFullYear() - 1;
+  const year = qi === 3 ? fyStart + 1 : fyStart;
+  const from = new Date(year, startMonth, 1);
+  const to = new Date(year, startMonth + 3, 0);
+  const fyLabel = `${fyStart}-${String((fyStart + 1) % 100).padStart(2, "0")}`;
+  return { q: qi + 1, fyStart, fyLabel, from, to, key: `${fyLabel}-Q${qi + 1}`, label: `Q${qi + 1} ${fyLabel} (${monShort(from)}–${monShort(to)})` };
+}
+const monShort = (d) => d.toLocaleDateString("en-IN", { month: "short", year: "numeric" });
+const prevQuarter = (anyDate) => {
+  const cur = fyQuarter(anyDate);
+  return fyQuarter(new Date(cur.from.getTime() - DAY_MS));
+};
+const fmtDay = (v) => {
+  const d = dayOf(v);
+  return d ? d.toLocaleDateString("en-IN", { day: "2-digit", month: "short", year: "numeric" }) : "";
+};
+// Where the service is treated as supplied. For an NRI that is the Indian address on
+// record, which is why the billing profile keeps a permanent state of its own.
+function placeOfSupplyFor(prof) {
+  if (!prof) return "";
+  if (String(prof.residency || "") === "NRI") return prof.permanentState || prof.state || "";
+  return prof.state || "";
+}
+// Same state as the firm means the tax splits into CGST and SGST; a different state
+// means one IGST line; outside India is a zero-rated export.
+function gstSplit(fee, placeOfSupply, firmState, rate) {
+  const taxable = round2(fee);
+  const pos = String(placeOfSupply || "").trim();
+  const r = Number(rate) || 0;
+  if (!pos) return { cgst: 0, sgst: 0, igst: 0, mode: "Not set", tax: 0 };
+  if (pos === OUTSIDE_INDIA) return { cgst: 0, sgst: 0, igst: 0, mode: "Zero-rated export", tax: 0 };
+  if (!r || taxable <= 0) return { cgst: 0, sgst: 0, igst: 0, mode: "No GST", tax: 0 };
+  const tax = round2(taxable * r / 100);
+  if (pos.toLowerCase() === String(firmState || "").trim().toLowerCase()) {
+    const half = round2(tax / 2);
+    return { cgst: half, sgst: round2(tax - half), igst: 0, mode: "CGST + SGST", tax };
+  }
+  return { cgst: 0, sgst: 0, igst: tax, mode: "IGST", tax };
+}
+// What one quarter of a plan costs, whatever the plan's own billing frequency is.
+// A monthly plan bills three months in the quarter; an annual plan bills a quarter of
+// the year. A one-time plan is not a recurring charge and is left out of a quarter run.
+function quarterFeeOf(plan, aua) {
+  if (!plan) return { fee: 0, why: "no fee plan attached" };
+  const perYear = FEE_PERIODS_PER_YEAR[plan.frequency];
+  if (!perYear) return { fee: 0, why: "one-time plan, not billed quarterly" };
+  if (plan.status === "Inactive") return { fee: 0, why: "fee plan is inactive" };
+  if (plan.mode === "% of AUA") {
+    const pctPerYear = num(plan.amount) * perYear;
+    if (!(num(aua) > 0)) return { fee: 0, why: "no portfolio value to charge a percentage on" };
+    return { fee: round2(num(aua) * (pctPerYear / 4) / 100), why: "" };
+  }
+  return { fee: round2(num(plan.amount) * perYear / 4), why: "" };
+}
+// The whole calculation for one client for one quarter, kept in one place so the
+// preview, the generated invoice and any re-run agree to the paisa.
+// firstTrade is the earliest executed trade on the account; a client whose first
+// trade falls inside the quarter is charged from that date, pro rata on days.
+function computeQuarterFee(opts) {
+  const { plan, quarter, firstTrade, billingStart, aua, profile, settings } = opts;
+  const qFrom = dayOf(quarter.from), qTo = dayOf(quarter.to);
+  const daysInQuarter = daysBetween(qFrom, qTo);
+  const base = quarterFeeOf(plan, aua);
+  if (base.why) return { skip: base.why, daysInQuarter };
+  // An explicit billing start on the profile overrides the trade book - that is the
+  // escape hatch for an account transferred in with history, or a fee holiday.
+  const startRaw = billingStart || firstTrade || "";
+  const start = dayOf(startRaw);
+  if (!start) return { skip: "no executed trade on this account yet, and no billing start set", daysInQuarter };
+  if (start > qTo) return { skip: `billing starts ${fmtDay(start)}, after this quarter`, daysInQuarter };
+  const proRata = start > qFrom;
+  const from = proRata ? start : qFrom;
+  const days = daysBetween(from, qTo);
+  const fee = proRata ? round2(base.fee * days / daysInQuarter) : base.fee;
+  const pos = placeOfSupplyFor(profile);
+  const g = gstSplit(fee, pos, settings && settings.firmState, settings && settings.gstRate);
+  return {
+    skip: "", proRata, basis: proRata ? "Pro rata" : "Full quarter",
+    from: ymd(from), to: ymd(qTo), days, daysInQuarter, fullFee: base.fee, fee,
+    placeOfSupply: pos, gstMode: g.mode, cgst: g.cgst, sgst: g.sgst, igst: g.igst,
+    total: round2(fee + g.cgst + g.sgst + g.igst), aua: num(aua), firstTrade: firstTrade || ""
+  };
+}
+// WhatsApp alerts keep using the number in Holdings, as everywhere else in the
+// console - AdviceContacts is only for opening an order link.
+const waOf = (db, code) => ((db.clients || {})[String(code || "").trim()] || {}).whatsapp || "";
+function downloadExcelRows(rows, title) {
+  const ws = XLSX.utils.json_to_sheet(rows);
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, "Billing");
+  const out = XLSX.write(wb, { type: "array", bookType: "xlsx" });
+  const blob = new Blob([out], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `${title}.xlsx`;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(url), 1500);
+}
+const DEFAULT_BILLING_SETTINGS = () => ({
+  firmName: "Vasupradah Investment Advisory Services P Ltd",
+  firmState: "Kerala", firmGstin: "", pan: "", sebiReg: "", address: "Kochi, Kerala",
+  gstRate: 18, bankName: "", accountName: "", accountNo: "", ifsc: "", branch: "",
+  upiId: "", upiQr: "", invoicePrefix: "VIAS", receiptPrefix: "VIAS/R", notes: "", updatedAt: 0
+});
+async function pullBillingProfiles(url) {
+  const res = await fetch(url + (url.includes("?") ? "&" : "?") + "billing_profiles=1");
+  const data = await res.json();
+  const rows = Array.isArray(data.rows) ? data.rows : [];
+  if (rows.length < 2) return {};
+  const out = {};
+  for (const r of rows.slice(1)) {
+    const code = String(r[0] || "").trim();
+    if (!code) continue;
+    out[code] = {
+      code, name: String(r[1] || ""), planId: String(r[2] || ""), planName: String(r[3] || ""),
+      residency: String(r[4] || "") || "Resident", state: String(r[5] || ""),
+      permanentState: String(r[6] || ""), gstin: String(r[7] || ""), billingStart: String(r[8] || ""),
+      email: String(r[9] || ""), status: String(r[10] || "") || "Active", notes: String(r[11] || ""),
+      updatedAt: num(r[12])
+    };
+  }
+  return out;
+}
+async function pushBillingProfiles(db, rows) {
+  if (!(db.sheetUrl || "").trim() || !(rows || []).length) return false;
+  try {
+    await fetch(db.sheetUrl, { method: "POST", mode: "no-cors", headers: { "Content-Type": "text/plain;charset=utf-8" },
+      body: JSON.stringify({ token: db.sheetToken || "", type: "billing_profiles", rows }) });
+    return true;
+  } catch (e) { return false; }
+}
+async function pullBillingSettings(url) {
+  const res = await fetch(url + (url.includes("?") ? "&" : "?") + "billing_settings=1");
+  const data = await res.json();
+  const rows = Array.isArray(data.rows) ? data.rows : [];
+  if (rows.length < 2) return null;
+  const r = rows[1];
+  return {
+    firmName: String(r[0] || ""), firmState: String(r[1] || ""), firmGstin: String(r[2] || ""),
+    pan: String(r[3] || ""), sebiReg: String(r[4] || ""), address: String(r[5] || ""), gstRate: num(r[6]),
+    bankName: String(r[7] || ""), accountName: String(r[8] || ""), accountNo: String(r[9] || "").replace(/^'/, ""),
+    ifsc: String(r[10] || ""), branch: String(r[11] || ""), upiId: String(r[12] || ""), upiQr: String(r[13] || ""),
+    invoicePrefix: String(r[14] || ""), receiptPrefix: String(r[15] || ""), notes: String(r[16] || ""),
+    updatedAt: num(r[17])
+  };
+}
+async function pushBillingSettings(db, row) {
+  if (!(db.sheetUrl || "").trim()) return false;
+  try {
+    await fetch(db.sheetUrl, { method: "POST", mode: "no-cors", headers: { "Content-Type": "text/plain;charset=utf-8" },
+      body: JSON.stringify({ token: db.sheetToken || "", type: "billing_settings", row }) });
+    return true;
+  } catch (e) { return false; }
+}
+async function pullInvoices(url, period) {
+  const res = await fetch(url + (url.includes("?") ? "&" : "?") + "invoices=1" + (period ? "&period=" + encodeURIComponent(period) : ""));
+  const data = await res.json();
+  const rows = Array.isArray(data.rows) ? data.rows : [];
+  if (rows.length < 2) return {};
+  const out = {};
+  for (const r of rows.slice(1)) {
+    const id = String(r[0] || "").trim();
+    if (!id) continue;
+    out[id] = {
+      id, no: String(r[1] || ""), period: String(r[2] || ""), code: String(r[3] || ""), name: String(r[4] || ""),
+      email: String(r[5] || ""), planName: String(r[6] || ""), from: String(r[7] || ""), to: String(r[8] || ""),
+      days: num(r[9]), daysInQuarter: num(r[10]), basis: String(r[11] || ""), fee: num(r[12]),
+      gstMode: String(r[13] || ""), cgst: num(r[14]), sgst: num(r[15]), igst: num(r[16]), total: num(r[17]),
+      placeOfSupply: String(r[18] || ""), status: String(r[19] || "") || "Unpaid",
+      issuedAt: num(r[20]), emailedAt: num(r[21]), waAt: num(r[22]),
+      receipt: String(r[23] || "") ? { no: String(r[23]), paidOn: String(r[24] || ""), mode: String(r[25] || ""), ref: String(r[26] || ""), at: num(r[27]), by: String(r[28] || "") } : null,
+      updatedAt: num(r[29])
+    };
+  }
+  return out;
+}
+async function pushInvoices(db, rows) {
+  if (!(db.sheetUrl || "").trim() || !(rows || []).length) return false;
+  try {
+    await fetch(db.sheetUrl, { method: "POST", mode: "no-cors", headers: { "Content-Type": "text/plain;charset=utf-8" },
+      body: JSON.stringify({ token: db.sheetToken || "", type: "invoices", rows }) });
+    return true;
+  } catch (e) { return false; }
+}
+async function deleteInvoiceOnSheet(db, id) {
+  if (!(db.sheetUrl || "").trim() || !id) return false;
+  try {
+    await fetch(db.sheetUrl, { method: "POST", mode: "no-cors", headers: { "Content-Type": "text/plain;charset=utf-8" },
+      body: JSON.stringify({ token: db.sheetToken || "", type: "invoices", action: "delete", id }) });
+    return true;
+  } catch (e) { return false; }
+}
+// The earliest executed trade per client code, computed on the sheet so this stays a
+// few KB. It is what a new client's first quarter is charged from.
+async function pullFirstTrades(url) {
+  const res = await fetch(url + (url.includes("?") ? "&" : "?") + "first_trades=1");
+  const data = await res.json();
+  return data && data.first && typeof data.first === "object" ? data.first : {};
+}
+// Bills and receipts are ready-made HTML, unlike the advice mail, so they go through
+// their own endpoint. Returns {sent, skipped, failed} rather than a bare ok.
+async function sendBillingEmail(db, recipients, qr) {
+  const url = (db.sheetUrl || "").trim();
+  if (!url) return { ok: false, msg: "Connect the office Google Sheet in Settings first." };
+  try {
+    const res = await fetch(url, { method: "POST", headers: { "Content-Type": "text/plain;charset=utf-8" },
+      body: JSON.stringify({ token: db.sheetToken || "", type: "billing_email", recipients, qr: qr || "",
+        fromName: db.firmName || "Vasupradah Investment Advisory", replyTo: "" }) });
+    const txt = await res.text();
+    try {
+      const j = JSON.parse(txt);
+      return { ok: !!j.ok, sent: j.sent, sentTo: Array.isArray(j.sentTo) ? j.sentTo : null, skipped: j.skipped, failed: j.failed, quota: j.quota,
+        msg: j.ok ? `Sent ${j.sent} mail(s).${j.failed ? ` ${j.failed} failed.` : ""}${j.skipped ? ` ${j.skipped} skipped.` : ""}`
+                  : "Nothing was sent - check the email addresses and your Gmail quota." };
+    } catch (e) {
+      return { ok: false, msg: txt.slice(0, 200) || "The sheet gave an unexpected reply." };
+    }
+  } catch (e) {
+    return { ok: false, msg: "Could not reach the office Google Sheet." };
+  }
+}
+// ---- Billing: the bill and the receipt, as documents ------------------------
+const esc = (v) => String(v == null ? "" : v).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+const rupee = (n) => "₹" + Number(n || 0).toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+// Rupees in words, for the amount line every invoice is expected to carry.
+function rupeesInWords(amount) {
+  const ones = ["", "One", "Two", "Three", "Four", "Five", "Six", "Seven", "Eight", "Nine", "Ten", "Eleven",
+    "Twelve", "Thirteen", "Fourteen", "Fifteen", "Sixteen", "Seventeen", "Eighteen", "Nineteen"];
+  const tens = ["", "", "Twenty", "Thirty", "Forty", "Fifty", "Sixty", "Seventy", "Eighty", "Ninety"];
+  const two = (n) => n < 20 ? ones[n] : tens[Math.floor(n / 10)] + (n % 10 ? " " + ones[n % 10] : "");
+  const chunk = (n) => n > 99 ? ones[Math.floor(n / 100)] + " Hundred" + (n % 100 ? " " + two(n % 100) : "") : two(n);
+  const whole = Math.floor(Math.abs(Number(amount) || 0));
+  const paise = Math.round((Math.abs(Number(amount) || 0) - whole) * 100);
+  let n = whole, parts = [];
+  const crore = Math.floor(n / 1e7); n %= 1e7;
+  const lakh = Math.floor(n / 1e5); n %= 1e5;
+  const thou = Math.floor(n / 1e3); n %= 1e3;
+  if (crore) parts.push(chunk(crore) + " Crore");
+  if (lakh) parts.push(chunk(lakh) + " Lakh");
+  if (thou) parts.push(chunk(thou) + " Thousand");
+  if (n) parts.push(chunk(n));
+  let out = parts.join(" ") || "Zero";
+  out = "Rupees " + out;
+  if (paise) out += " and " + two(paise) + " Paise";
+  return out + " only";
+}
+// The one account clients may pay into, as an HTML block and as plain text. Kept in
+// one place so the bill, the WhatsApp message and the on-screen copy cannot drift.
+function payeeBlockHtml(st, withQr) {
+  const rows = [
+    ["Account name", st.accountName], ["Bank", st.bankName], ["Account number", st.accountNo],
+    ["IFSC", st.ifsc], ["Branch", st.branch], ["UPI", st.upiId]
+  ].filter(([, v]) => String(v || "").trim());
+  if (!rows.length) return "";
+  return `<div style="margin-top:18px;border:1px solid #e2e8f0;border-radius:10px;padding:14px;background:#f8fafc">
+  <div style="font-weight:bold;font-size:13px;margin-bottom:8px">How to pay</div>
+  <table style="font-size:13px;border-collapse:collapse">${rows.map(([k, v]) =>
+    `<tr><td style="padding:2px 14px 2px 0;color:#64748b">${esc(k)}</td><td style="padding:2px 0;font-weight:bold">${esc(v)}</td></tr>`).join("")}</table>
+  ${withQr && st.upiQr ? '<div style="margin-top:10px"><img src="cid:upiqr" alt="UPI QR" style="width:150px;height:150px;border:1px solid #e2e8f0;border-radius:8px"/></div>' : ""}
+  <div style="margin-top:10px;font-size:12px;color:#b45309">Please pay only into the account shown above. We will never ask you to pay into any other account, and we do not accept cash.</div>
+</div>`;
+}
+function payeeBlockText(st) {
+  const rows = [["Account name", st.accountName], ["Bank", st.bankName], ["A/c no", st.accountNo],
+    ["IFSC", st.ifsc], ["UPI", st.upiId]].filter(([, v]) => String(v || "").trim());
+  return rows.map(([k, v]) => `${k}: ${v}`).join("\n");
+}
+function invoiceHtml(inv, st) {
+  const gstRows = [];
+  if (inv.gstMode === "CGST + SGST") {
+    gstRows.push([`CGST @ ${num(st.gstRate) / 2}%`, inv.cgst], [`SGST @ ${num(st.gstRate) / 2}%`, inv.sgst]);
+  } else if (inv.gstMode === "IGST") {
+    gstRows.push([`IGST @ ${num(st.gstRate)}%`, inv.igst]);
+  }
+  const line = (k, v, bold) => `<tr><td style="padding:6px 0;color:#475569">${esc(k)}</td>
+    <td style="padding:6px 0;text-align:right;${bold ? "font-weight:bold;font-size:15px" : ""}">${rupee(v)}</td></tr>`;
+  return `<div style="font-family:Arial,Helvetica,sans-serif;color:#0f172a;font-size:14px;line-height:1.5;max-width:640px">
+  <div style="border-bottom:3px solid #C9A24B;padding-bottom:10px;margin-bottom:14px">
+    <div style="font-size:17px;font-weight:bold;color:#1E2A78">${esc(st.firmName)}</div>
+    <div style="font-size:12px;color:#64748b">${esc(st.address)}${st.sebiReg ? ` &middot; SEBI RIA Reg. No. ${esc(st.sebiReg)}` : ""}</div>
+    <div style="font-size:12px;color:#64748b">${st.firmGstin ? `GSTIN ${esc(st.firmGstin)}` : ""}${st.pan ? ` &middot; PAN ${esc(st.pan)}` : ""}</div>
+  </div>
+  <div style="font-size:15px;font-weight:bold;margin-bottom:10px">Tax invoice ${esc(inv.no)}</div>
+  <table style="width:100%;font-size:13px;border-collapse:collapse;margin-bottom:14px">
+    <tr><td style="vertical-align:top;padding-right:16px">
+      <div style="color:#64748b">Billed to</div>
+      <div style="font-weight:bold">${esc(inv.name)}</div>
+      <div style="color:#64748b">Client code ${esc(inv.code)}</div>
+      ${inv.gstin ? `<div style="color:#64748b">GSTIN ${esc(inv.gstin)}</div>` : ""}
+      <div style="color:#64748b">Place of supply: ${esc(inv.placeOfSupply || "not set")}</div>
+    </td><td style="vertical-align:top;text-align:right">
+      <div style="color:#64748b">Invoice date</div><div style="font-weight:bold">${esc(fmtDay(inv.issuedAt ? new Date(inv.issuedAt) : new Date()))}</div>
+      <div style="color:#64748b;margin-top:6px">Period</div><div style="font-weight:bold">${esc(fmtDay(inv.from))} to ${esc(fmtDay(inv.to))}</div>
+    </td></tr>
+  </table>
+  <table style="width:100%;border-collapse:collapse;font-size:13px;border:1px solid #e2e8f0;border-radius:8px">
+    <tr style="background:#f1f5f9"><th style="text-align:left;padding:8px;font-size:12px">Particulars</th><th style="text-align:right;padding:8px;font-size:12px">Amount</th></tr>
+    <tr><td style="padding:10px 8px;border-top:1px solid #e2e8f0">
+      Investment advisory fee &ndash; ${esc(inv.planName)}<br>
+      <span style="color:#64748b;font-size:12px">${esc(inv.basis)}${inv.basis === "Pro rata" ? ` &middot; ${inv.days} of ${inv.daysInQuarter} days, from ${esc(fmtDay(inv.from))}` : ""}</span>
+    </td><td style="padding:10px 8px;border-top:1px solid #e2e8f0;text-align:right">${rupee(inv.fee)}</td></tr>
+  </table>
+  <table style="width:100%;font-size:13px;border-collapse:collapse;margin-top:8px">
+    ${line("Fee", inv.fee)}
+    ${gstRows.map(([k, v]) => line(k, v)).join("")}
+    ${inv.gstMode === "Zero-rated export" ? '<tr><td colspan="2" style="padding:6px 0;color:#64748b;font-size:12px">Export of service &ndash; zero rated, no GST charged.</td></tr>' : ""}
+    <tr><td colspan="2" style="border-top:1px solid #e2e8f0"></td></tr>
+    ${line("Total payable", inv.total, true)}
+  </table>
+  <div style="font-size:12px;color:#64748b;margin-top:6px">${esc(rupeesInWords(inv.total))}</div>
+  ${payeeBlockHtml(st, true)}
+  <div style="margin-top:16px;font-size:11px;color:#94a3b8">
+    Investment advisory fees are charged under the SEBI (Investment Advisers) Regulations, 2013.
+    Please quote invoice ${esc(inv.no)} with your payment. If anything here looks wrong, write back before paying.
+  </div>
+</div>`;
+}
+function receiptHtml(inv, st) {
+  const r = inv.receipt || {};
+  return `<div style="font-family:Arial,Helvetica,sans-serif;color:#0f172a;font-size:14px;line-height:1.5;max-width:640px">
+  <div style="border-bottom:3px solid #C9A24B;padding-bottom:10px;margin-bottom:14px">
+    <div style="font-size:17px;font-weight:bold;color:#1E2A78">${esc(st.firmName)}</div>
+    <div style="font-size:12px;color:#64748b">${esc(st.address)}${st.sebiReg ? ` &middot; SEBI RIA Reg. No. ${esc(st.sebiReg)}` : ""}</div>
+    <div style="font-size:12px;color:#64748b">${st.firmGstin ? `GSTIN ${esc(st.firmGstin)}` : ""}</div>
+  </div>
+  <div style="font-size:15px;font-weight:bold;margin-bottom:4px">Receipt ${esc(r.no)}</div>
+  <div style="font-size:12px;color:#64748b;margin-bottom:14px">Dated ${esc(fmtDay(r.at ? new Date(r.at) : new Date()))}</div>
+  <p>Received with thanks from <b>${esc(inv.name)}</b> (client code ${esc(inv.code)}) the sum of
+  <b>${rupee(inv.total)}</b> &ndash; ${esc(rupeesInWords(inv.total))} &ndash; towards invoice
+  <b>${esc(inv.no)}</b> for the period ${esc(fmtDay(inv.from))} to ${esc(fmtDay(inv.to))}.</p>
+  <table style="font-size:13px;border-collapse:collapse;margin-top:10px">
+    ${[["Payment received on", fmtDay(r.paidOn)], ["Mode", r.mode], ["Reference", r.ref]]
+      .filter(([, v]) => String(v || "").trim())
+      .map(([k, v]) => `<tr><td style="padding:3px 16px 3px 0;color:#64748b">${esc(k)}</td><td style="padding:3px 0;font-weight:bold">${esc(v)}</td></tr>`).join("")}
+  </table>
+  <div style="margin-top:16px;font-size:11px;color:#94a3b8">This receipt is issued against the invoice named above. No further amount is due for that period.</div>
+</div>`;
+}
+// The WhatsApp note is deliberately not the bill: it says the bill is in their inbox,
+// gives the amount and how to pay, and nothing that would be unsafe to read off a
+// forwarded message.
+function invoiceWaText(inv, st, sentOn) {
+  const lines = [
+    `Dear ${inv.name || "Investor"},`, "",
+    `Your investment advisory fee bill for ${fmtDay(inv.from)} to ${fmtDay(inv.to)} is ${rupee(inv.total)} (invoice ${inv.no}).`,
+    `The bill has been sent to your registered email${inv.email ? " (" + inv.email + ")" : ""} on ${fmtDay(sentOn || new Date())}.`, ""
+  ];
+  const pay = payeeBlockText(st);
+  if (pay) lines.push("Payment may be made to:", pay, "", "Please pay only into this account. We never ask you to pay anywhere else.", "");
+  lines.push(st.firmName || "Vasupradah Investment Advisory Services P Ltd");
+  if (st.sebiReg) lines.push(`SEBI RIA Reg. No. ${st.sebiReg}`);
+  return lines.join("\n");
+}
+function receiptWaText(inv, st) {
+  const r = inv.receipt || {};
+  const lines = [
+    `Dear ${inv.name || "Investor"},`, "",
+    `Received with thanks ${rupee(inv.total)} towards invoice ${inv.no} for ${fmtDay(inv.from)} to ${fmtDay(inv.to)}.`,
+    `Receipt ${r.no} dated ${fmtDay(r.at ? new Date(r.at) : new Date())} has been sent to your registered email${inv.email ? " (" + inv.email + ")" : ""}.`,
+    "", st.firmName || "Vasupradah Investment Advisory Services P Ltd"
+  ];
+  if (st.sebiReg) lines.push(`SEBI RIA Reg. No. ${st.sebiReg}`);
+  return lines.join("\n");
+}
+// Next running number within a financial year. Invoice numbers must not repeat, so
+// the sequence is taken from the highest one already issued in that year rather than
+// from a count, which would collide after a deletion.
+function nextDocSeq(existingNos, prefix, fyLabel) {
+  let top = 0;
+  const head = `${prefix}/${fyLabel}/`;
+  for (const no of existingNos) {
+    const s2 = String(no || "");
+    if (!s2.startsWith(head)) continue;
+    const m = s2.match(/(\d+)\s*$/);
+    if (m) top = Math.max(top, parseInt(m[1], 10));
+  }
+  return top + 1;
+}
+const docNo = (prefix, fyLabel, q, seq) =>
+  `${prefix}/${fyLabel}/${q ? "Q" + q + "/" : ""}${String(seq).padStart(3, "0")}`;
+// Works out the whole quarter's billing run without touching any state, so the
+// preview you approve and the invoices that get written are the same numbers.
+function buildQuarterRun(opts) {
+  const { quarter, clients, profiles, plans, firstTrades, settings, existing, auaOf } = opts;
+  const st = { ...DEFAULT_BILLING_SETTINGS(), ...settings || {} };
+  const already = {};
+  for (const iv of Object.values(existing || {})) {
+    if (iv.period === quarter.key && iv.status !== "Cancelled") already[iv.code] = iv;
+  }
+  let seq = nextDocSeq(Object.values(existing || {}).map((x) => x.no), st.invoicePrefix, quarter.fyLabel);
+  const bills = [], skipped = [], repeats = [];
+  const sorted = Object.values(clients || {}).sort((a, b) => String(a.name || a.code).localeCompare(String(b.name || b.code)));
+  for (const c of sorted) {
+    const prof = (profiles || {})[c.code];
+    const name = c.name || c.code;
+    if (already[c.code]) { repeats.push({ code: c.code, name, no: already[c.code].no }); continue; }
+    if (!prof) { skipped.push({ code: c.code, name, why: "no billing setup - attach a fee plan first" }); continue; }
+    if (prof.status === "Inactive") { skipped.push({ code: c.code, name, why: "billing marked inactive" }); continue; }
+    const plan = (plans || {})[prof.planId];
+    if (!plan) { skipped.push({ code: c.code, name, why: "fee plan missing or deleted" }); continue; }
+    const r = computeQuarterFee({
+      plan, quarter, firstTrade: (firstTrades || {})[c.code] || "",
+      billingStart: prof.billingStart, aua: auaOf ? auaOf(c) : 0, profile: prof, settings: st
+    });
+    if (r.skip) { skipped.push({ code: c.code, name, why: r.skip }); continue; }
+    if (!(r.total > 0)) { skipped.push({ code: c.code, name, why: "the fee works out to nothing" }); continue; }
+    const email = String(prof.email || c.email || "").trim();
+    bills.push({
+      id: `inv_${quarter.key}_${c.code}`.replace(/[^A-Za-z0-9_\-]/g, ""),
+      no: docNo(st.invoicePrefix, quarter.fyLabel, quarter.q, seq++),
+      period: quarter.key, periodLabel: quarter.label, code: c.code, name, email,
+      gstin: prof.gstin || "", planId: prof.planId, planName: plan.name,
+      from: r.from, to: r.to, days: r.days, daysInQuarter: r.daysInQuarter, basis: r.basis,
+      fullFee: r.fullFee, fee: r.fee, aua: r.aua, firstTrade: r.firstTrade,
+      placeOfSupply: r.placeOfSupply, gstMode: r.gstMode, cgst: r.cgst, sgst: r.sgst, igst: r.igst,
+      total: r.total, status: "Unpaid", issuedAt: 0, emailedAt: 0, waAt: 0, receipt: null,
+      noEmail: !email.includes("@"), gstUnset: r.gstMode === "Not set"
+    });
+  }
+  return { bills, skipped, repeats, quarter, settings: st };
+}
 async function pullExecModes(url) {
   const res = await fetch(url + (url.includes("?") ? "&" : "?") + "exec_modes=1");
   const data = await res.json();
@@ -5095,7 +5784,804 @@ const STARTER_FEE_PLANS = [
   { name: "Fixed Fee 15000 Per Quarter", amount: 15e3 },
   { name: "Fixed Fee 22,500 Per Quarter", amount: 22500 }
 ];
+// The billing module. Fees are billed on the first day of a quarter for the quarter
+// just finished, so the Invoices section opens on the closed period and generates it
+// if that has not happened yet.
+const BILLING_SECTIONS = [
+  { id: "invoices", label: "Invoices" },
+  { id: "receipts", label: "Receipts" },
+  { id: "clients", label: "Client billing setup" },
+  { id: "plans", label: "Fee plans" },
+  { id: "settings", label: "Bank & GST" }
+];
+const billingSettingsOf = (db) => ({ ...DEFAULT_BILLING_SETTINGS(), ...db.billingSettings || {} });
+// cid: only resolves inside a mail client, so the on-screen copy needs the real image.
+const previewHtml = (html, qr) => qr ? String(html).split('src="cid:upiqr"').join(`src="${qr}"`) : String(html);
 function BillingTab({ db, user, commit, showToast }) {
+  const [sec, setSec] = useState("invoices");
+  return /* @__PURE__ */ React.createElement("div", { className: "space-y-4" },
+    /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-1 flex-wrap border-b border-slate-200" },
+      BILLING_SECTIONS.map((t) => /* @__PURE__ */ React.createElement("button", {
+        key: t.id, onClick: () => setSec(t.id),
+        className: `px-3 py-2 text-sm -mb-px border-b-2 ${sec === t.id ? "border-indigo-600 text-indigo-700 font-medium" : "border-transparent text-slate-500 hover:text-slate-700"}`
+      }, t.label))
+    ),
+    sec === "plans" && /* @__PURE__ */ React.createElement(FeePlanSetup, { db, user, commit, showToast }),
+    sec === "clients" && /* @__PURE__ */ React.createElement(BillingClients, { db, user, commit, showToast }),
+    sec === "invoices" && /* @__PURE__ */ React.createElement(BillingInvoices, { db, user, commit, showToast }),
+    sec === "receipts" && /* @__PURE__ */ React.createElement(BillingReceipts, { db, user, commit, showToast }),
+    sec === "settings" && /* @__PURE__ */ React.createElement(BillingSettingsSection, { db, user, commit, showToast })
+  );
+}
+// A document (bill or receipt) shown as it will arrive, with a print option.
+function DocModal({ title, html, qr, onClose, actions }) {
+  const print = () => {
+    const w = window.open("", "_blank", "width=820,height=900");
+    if (!w) return;
+    w.document.write(`<!doctype html><html><head><title>${title}</title></head><body style="margin:24px">${previewHtml(html, qr)}</body></html>`);
+    w.document.close();
+    w.focus();
+    setTimeout(() => w.print(), 300);
+  };
+  return /* @__PURE__ */ React.createElement("div", { className: "fixed inset-0 bg-black/40 z-40 flex items-center justify-center p-4", onClick: onClose },
+    /* @__PURE__ */ React.createElement("div", { className: "bg-white rounded-2xl w-full max-w-3xl max-h-[92vh] flex flex-col", onClick: (e) => e.stopPropagation() },
+      /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-2 px-5 py-3 border-b border-slate-100" },
+        /* @__PURE__ */ React.createElement("h3", { className: "text-sm font-semibold text-slate-800" }, title),
+        /* @__PURE__ */ React.createElement("div", { className: "ml-auto flex items-center gap-2" },
+          actions,
+          /* @__PURE__ */ React.createElement("button", { onClick: print, className: "text-xs px-2.5 py-1.5 rounded-md border border-slate-200 text-slate-600 hover:bg-slate-50" }, "Print / save PDF"),
+          /* @__PURE__ */ React.createElement("button", { onClick: onClose, className: "text-slate-400 hover:text-slate-600" }, /* @__PURE__ */ React.createElement(X, { size: 18 }))
+        )
+      ),
+      /* @__PURE__ */ React.createElement("div", { className: "overflow-y-auto p-5 bg-slate-50" },
+        /* @__PURE__ */ React.createElement("div", { className: "bg-white p-5 rounded-xl border border-slate-200", dangerouslySetInnerHTML: { __html: previewHtml(html, qr) } })
+      )
+    )
+  );
+}
+// Which fee plan each client is on, and the state that decides their GST. Without a
+// row here a client is simply not billed - the quarter run says so rather than
+// guessing a plan or a place of supply.
+function BillingClients({ db, user, commit, showToast }) {
+  const isAdmin = user?.role === "admin";
+  const [q, setQ] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [editing, setEditing] = useState(null);
+  const [firstTrades, setFirstTrades] = useState(null);
+  const [bulkPlan, setBulkPlan] = useState("");
+  const [picked, setPicked] = useState(() => /* @__PURE__ */ new Set());
+  const plans = useMemo(() => Object.values(db.feePlans || {}).filter((p) => p.status !== "Inactive")
+    .sort((a, b) => feePlanAnnual(a) - feePlanAnnual(b)), [db.feePlans]);
+  const profiles = db.billingProfiles || {};
+  const rows = useMemo(() => {
+    const needle = q.trim().toLowerCase();
+    return Object.values(db.clients || {})
+      .map((c) => ({ c, p: profiles[c.code] || null }))
+      .filter(({ c }) => !needle || String(c.name || "").toLowerCase().includes(needle) || String(c.code || "").toLowerCase().includes(needle))
+      .sort((a, b) => String(a.c.name || a.c.code).localeCompare(String(b.c.name || b.c.code)));
+  }, [db.clients, profiles, q]);
+  const missing = rows.filter(({ p }) => !p || !p.planId).length;
+
+  useEffect(() => {
+    const url = (db.sheetUrl || "").trim();
+    if (!url) return;
+    let dead = false;
+    pullFirstTrades(url).then((f) => { if (!dead) setFirstTrades(f); }).catch(() => { if (!dead) setFirstTrades({}); });
+    return () => { dead = true; };
+  }, [db.sheetUrl]);
+
+  const saveProfile = async (code, patch) => {
+    const c = (db.clients || {})[code] || {};
+    const cur = profiles[code] || { code, name: c.name || code, residency: "Resident", status: "Active" };
+    const rec = { ...cur, ...patch, code, name: c.name || cur.name || code, updatedAt: Date.now() };
+    if (rec.planId) rec.planName = ((db.feePlans || {})[rec.planId] || {}).name || "";
+    setBusy(true);
+    try {
+      const next = await commit((d) => {
+        d.billingProfiles = { ...d.billingProfiles || {}, [code]: rec };
+      }, "billing setup");
+      await pushBillingProfiles(next, [rec]);
+    } finally { setBusy(false); }
+    return rec;
+  };
+  const applyBulkPlan = async () => {
+    if (!bulkPlan || !picked.size) return;
+    const planName = ((db.feePlans || {})[bulkPlan] || {}).name || "";
+    const recs = [];
+    for (const code of picked) {
+      const c = (db.clients || {})[code] || {};
+      const cur = profiles[code] || { code, residency: "Resident", status: "Active" };
+      recs.push({ ...cur, code, name: c.name || code, planId: bulkPlan, planName, updatedAt: Date.now() });
+    }
+    setBusy(true);
+    try {
+      const next = await commit((d) => {
+        const all = { ...d.billingProfiles || {} };
+        for (const r of recs) all[r.code] = r;
+        d.billingProfiles = all;
+      }, "billing setup (bulk)");
+      await pushBillingProfiles(next, recs);
+    } finally { setBusy(false); }
+    setPicked(/* @__PURE__ */ new Set());
+    showToast(`${recs.length} client(s) put on ${planName}.`);
+  };
+  const toggle = (code) => setPicked((s2) => {
+    const n = new Set(s2);
+    n.has(code) ? n.delete(code) : n.add(code);
+    return n;
+  });
+  const sel = "px-2 py-1 text-[12px] border border-slate-200 rounded-md bg-white max-w-[190px]";
+  return /* @__PURE__ */ React.createElement("div", { className: "space-y-3" },
+    /* @__PURE__ */ React.createElement("div", { className: "flex items-start justify-between gap-3 flex-wrap" },
+      /* @__PURE__ */ React.createElement("div", null,
+        /* @__PURE__ */ React.createElement("h2", { className: "text-lg font-semibold text-slate-800" }, "Client billing setup"),
+        /* @__PURE__ */ React.createElement("p", { className: "text-[12px] text-slate-500 max-w-3xl" }, "Which fee plan each client is on, and the state that decides their GST. A client with no fee plan here is not billed at all — the quarter run lists them rather than guessing.")
+      ),
+      missing > 0 && /* @__PURE__ */ React.createElement("div", { className: "text-[12px] text-amber-800 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2" },
+        /* @__PURE__ */ React.createElement("b", null, missing), " client(s) have no fee plan yet and will not be billed.")
+    ),
+    isAdmin && /* @__PURE__ */ React.createElement("div", { className: "bg-white border border-slate-200 rounded-xl px-3 py-2.5 flex items-center gap-3 flex-wrap" },
+      /* @__PURE__ */ React.createElement("div", { className: "relative" },
+        /* @__PURE__ */ React.createElement(Search, { size: 14, className: "absolute left-3 top-2.5 text-slate-400" }),
+        /* @__PURE__ */ React.createElement("input", { value: q, onChange: (e) => setQ(e.target.value), placeholder: "Search client", className: "pl-9 pr-3 py-2 text-sm border border-slate-200 rounded-lg w-56 focus:outline-none focus:ring-2 focus:ring-indigo-500" })
+      ),
+      /* @__PURE__ */ React.createElement("span", { className: "text-[12px] text-slate-400" }, picked.size, " selected"),
+      /* @__PURE__ */ React.createElement("select", { value: bulkPlan, onChange: (e) => setBulkPlan(e.target.value), className: sel },
+        /* @__PURE__ */ React.createElement("option", { value: "" }, "Put selected on…"),
+        plans.map((p) => /* @__PURE__ */ React.createElement("option", { key: p.id, value: p.id }, p.name))
+      ),
+      /* @__PURE__ */ React.createElement("button", { onClick: applyBulkPlan, disabled: busy || !bulkPlan || !picked.size, className: "text-xs px-3 py-1.5 rounded-md bg-indigo-600 text-white hover:bg-indigo-700 disabled:opacity-40" }, "Apply"),
+      /* @__PURE__ */ React.createElement("button", { onClick: () => setPicked(new Set(rows.map((r) => r.c.code))), className: "text-xs text-indigo-600 hover:underline" }, "Select all"),
+      /* @__PURE__ */ React.createElement("button", { onClick: () => setPicked(/* @__PURE__ */ new Set()), className: "text-xs text-slate-500 hover:underline" }, "Clear")
+    ),
+    /* @__PURE__ */ React.createElement("div", { className: "bg-white border border-slate-200 rounded-xl overflow-hidden" },
+      /* @__PURE__ */ React.createElement("div", { style: { maxHeight: "62vh", overflowY: "auto" } },
+        /* @__PURE__ */ React.createElement("table", { className: "w-full text-sm" },
+          /* @__PURE__ */ React.createElement("thead", { className: "bg-slate-50 text-slate-500 text-[11px] uppercase sticky top-0" },
+            /* @__PURE__ */ React.createElement("tr", null,
+              isAdmin && /* @__PURE__ */ React.createElement("th", { className: "w-8 px-3 py-2" }),
+              /* @__PURE__ */ React.createElement("th", { className: "text-left font-medium px-3 py-2" }, "Client"),
+              /* @__PURE__ */ React.createElement("th", { className: "text-left font-medium px-3 py-2" }, "Fee plan"),
+              /* @__PURE__ */ React.createElement("th", { className: "text-left font-medium px-3 py-2" }, "Residency"),
+              /* @__PURE__ */ React.createElement("th", { className: "text-left font-medium px-3 py-2" }, "State for GST"),
+              /* @__PURE__ */ React.createElement("th", { className: "text-left font-medium px-3 py-2" }, "Billing starts"),
+              isAdmin && /* @__PURE__ */ React.createElement("th", { className: "w-10 px-3 py-2" })
+            )
+          ),
+          /* @__PURE__ */ React.createElement("tbody", { className: "divide-y divide-slate-100" },
+            rows.map(({ c, p }) => {
+              const nri = (p || {}).residency === "NRI";
+              const ft = firstTrades ? firstTrades[c.code] || "" : null;
+              const start = (p || {}).billingStart || "";
+              return /* @__PURE__ */ React.createElement("tr", { key: c.code, className: p && p.status === "Inactive" ? "opacity-50" : "" },
+                isAdmin && /* @__PURE__ */ React.createElement("td", { className: "px-3 py-2" },
+                  /* @__PURE__ */ React.createElement("input", { type: "checkbox", checked: picked.has(c.code), onChange: () => toggle(c.code) })),
+                /* @__PURE__ */ React.createElement("td", { className: "px-3 py-2" },
+                  /* @__PURE__ */ React.createElement("div", { className: "text-slate-800" }, c.name || c.code),
+                  /* @__PURE__ */ React.createElement("div", { className: "text-[11px] text-slate-400" }, c.code, (p || {}).gstin ? ` · GSTIN ${p.gstin}` : "")
+                ),
+                /* @__PURE__ */ React.createElement("td", { className: "px-3 py-2" },
+                  isAdmin ? /* @__PURE__ */ React.createElement("select", { value: (p || {}).planId || "", onChange: (e) => saveProfile(c.code, { planId: e.target.value }), className: sel + ((p || {}).planId ? "" : " border-amber-300 bg-amber-50") },
+                    /* @__PURE__ */ React.createElement("option", { value: "" }, "— not billed —"),
+                    plans.map((x) => /* @__PURE__ */ React.createElement("option", { key: x.id, value: x.id }, x.name))
+                  ) : /* @__PURE__ */ React.createElement("span", { className: "text-[12px] text-slate-600" }, (p || {}).planName || "—")
+                ),
+                /* @__PURE__ */ React.createElement("td", { className: "px-3 py-2" },
+                  isAdmin ? /* @__PURE__ */ React.createElement("select", { value: (p || {}).residency || "Resident", onChange: (e) => saveProfile(c.code, { residency: e.target.value }), className: sel },
+                    ["Resident", "NRI"].map((x) => /* @__PURE__ */ React.createElement("option", { key: x, value: x }, x))
+                  ) : /* @__PURE__ */ React.createElement("span", { className: "text-[12px] text-slate-600" }, (p || {}).residency || "Resident")
+                ),
+                /* @__PURE__ */ React.createElement("td", { className: "px-3 py-2" },
+                  isAdmin ? /* @__PURE__ */ React.createElement(React.Fragment, null,
+                    /* @__PURE__ */ React.createElement("select", { value: (nri ? (p || {}).permanentState : (p || {}).state) || "", onChange: (e) => saveProfile(c.code, nri ? { permanentState: e.target.value } : { state: e.target.value }), className: sel + ((nri ? (p || {}).permanentState : (p || {}).state) ? "" : " border-amber-300 bg-amber-50") },
+                      /* @__PURE__ */ React.createElement("option", { value: "" }, "— not set —"),
+                      INDIAN_STATES.map((x) => /* @__PURE__ */ React.createElement("option", { key: x, value: x }, x)),
+                      nri && /* @__PURE__ */ React.createElement("option", { value: OUTSIDE_INDIA }, OUTSIDE_INDIA)
+                    ),
+                    nri && /* @__PURE__ */ React.createElement("div", { className: "text-[10px] text-slate-400 mt-0.5" }, "permanent residence")
+                  ) : /* @__PURE__ */ React.createElement("span", { className: "text-[12px] text-slate-600" }, placeOfSupplyFor(p) || "—")
+                ),
+                /* @__PURE__ */ React.createElement("td", { className: "px-3 py-2 text-[12px]" },
+                  start
+                    ? /* @__PURE__ */ React.createElement("span", { className: "text-slate-700" }, fmtDay(start), /* @__PURE__ */ React.createElement("div", { className: "text-[10px] text-slate-400" }, "set by hand"))
+                    : ft === null
+                      ? /* @__PURE__ */ React.createElement("span", { className: "text-slate-300" }, "…")
+                      : ft
+                        ? /* @__PURE__ */ React.createElement("span", { className: "text-slate-600" }, fmtDay(ft), /* @__PURE__ */ React.createElement("div", { className: "text-[10px] text-slate-400" }, "first trade"))
+                        : /* @__PURE__ */ React.createElement("span", { className: "text-amber-600" }, "no trade yet")
+                ),
+                isAdmin && /* @__PURE__ */ React.createElement("td", { className: "px-3 py-2 text-right" },
+                  /* @__PURE__ */ React.createElement(IconBtn, { title: "More billing details", onClick: () => setEditing({ ...(p || { code: c.code, name: c.name || c.code, residency: "Resident", status: "Active" }), _clientName: c.name || c.code, _firstTrade: ft }) }, /* @__PURE__ */ React.createElement(Edit3, { size: 15 }))
+                )
+              );
+            }),
+            !rows.length && /* @__PURE__ */ React.createElement("tr", null, /* @__PURE__ */ React.createElement("td", { colSpan: isAdmin ? 7 : 5, className: "px-3 py-10 text-center text-slate-400 text-sm" }, Object.keys(db.clients || {}).length ? "No client matches that search." : "No clients yet — import them under Upload Data first."))
+          )
+        )
+      )
+    ),
+    /* @__PURE__ */ React.createElement("p", { className: "text-[11px] text-slate-400" }, "“Billing starts” is the first executed trade found on the account, which is what a new client's first quarter is charged from. Set it by hand only to override that — for an account transferred in with history, or a fee holiday."),
+    editing && /* @__PURE__ */ React.createElement(BillingProfileEditor, {
+      draft: editing, busy,
+      onCancel: () => setEditing(null),
+      onSave: async (d) => { await saveProfile(d.code, d); setEditing(null); showToast("Billing details saved."); }
+    })
+  );
+}
+function BillingProfileEditor({ draft, busy, onSave, onCancel }) {
+  const [f, setF] = useState(draft);
+  const set = (k, v) => setF((x) => ({ ...x, [k]: v }));
+  const inCls = "w-full px-3 py-2 text-sm border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500";
+  const lbl = "text-[11px] text-slate-500 block mb-1";
+  return /* @__PURE__ */ React.createElement("div", { className: "fixed inset-0 bg-black/40 z-40 flex items-center justify-center p-4", onClick: onCancel },
+    /* @__PURE__ */ React.createElement("div", { className: "bg-white rounded-2xl w-full max-w-lg p-5 max-h-[90vh] overflow-y-auto", onClick: (e) => e.stopPropagation() },
+      /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-2 mb-1" },
+        /* @__PURE__ */ React.createElement("h3", { className: "text-sm font-semibold text-slate-800" }, "Billing details — ", f._clientName || f.code),
+        /* @__PURE__ */ React.createElement("button", { onClick: onCancel, className: "ml-auto text-slate-400 hover:text-slate-600" }, /* @__PURE__ */ React.createElement(X, { size: 18 }))
+      ),
+      /* @__PURE__ */ React.createElement("p", { className: "text-[11px] text-slate-400 mb-4" }, "Client code ", f.code),
+      /* @__PURE__ */ React.createElement("div", { className: "space-y-3" },
+        /* @__PURE__ */ React.createElement("div", null,
+          /* @__PURE__ */ React.createElement("label", { className: lbl }, "GSTIN (only if the client is registered)"),
+          /* @__PURE__ */ React.createElement("input", { value: f.gstin || "", onChange: (e) => set("gstin", e.target.value.toUpperCase()), placeholder: "22AAAAA0000A1Z5", className: inCls })
+        ),
+        /* @__PURE__ */ React.createElement("div", null,
+          /* @__PURE__ */ React.createElement("label", { className: lbl }, "Billing start date — overrides the first trade"),
+          /* @__PURE__ */ React.createElement("input", { type: "date", value: f.billingStart || "", onChange: (e) => set("billingStart", e.target.value), className: inCls }),
+          /* @__PURE__ */ React.createElement("div", { className: "text-[11px] text-slate-400 mt-1" },
+            f._firstTrade ? `First executed trade on record: ${fmtDay(f._firstTrade)}. Leave this blank to bill from there.` : "No executed trade found on this account yet. Without a date here the client is not billed.")
+        ),
+        /* @__PURE__ */ React.createElement("div", null,
+          /* @__PURE__ */ React.createElement("label", { className: lbl }, "Billing email — leave blank to use the client's usual email"),
+          /* @__PURE__ */ React.createElement("input", { value: f.email || "", onChange: (e) => set("email", e.target.value), placeholder: "accounts@example.com", className: inCls })
+        ),
+        /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-2 gap-3" },
+          /* @__PURE__ */ React.createElement("div", null,
+            /* @__PURE__ */ React.createElement("label", { className: lbl }, "Billing status"),
+            /* @__PURE__ */ React.createElement("select", { value: f.status || "Active", onChange: (e) => set("status", e.target.value), className: inCls },
+              ["Active", "Inactive"].map((x) => /* @__PURE__ */ React.createElement("option", { key: x, value: x }, x)))
+          ),
+          /* @__PURE__ */ React.createElement("div", null,
+            /* @__PURE__ */ React.createElement("label", { className: lbl }, "Residency"),
+            /* @__PURE__ */ React.createElement("select", { value: f.residency || "Resident", onChange: (e) => set("residency", e.target.value), className: inCls },
+              ["Resident", "NRI"].map((x) => /* @__PURE__ */ React.createElement("option", { key: x, value: x }, x)))
+          )
+        ),
+        /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-2 gap-3" },
+          /* @__PURE__ */ React.createElement("div", null,
+            /* @__PURE__ */ React.createElement("label", { className: lbl }, "State of residence"),
+            /* @__PURE__ */ React.createElement("select", { value: f.state || "", onChange: (e) => set("state", e.target.value), className: inCls },
+              /* @__PURE__ */ React.createElement("option", { value: "" }, "— not set —"),
+              INDIAN_STATES.map((x) => /* @__PURE__ */ React.createElement("option", { key: x, value: x }, x)))
+          ),
+          (f.residency === "NRI") && /* @__PURE__ */ React.createElement("div", null,
+            /* @__PURE__ */ React.createElement("label", { className: lbl }, "Permanent residence state"),
+            /* @__PURE__ */ React.createElement("select", { value: f.permanentState || "", onChange: (e) => set("permanentState", e.target.value), className: inCls },
+              /* @__PURE__ */ React.createElement("option", { value: "" }, "— not set —"),
+              INDIAN_STATES.map((x) => /* @__PURE__ */ React.createElement("option", { key: x, value: x })),
+              /* @__PURE__ */ React.createElement("option", { value: OUTSIDE_INDIA }, OUTSIDE_INDIA))
+          )
+        ),
+        /* @__PURE__ */ React.createElement("div", { className: "text-[12px] text-slate-600 bg-slate-50 border border-slate-200 rounded-lg px-3 py-2" },
+          "GST will be charged on a place of supply of ", /* @__PURE__ */ React.createElement("b", null, placeOfSupplyFor(f) || "— not set —"),
+          f.residency === "NRI" ? " (an NRI's permanent Indian address, or an export if they are outside India)." : "."),
+        /* @__PURE__ */ React.createElement("div", null,
+          /* @__PURE__ */ React.createElement("label", { className: lbl }, "Notes"),
+          /* @__PURE__ */ React.createElement("input", { value: f.notes || "", onChange: (e) => set("notes", e.target.value), className: inCls })
+        )
+      ),
+      /* @__PURE__ */ React.createElement("div", { className: "flex gap-2 mt-5" },
+        /* @__PURE__ */ React.createElement("button", { onClick: () => onSave(f), disabled: busy, className: "flex-1 bg-indigo-600 hover:bg-indigo-700 text-white text-sm py-2.5 rounded-lg disabled:opacity-50" }, busy ? "Saving…" : "Save"),
+        /* @__PURE__ */ React.createElement("button", { onClick: onCancel, className: "px-4 text-sm text-slate-500 hover:text-slate-700" }, "Cancel")
+      )
+    )
+  );
+}
+// The quarter's bills. Opens on the quarter that has just closed and generates it if
+// that has not happened yet, which is what "billed on the first day of the quarter"
+// comes to in a console that only runs while someone has it open.
+function BillingInvoices({ db, user, commit, showToast }) {
+  const isAdmin = user?.role === "admin";
+  const st = billingSettingsOf(db);
+  const [periodKey, setPeriodKey] = useState(() => prevQuarter(new Date()).key);
+  const [busy, setBusy] = useState(false);
+  const [firstTrades, setFirstTrades] = useState(null);
+  const [lastRun, setLastRun] = useState(null);
+  const [viewing, setViewing] = useState(null);
+  const [paying, setPaying] = useState(null);
+  const [waOpen, setWaOpen] = useState(false);
+  const [sentWA, setSentWA] = useState(() => /* @__PURE__ */ new Set());
+  const ranRef = useRef("");
+
+  // The last eight closed quarters, so an older period can be re-opened or corrected.
+  const periods = useMemo(() => {
+    const out = [];
+    let d = new Date();
+    for (let i = 0; i < 8; i++) {
+      const qq = prevQuarter(d);
+      out.push(qq);
+      d = new Date(qq.from.getTime() - DAY_MS);
+    }
+    return out;
+  }, []);
+  const quarter = useMemo(() => periods.find((x) => x.key === periodKey) || periods[0], [periods, periodKey]);
+  const invoices = useMemo(() => Object.values(db.invoices || {}).filter((x) => x.period === periodKey)
+    .sort((a, b) => String(a.no).localeCompare(String(b.no), "en", { numeric: true })), [db.invoices, periodKey]);
+
+  const effOfLocal = (h) => effOf(h, db.prices);
+  const cashCodeL = db.cashCode || {};
+  const auaOf = (c) => {
+    let v = 0;
+    for (const h of Object.values(c.holdings || {})) if (num(h.quantity) > 0) v += effOfLocal(h).current;
+    return v + num(cashCodeL[String(c.code || "").trim()]);
+  };
+
+  useEffect(() => {
+    const url = (db.sheetUrl || "").trim();
+    if (!url) { setFirstTrades({}); return; }
+    let dead = false;
+    pullFirstTrades(url).then((f) => { if (!dead) setFirstTrades(f); }).catch(() => { if (!dead) setFirstTrades({}); });
+    return () => { dead = true; };
+  }, [db.sheetUrl]);
+
+  const runQuarter = (quiet) => {
+    const res = buildQuarterRun({
+      quarter, clients: db.clients, profiles: db.billingProfiles, plans: db.feePlans,
+      firstTrades: firstTrades || {}, settings: st, existing: db.invoices, auaOf
+    });
+    setLastRun(res);
+    return res;
+  };
+  const generate = async (quiet) => {
+    const res = runQuarter();
+    if (!res.bills.length) {
+      if (!quiet) showToast(res.repeats.length ? "Every eligible client already has a bill for this quarter." : "Nothing to bill for this quarter.", "err");
+      return res;
+    }
+    const at = Date.now();
+    const recs = res.bills.map((b) => ({ ...b, issuedAt: at, updatedAt: at }));
+    setBusy(true);
+    try {
+      const next = await commit((d) => {
+        const all = { ...d.invoices || {} };
+        for (const r of recs) all[r.id] = r;
+        d.invoices = all;
+        d.lastBillRun = quarter.key;
+      }, "generate quarter bills");
+      await pushInvoices(next, recs);
+    } finally { setBusy(false); }
+    showToast(`${recs.length} bill(s) generated for ${quarter.label}. Nothing has been emailed yet.`);
+    return res;
+  };
+  // Auto-generate once per quarter, the first time the console is opened after it
+  // closes. Nothing is sent by this - the bills just exist, ready to review.
+  useEffect(() => {
+    if (!isAdmin || firstTrades === null || busy) return;
+    if (periodKey !== prevQuarter(new Date()).key) return;
+    if (ranRef.current === periodKey) return;
+    if ((db.lastBillRun || "") === periodKey) { ranRef.current = periodKey; runQuarter(); return; }
+    if (!Object.keys(db.feePlans || {}).length || !Object.keys(db.billingProfiles || {}).length) return;
+    ranRef.current = periodKey;
+    generate(true);
+  }, [isAdmin, firstTrades, periodKey, db.lastBillRun, db.feePlans, db.billingProfiles, busy]);
+  useEffect(() => { if (firstTrades !== null) runQuarter(); }, [firstTrades, periodKey, db.invoices, db.billingProfiles, db.feePlans]);
+
+  const saveInvoices = async (recs, label) => {
+    const next = await commit((d) => {
+      const all = { ...d.invoices || {} };
+      for (const r of recs) all[r.id] = r;
+      d.invoices = all;
+    }, label);
+    await pushInvoices(next, recs);
+    return next;
+  };
+  const unsent = invoices.filter((x) => !x.emailedAt && String(x.email || "").includes("@") && x.status !== "Cancelled");
+  const emailThese = async (list) => {
+    const withEmail = list.filter((x) => String(x.email || "").includes("@"));
+    if (!withEmail.length) { showToast("None of those have an email address on file.", "err"); return; }
+    setBusy(true);
+    const r = await sendBillingEmail(db, withEmail.map((inv) => ({
+      email: inv.email,
+      subject: `Investment advisory fee — ${fmtDay(inv.from)} to ${fmtDay(inv.to)} — invoice ${inv.no}`,
+      html: invoiceHtml(inv, st),
+      text: `Your investment advisory fee bill for ${fmtDay(inv.from)} to ${fmtDay(inv.to)} is ${rupee(inv.total)} (invoice ${inv.no}).`
+    })), st.upiQr);
+    if (r.ok) {
+      // Only the addresses Gmail actually accepted are marked as mailed. An older
+      // backend does not report them, and there the count is all we have to go on.
+      const at = Date.now();
+      const took = r.sentTo ? new Set(r.sentTo.map((x) => String(x).toLowerCase())) : null;
+      const done = took ? withEmail.filter((x) => took.has(String(x.email).toLowerCase())) : withEmail;
+      if (done.length) await saveInvoices(done.map((x) => ({ ...x, emailedAt: at, updatedAt: at })), "email bills");
+    }
+    setBusy(false);
+    showToast(r.msg, r.ok ? "ok" : "err");
+  };
+  const markPaid = async (inv, form) => {
+    const at = Date.now();
+    const no = docNo(st.receiptPrefix, quarter.fyLabel, 0,
+      nextDocSeq(Object.values(db.invoices || {}).map((x) => (x.receipt || {}).no), st.receiptPrefix, quarter.fyLabel));
+    const rec = { ...inv, status: "Paid", updatedAt: at,
+      receipt: { no, paidOn: form.paidOn, mode: form.mode, ref: form.ref, at, by: user?.name || "staff" } };
+    setBusy(true);
+    try { await saveInvoices([rec], "record payment"); } finally { setBusy(false); }
+    setPaying(null);
+    showToast(`Receipt ${no} created, dated today.`);
+  };
+  const removeInvoice = async (inv) => {
+    if (!window.confirm(`Delete bill ${inv.no} for ${inv.name}? Do this only if it was generated in error — to void a bill you have already sent, mark it cancelled instead.`)) return;
+    setBusy(true);
+    try {
+      const next = await commit((d) => {
+        const all = { ...d.invoices || {} };
+        delete all[inv.id];
+        d.invoices = all;
+      }, "delete bill");
+      await deleteInvoiceOnSheet(next, inv.id);
+    } finally { setBusy(false); }
+    showToast("Bill deleted.");
+  };
+  const cancelInvoice = async (inv) => {
+    if (!window.confirm(`Mark ${inv.no} cancelled? It stays on record with its number, and the client can be billed again for this quarter.`)) return;
+    await saveInvoices([{ ...inv, status: "Cancelled", updatedAt: Date.now() }], "cancel bill");
+    showToast("Bill cancelled.");
+  };
+  const waList = invoices.filter((x) => x.status !== "Cancelled" && waNumber(waOf(db, x.code)));
+  const sendWaOne = (inv) => {
+    const n = waNumber(waOf(db, inv.code));
+    if (!n) { showToast("No WhatsApp number on file for this client.", "err"); return; }
+    window.open(waChatUrl(n, invoiceWaText(inv, st, inv.emailedAt ? new Date(inv.emailedAt) : new Date())), "_blank");
+    setSentWA((s2) => new Set(s2).add(inv.code));
+    saveInvoices([{ ...inv, waAt: Date.now(), updatedAt: Date.now() }], "whatsapp bill");
+  };
+  const exportRun = () => {
+    const rows = invoices.map((x) => ({
+      "Invoice no": x.no, "Client code": x.code, Client: x.name, Email: x.email, "Fee plan": x.planName,
+      From: x.from, To: x.to, Basis: x.basis, Days: x.days, "Days in quarter": x.daysInQuarter,
+      Fee: x.fee, "Place of supply": x.placeOfSupply, "GST mode": x.gstMode, CGST: x.cgst, SGST: x.sgst,
+      IGST: x.igst, Total: x.total, Status: x.status,
+      Emailed: x.emailedAt ? new Date(x.emailedAt).toLocaleString("en-IN") : "",
+      "Receipt no": (x.receipt || {}).no || "", "Paid on": (x.receipt || {}).paidOn || ""
+    }));
+    if (!rows.length) { showToast("Nothing to export.", "err"); return; }
+    downloadExcelRows(rows, `bills-${periodKey}`);
+  };
+
+  const totals = invoices.filter((x) => x.status !== "Cancelled").reduce((a, x) => ({
+    fee: a.fee + num(x.fee), tax: a.tax + num(x.cgst) + num(x.sgst) + num(x.igst), total: a.total + num(x.total)
+  }), { fee: 0, tax: 0, total: 0 });
+  const setupGaps = [];
+  if (!st.firmGstin) setupGaps.push("the firm's GSTIN");
+  if (!st.accountNo && !st.upiId) setupGaps.push("a bank account or UPI id to collect into");
+  const notYetRun = isAdmin && periodKey === prevQuarter(new Date()).key && !invoices.length;
+
+  return /* @__PURE__ */ React.createElement("div", { className: "space-y-3" },
+    /* @__PURE__ */ React.createElement("div", { className: "flex items-start justify-between gap-3 flex-wrap" },
+      /* @__PURE__ */ React.createElement("div", null,
+        /* @__PURE__ */ React.createElement("h2", { className: "text-lg font-semibold text-slate-800" }, "Invoices"),
+        /* @__PURE__ */ React.createElement("p", { className: "text-[12px] text-slate-500 max-w-3xl" }, "Fees are billed at the start of a quarter for the quarter just finished. A client who joined during the quarter is charged from their first executed trade, pro rata on days; everyone already on the books pays the full quarter.")
+      ),
+      /* @__PURE__ */ React.createElement("div", { className: "flex gap-2 flex-wrap items-center" },
+        /* @__PURE__ */ React.createElement("select", { value: periodKey, onChange: (e) => setPeriodKey(e.target.value), className: "px-3 py-2 text-sm border border-slate-200 rounded-lg bg-white" },
+          periods.map((x) => /* @__PURE__ */ React.createElement("option", { key: x.key, value: x.key }, x.label))),
+        isAdmin && /* @__PURE__ */ React.createElement("button", { onClick: () => generate(false), disabled: busy, className: "text-sm px-3 py-2 rounded-lg border border-slate-200 text-slate-600 hover:bg-slate-50 flex items-center gap-1.5 disabled:opacity-50" }, /* @__PURE__ */ React.createElement(RefreshCw, { size: 15 }), " Generate"),
+        isAdmin && /* @__PURE__ */ React.createElement("button", { onClick: () => emailThese(unsent), disabled: busy || !unsent.length, className: "text-sm px-4 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-700 text-white flex items-center gap-1.5 disabled:opacity-40" }, /* @__PURE__ */ React.createElement(Mail, { size: 15 }), " Email all unsent (", unsent.length, ")"),
+        /* @__PURE__ */ React.createElement("button", { onClick: () => setWaOpen((v) => !v), disabled: !waList.length, className: "text-sm px-3 py-2 rounded-lg border border-emerald-200 text-emerald-700 hover:bg-emerald-50 flex items-center gap-1.5 disabled:opacity-40" }, /* @__PURE__ */ React.createElement(MessageCircle, { size: 15 }), " WhatsApp (", waList.length, ")"),
+        /* @__PURE__ */ React.createElement("button", { onClick: exportRun, className: "text-sm px-3 py-2 rounded-lg border border-slate-200 text-slate-600 hover:bg-slate-50 flex items-center gap-1.5" }, /* @__PURE__ */ React.createElement(Download, { size: 15 }), " Excel")
+      )
+    ),
+    setupGaps.length > 0 && /* @__PURE__ */ React.createElement("div", { className: "text-[12px] text-amber-800 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2 flex gap-2" },
+      /* @__PURE__ */ React.createElement(AlertTriangle, { size: 14, className: "shrink-0 mt-0.5" }),
+      /* @__PURE__ */ React.createElement("span", null, "Bank & GST is missing ", setupGaps.join(" and "), ". Bills will still generate, but fill that in before you send any.")),
+    notYetRun && /* @__PURE__ */ React.createElement("div", { className: "text-[12px] text-slate-600 bg-slate-50 border border-slate-200 rounded-lg px-3 py-2" },
+      "No bills for ", quarter.label, " yet. They generate on their own the first time the console is opened after the quarter closes — or press Generate."),
+    invoices.length > 0 && /* @__PURE__ */ React.createElement("div", { className: "grid sm:grid-cols-4 gap-2" },
+      [["Bills", invoices.length], ["Fee", rupee(totals.fee)], ["GST", rupee(totals.tax)], ["Total billed", rupee(totals.total)]]
+        .map(([k, v]) => /* @__PURE__ */ React.createElement("div", { key: k, className: "bg-white border border-slate-200 rounded-xl px-3 py-2" },
+          /* @__PURE__ */ React.createElement("div", { className: "text-[10px] uppercase text-slate-400" }, k),
+          /* @__PURE__ */ React.createElement("div", { className: "text-sm font-semibold text-slate-800 tabular-nums" }, v)))),
+    /* @__PURE__ */ React.createElement("div", { className: "bg-white border border-slate-200 rounded-xl overflow-hidden" },
+      /* @__PURE__ */ React.createElement("div", { style: { maxHeight: "58vh", overflowY: "auto" } },
+        /* @__PURE__ */ React.createElement("table", { className: "w-full text-sm" },
+          /* @__PURE__ */ React.createElement("thead", { className: "bg-slate-50 text-slate-500 text-[11px] uppercase sticky top-0" },
+            /* @__PURE__ */ React.createElement("tr", null,
+              /* @__PURE__ */ React.createElement("th", { className: "text-left font-medium px-3 py-2" }, "Invoice"),
+              /* @__PURE__ */ React.createElement("th", { className: "text-left font-medium px-3 py-2" }, "Client"),
+              /* @__PURE__ */ React.createElement("th", { className: "text-left font-medium px-3 py-2" }, "Basis"),
+              /* @__PURE__ */ React.createElement("th", { className: "text-right font-medium px-3 py-2" }, "Fee"),
+              /* @__PURE__ */ React.createElement("th", { className: "text-right font-medium px-3 py-2" }, "GST"),
+              /* @__PURE__ */ React.createElement("th", { className: "text-right font-medium px-3 py-2" }, "Total"),
+              /* @__PURE__ */ React.createElement("th", { className: "text-left font-medium px-3 py-2" }, "Status"),
+              /* @__PURE__ */ React.createElement("th", { className: "text-right font-medium px-3 py-2" }, "")
+            )),
+          /* @__PURE__ */ React.createElement("tbody", { className: "divide-y divide-slate-100" },
+            invoices.map((x) => /* @__PURE__ */ React.createElement("tr", { key: x.id, className: x.status === "Cancelled" ? "opacity-45 line-through" : "" },
+              /* @__PURE__ */ React.createElement("td", { className: "px-3 py-2" },
+                /* @__PURE__ */ React.createElement("button", { onClick: () => setViewing(x), className: "text-indigo-600 hover:underline text-[12px]" }, x.no),
+                /* @__PURE__ */ React.createElement("div", { className: "text-[11px] text-slate-400" }, fmtDay(x.from), " – ", fmtDay(x.to))),
+              /* @__PURE__ */ React.createElement("td", { className: "px-3 py-2" },
+                /* @__PURE__ */ React.createElement("div", { className: "text-slate-800" }, x.name),
+                /* @__PURE__ */ React.createElement("div", { className: "text-[11px] text-slate-400" }, x.code, String(x.email || "").includes("@") ? "" : " · no email")),
+              /* @__PURE__ */ React.createElement("td", { className: "px-3 py-2 text-[12px]" },
+                x.basis === "Pro rata"
+                  ? /* @__PURE__ */ React.createElement("span", { className: "text-amber-700" }, "Pro rata", /* @__PURE__ */ React.createElement("div", { className: "text-[11px] text-slate-400" }, x.days, " of ", x.daysInQuarter, " days"))
+                  : /* @__PURE__ */ React.createElement("span", { className: "text-slate-500" }, "Full quarter")),
+              /* @__PURE__ */ React.createElement("td", { className: "px-3 py-2 text-right tabular-nums text-slate-700" }, rupee(x.fee)),
+              /* @__PURE__ */ React.createElement("td", { className: "px-3 py-2 text-right tabular-nums text-slate-600 text-[12px]" },
+                rupee(num(x.cgst) + num(x.sgst) + num(x.igst)),
+                /* @__PURE__ */ React.createElement("div", { className: `text-[10px] ${x.gstMode === "Not set" ? "text-rose-600" : "text-slate-400"}` }, x.gstMode)),
+              /* @__PURE__ */ React.createElement("td", { className: "px-3 py-2 text-right tabular-nums font-medium text-slate-800" }, rupee(x.total)),
+              /* @__PURE__ */ React.createElement("td", { className: "px-3 py-2" },
+                /* @__PURE__ */ React.createElement("span", { className: `text-[10px] px-1.5 py-0.5 rounded ${x.status === "Paid" ? "bg-emerald-50 text-emerald-700" : x.status === "Cancelled" ? "bg-slate-100 text-slate-500" : "bg-amber-50 text-amber-700"}` }, x.status),
+                /* @__PURE__ */ React.createElement("div", { className: "text-[10px] text-slate-400 mt-0.5" },
+                  x.emailedAt ? `mailed ${fmtDay(new Date(x.emailedAt))}` : "not mailed", x.waAt ? " · wa" : "")),
+              /* @__PURE__ */ React.createElement("td", { className: "px-3 py-2 text-right whitespace-nowrap" },
+                /* @__PURE__ */ React.createElement(IconBtn, { title: "View bill", onClick: () => setViewing(x) }, /* @__PURE__ */ React.createElement(Eye, { size: 15 })),
+                isAdmin && x.status !== "Cancelled" && /* @__PURE__ */ React.createElement(IconBtn, { title: x.emailedAt ? "Send again" : "Email this bill", tone: "mail", onClick: () => emailThese([x]) }, /* @__PURE__ */ React.createElement(Mail, { size: 15 })),
+                x.status !== "Cancelled" && /* @__PURE__ */ React.createElement(IconBtn, { title: "WhatsApp the client", tone: "wa", onClick: () => sendWaOne(x) }, /* @__PURE__ */ React.createElement(MessageCircle, { size: 15 })),
+                x.status === "Unpaid" && /* @__PURE__ */ React.createElement("button", { onClick: () => setPaying(x), className: "text-[11px] px-2 py-1 rounded-md border border-emerald-200 text-emerald-700 hover:bg-emerald-50 ml-1" }, "Mark paid"),
+                isAdmin && x.status !== "Paid" && /* @__PURE__ */ React.createElement(IconBtn, { title: x.emailedAt ? "Cancel this bill" : "Delete this bill", tone: "danger", onClick: () => x.emailedAt ? cancelInvoice(x) : removeInvoice(x) }, /* @__PURE__ */ React.createElement(Trash2, { size: 15 })))
+            )),
+            !invoices.length && /* @__PURE__ */ React.createElement("tr", null, /* @__PURE__ */ React.createElement("td", { colSpan: 8, className: "px-3 py-10 text-center text-slate-400 text-sm" }, "No bills for ", quarter.label, " yet."))
+          )
+        )
+      )
+    ),
+    waOpen && /* @__PURE__ */ React.createElement("div", { className: "bg-white border border-slate-200 rounded-xl p-3" },
+      /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-2 mb-2" },
+        /* @__PURE__ */ React.createElement("span", { className: "text-sm font-medium text-slate-700" }, "WhatsApp — one at a time"),
+        /* @__PURE__ */ React.createElement("span", { className: "text-[11px] text-slate-400 ml-auto" }, sentWA.size, " of ", waList.length, " opened")),
+      /* @__PURE__ */ React.createElement("p", { className: "text-[11px] text-slate-400 mb-2" }, "The message says the bill is in their inbox and how to pay. It does not repeat the bill itself."),
+      /* @__PURE__ */ React.createElement("div", { className: "border border-slate-200 rounded-lg divide-y divide-slate-100", style: { maxHeight: "40vh", overflowY: "auto" } },
+        waList.map((x) => /* @__PURE__ */ React.createElement("div", { key: x.id, className: "flex items-center gap-2 px-3 py-2" },
+          /* @__PURE__ */ React.createElement("div", { className: "min-w-0 flex-1" },
+            /* @__PURE__ */ React.createElement("div", { className: "text-sm text-slate-800 truncate flex items-center gap-1.5" }, sentWA.has(x.code) && /* @__PURE__ */ React.createElement(Check, { size: 13, className: "text-emerald-600 shrink-0" }), x.name),
+            /* @__PURE__ */ React.createElement("div", { className: "text-[11px] text-slate-400" }, waDisplay(waOf(db, x.code)), " · ", rupee(x.total), x.emailedAt ? "" : " · bill not emailed yet")),
+          /* @__PURE__ */ React.createElement("button", { onClick: () => sendWaOne(x), className: `text-xs px-2.5 py-1 rounded-md flex items-center gap-1.5 shrink-0 ${sentWA.has(x.code) ? "border border-emerald-200 text-emerald-700 bg-emerald-50" : "bg-emerald-600 hover:bg-emerald-700 text-white"}` },
+            /* @__PURE__ */ React.createElement(Send, { size: 12 }), " ", sentWA.has(x.code) ? "Again" : "Send")))
+      )),
+    lastRun && (lastRun.skipped.length > 0 || lastRun.repeats.length > 0) && /* @__PURE__ */ React.createElement("div", { className: "bg-white border border-slate-200 rounded-xl p-3" },
+      /* @__PURE__ */ React.createElement("div", { className: "text-sm font-medium text-slate-700 mb-1" }, "Not billed this quarter (", lastRun.skipped.length, ")"),
+      /* @__PURE__ */ React.createElement("p", { className: "text-[11px] text-slate-400 mb-2" }, "Fix the reason and press Generate again — only the newly eligible are added, nobody is billed twice."),
+      /* @__PURE__ */ React.createElement("div", { className: "space-y-1", style: { maxHeight: "30vh", overflowY: "auto" } },
+        lastRun.skipped.map((x) => /* @__PURE__ */ React.createElement("div", { key: x.code, className: "text-[12px] flex gap-2 flex-wrap" },
+          /* @__PURE__ */ React.createElement("span", { className: "text-slate-700 min-w-[180px]" }, x.name),
+          /* @__PURE__ */ React.createElement("span", { className: "text-slate-400" }, x.why))))),
+    viewing && /* @__PURE__ */ React.createElement(DocModal, {
+      title: `Bill ${viewing.no} — ${viewing.name}`, html: invoiceHtml(viewing, st), qr: st.upiQr,
+      onClose: () => setViewing(null),
+      actions: isAdmin && viewing.status !== "Cancelled" ? /* @__PURE__ */ React.createElement("button", { onClick: () => { emailThese([viewing]); setViewing(null); }, className: "text-xs px-2.5 py-1.5 rounded-md bg-indigo-600 text-white hover:bg-indigo-700" }, viewing.emailedAt ? "Send again" : "Email this bill") : null
+    }),
+    paying && /* @__PURE__ */ React.createElement(PaymentEntry, { inv: paying, busy, user, onCancel: () => setPaying(null), onSave: (f) => markPaid(paying, f) })
+  );
+}
+// Staff record the credit once it shows in the bank. The receipt is dated the day
+// this entry is made, which is what the firm is certifying; the day the money
+// actually moved is kept separately on the receipt.
+function PaymentEntry({ inv, busy, user, onSave, onCancel }) {
+  const [f, setF] = useState({ paidOn: ymd(new Date()), mode: "NEFT / IMPS", ref: "" });
+  const set = (k, v) => setF((x) => ({ ...x, [k]: v }));
+  const inCls = "w-full px-3 py-2 text-sm border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500";
+  const lbl = "text-[11px] text-slate-500 block mb-1";
+  return /* @__PURE__ */ React.createElement("div", { className: "fixed inset-0 bg-black/40 z-40 flex items-center justify-center p-4", onClick: onCancel },
+    /* @__PURE__ */ React.createElement("div", { className: "bg-white rounded-2xl w-full max-w-md p-5", onClick: (e) => e.stopPropagation() },
+      /* @__PURE__ */ React.createElement("h3", { className: "text-sm font-semibold text-slate-800 mb-1" }, "Record payment"),
+      /* @__PURE__ */ React.createElement("p", { className: "text-[12px] text-slate-500 mb-4" }, inv.name, " · ", inv.no, " · ", /* @__PURE__ */ React.createElement("b", { className: "text-slate-700" }, rupee(inv.total))),
+      /* @__PURE__ */ React.createElement("div", { className: "space-y-3" },
+        /* @__PURE__ */ React.createElement("div", null,
+          /* @__PURE__ */ React.createElement("label", { className: lbl }, "Credit appeared in the bank on"),
+          /* @__PURE__ */ React.createElement("input", { type: "date", value: f.paidOn, max: ymd(new Date()), onChange: (e) => set("paidOn", e.target.value), className: inCls })),
+        /* @__PURE__ */ React.createElement("div", null,
+          /* @__PURE__ */ React.createElement("label", { className: lbl }, "Mode"),
+          /* @__PURE__ */ React.createElement("select", { value: f.mode, onChange: (e) => set("mode", e.target.value), className: inCls },
+            ["NEFT / IMPS", "UPI", "RTGS", "Cheque", "Bank transfer", "Other"].map((x) => /* @__PURE__ */ React.createElement("option", { key: x, value: x }, x)))),
+        /* @__PURE__ */ React.createElement("div", null,
+          /* @__PURE__ */ React.createElement("label", { className: lbl }, "Bank reference / UTR"),
+          /* @__PURE__ */ React.createElement("input", { value: f.ref, onChange: (e) => set("ref", e.target.value), placeholder: "as it appears on the statement", className: inCls })),
+        /* @__PURE__ */ React.createElement("div", { className: "text-[12px] text-slate-500 bg-slate-50 border border-slate-200 rounded-lg px-3 py-2" },
+          "The receipt will be dated ", /* @__PURE__ */ React.createElement("b", { className: "text-slate-700" }, fmtDay(new Date())), " — today, the day this entry is made — and signed off as ", /* @__PURE__ */ React.createElement("b", { className: "text-slate-700" }, user?.name || "staff"), ".")
+      ),
+      /* @__PURE__ */ React.createElement("div", { className: "flex gap-2 mt-5" },
+        /* @__PURE__ */ React.createElement("button", { onClick: () => onSave(f), disabled: busy || !f.paidOn, className: "flex-1 bg-emerald-600 hover:bg-emerald-700 text-white text-sm py-2.5 rounded-lg disabled:opacity-50" }, busy ? "Saving…" : "Record payment & make receipt"),
+        /* @__PURE__ */ React.createElement("button", { onClick: onCancel, className: "px-4 text-sm text-slate-500 hover:text-slate-700" }, "Cancel"))
+    )
+  );
+}
+// Every payment staff have recorded, with the receipt that came out of it.
+function BillingReceipts({ db, user, commit, showToast }) {
+  const isAdmin = user?.role === "admin";
+  const st = billingSettingsOf(db);
+  const [q, setQ] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [viewing, setViewing] = useState(null);
+  const paid = useMemo(() => {
+    const needle = q.trim().toLowerCase();
+    return Object.values(db.invoices || {}).filter((x) => x.receipt && x.receipt.no)
+      .filter((x) => !needle || String(x.name).toLowerCase().includes(needle) || String(x.code).toLowerCase().includes(needle) || String(x.receipt.no).toLowerCase().includes(needle))
+      .sort((a, b) => num(b.receipt.at) - num(a.receipt.at));
+  }, [db.invoices, q]);
+  const total = paid.reduce((a, x) => a + num(x.total), 0);
+  const emailReceipt = async (inv) => {
+    if (!String(inv.email || "").includes("@")) { showToast("No email address on file for this client.", "err"); return; }
+    setBusy(true);
+    const r = await sendBillingEmail(db, [{
+      email: inv.email,
+      subject: `Receipt ${inv.receipt.no} — ${rupee(inv.total)} received against invoice ${inv.no}`,
+      html: receiptHtml(inv, st),
+      text: `Received with thanks ${rupee(inv.total)} towards invoice ${inv.no}. Receipt ${inv.receipt.no}.`
+    }], "");
+    setBusy(false);
+    showToast(r.msg, r.ok ? "ok" : "err");
+  };
+  const waReceipt = (inv) => {
+    const n = waNumber(waOf(db, inv.code));
+    if (!n) { showToast("No WhatsApp number on file for this client.", "err"); return; }
+    window.open(waChatUrl(n, receiptWaText(inv, st)), "_blank");
+  };
+  const exportAll = () => {
+    const rows = paid.map((x) => ({
+      "Receipt no": x.receipt.no, "Receipt date": ymd(new Date(x.receipt.at)), "Invoice no": x.no,
+      "Client code": x.code, Client: x.name, Period: x.period, Amount: x.total,
+      "Credited on": x.receipt.paidOn, Mode: x.receipt.mode, Reference: x.receipt.ref, "Entered by": x.receipt.by
+    }));
+    if (!rows.length) { showToast("Nothing to export.", "err"); return; }
+    downloadExcelRows(rows, "receipts");
+  };
+  return /* @__PURE__ */ React.createElement("div", { className: "space-y-3" },
+    /* @__PURE__ */ React.createElement("div", { className: "flex items-start justify-between gap-3 flex-wrap" },
+      /* @__PURE__ */ React.createElement("div", null,
+        /* @__PURE__ */ React.createElement("h2", { className: "text-lg font-semibold text-slate-800" }, "Receipts"),
+        /* @__PURE__ */ React.createElement("p", { className: "text-[12px] text-slate-500 max-w-3xl" }, "One receipt for every payment recorded against a bill. A receipt is dated the day staff entered the credit, not the day the money moved — both appear on it.")),
+      /* @__PURE__ */ React.createElement("div", { className: "flex gap-2 items-center flex-wrap" },
+        /* @__PURE__ */ React.createElement("div", { className: "relative" },
+          /* @__PURE__ */ React.createElement(Search, { size: 14, className: "absolute left-3 top-2.5 text-slate-400" }),
+          /* @__PURE__ */ React.createElement("input", { value: q, onChange: (e) => setQ(e.target.value), placeholder: "Search receipts", className: "pl-9 pr-3 py-2 text-sm border border-slate-200 rounded-lg w-56 focus:outline-none focus:ring-2 focus:ring-indigo-500" })),
+        /* @__PURE__ */ React.createElement("button", { onClick: exportAll, className: "text-sm px-3 py-2 rounded-lg border border-slate-200 text-slate-600 hover:bg-slate-50 flex items-center gap-1.5" }, /* @__PURE__ */ React.createElement(Download, { size: 15 }), " Excel"))),
+    /* @__PURE__ */ React.createElement("div", { className: "bg-white border border-slate-200 rounded-xl overflow-hidden" },
+      /* @__PURE__ */ React.createElement("div", { className: "px-3 py-2 border-b border-slate-100 text-[12px] text-slate-500" }, paid.length, " receipt(s) · ", rupee(total), " collected"),
+      /* @__PURE__ */ React.createElement("div", { style: { maxHeight: "62vh", overflowY: "auto" } },
+        /* @__PURE__ */ React.createElement("table", { className: "w-full text-sm" },
+          /* @__PURE__ */ React.createElement("thead", { className: "bg-slate-50 text-slate-500 text-[11px] uppercase sticky top-0" },
+            /* @__PURE__ */ React.createElement("tr", null,
+              /* @__PURE__ */ React.createElement("th", { className: "text-left font-medium px-3 py-2" }, "Receipt"),
+              /* @__PURE__ */ React.createElement("th", { className: "text-left font-medium px-3 py-2" }, "Client"),
+              /* @__PURE__ */ React.createElement("th", { className: "text-left font-medium px-3 py-2" }, "Against"),
+              /* @__PURE__ */ React.createElement("th", { className: "text-right font-medium px-3 py-2" }, "Amount"),
+              /* @__PURE__ */ React.createElement("th", { className: "text-left font-medium px-3 py-2" }, "Credited"),
+              /* @__PURE__ */ React.createElement("th", { className: "text-right font-medium px-3 py-2" }, ""))),
+          /* @__PURE__ */ React.createElement("tbody", { className: "divide-y divide-slate-100" },
+            paid.map((x) => /* @__PURE__ */ React.createElement("tr", { key: x.id },
+              /* @__PURE__ */ React.createElement("td", { className: "px-3 py-2" },
+                /* @__PURE__ */ React.createElement("button", { onClick: () => setViewing(x), className: "text-indigo-600 hover:underline text-[12px]" }, x.receipt.no),
+                /* @__PURE__ */ React.createElement("div", { className: "text-[11px] text-slate-400" }, "dated ", fmtDay(new Date(x.receipt.at)))),
+              /* @__PURE__ */ React.createElement("td", { className: "px-3 py-2" },
+                /* @__PURE__ */ React.createElement("div", { className: "text-slate-800" }, x.name),
+                /* @__PURE__ */ React.createElement("div", { className: "text-[11px] text-slate-400" }, x.code)),
+              /* @__PURE__ */ React.createElement("td", { className: "px-3 py-2 text-[12px] text-slate-500" }, x.no,
+                /* @__PURE__ */ React.createElement("div", { className: "text-[11px] text-slate-400" }, fmtDay(x.from), " – ", fmtDay(x.to))),
+              /* @__PURE__ */ React.createElement("td", { className: "px-3 py-2 text-right tabular-nums text-slate-800" }, rupee(x.total)),
+              /* @__PURE__ */ React.createElement("td", { className: "px-3 py-2 text-[12px] text-slate-500" }, fmtDay(x.receipt.paidOn),
+                /* @__PURE__ */ React.createElement("div", { className: "text-[11px] text-slate-400" }, x.receipt.mode, x.receipt.ref ? ` · ${x.receipt.ref}` : "", " · by ", x.receipt.by)),
+              /* @__PURE__ */ React.createElement("td", { className: "px-3 py-2 text-right whitespace-nowrap" },
+                /* @__PURE__ */ React.createElement(IconBtn, { title: "View receipt", onClick: () => setViewing(x) }, /* @__PURE__ */ React.createElement(Eye, { size: 15 })),
+                isAdmin && /* @__PURE__ */ React.createElement(IconBtn, { title: "Email the receipt", tone: "mail", onClick: () => emailReceipt(x) }, /* @__PURE__ */ React.createElement(Mail, { size: 15 })),
+                /* @__PURE__ */ React.createElement(IconBtn, { title: "WhatsApp the receipt", tone: "wa", onClick: () => waReceipt(x) }, /* @__PURE__ */ React.createElement(MessageCircle, { size: 15 }))))),
+            !paid.length && /* @__PURE__ */ React.createElement("tr", null, /* @__PURE__ */ React.createElement("td", { colSpan: 6, className: "px-3 py-10 text-center text-slate-400 text-sm" }, "No payments recorded yet. Mark a bill paid under Invoices and the receipt appears here."))))
+      )),
+    viewing && /* @__PURE__ */ React.createElement(DocModal, {
+      title: `Receipt ${viewing.receipt.no} — ${viewing.name}`, html: receiptHtml(viewing, st),
+      onClose: () => setViewing(null),
+      actions: isAdmin ? /* @__PURE__ */ React.createElement("button", { onClick: () => { emailReceipt(viewing); setViewing(null); }, disabled: busy, className: "text-xs px-2.5 py-1.5 rounded-md bg-indigo-600 text-white hover:bg-indigo-700 disabled:opacity-50" }, "Email the receipt") : null
+    })
+  );
+}
+// The firm's own GST details and the ONE account clients are told to pay into.
+function BillingSettingsSection({ db, user, commit, showToast }) {
+  const isAdmin = user?.role === "admin";
+  const [f, setF] = useState(() => billingSettingsOf(db));
+  const [busy, setBusy] = useState(false);
+  const [preview, setPreview] = useState(false);
+  useEffect(() => { setF(billingSettingsOf(db)); }, [db.billingSettings]);
+  const set = (k, v) => setF((x) => ({ ...x, [k]: v }));
+  const inCls = "w-full px-3 py-2 text-sm border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500 disabled:bg-slate-50";
+  const lbl = "text-[11px] text-slate-500 block mb-1";
+  // The QR travels to every device and gets inlined into the bill mail, so it is
+  // shrunk to something a Google Sheets cell and an email can both carry.
+  const pickQr = (file) => {
+    if (!file) return;
+    const rd = new FileReader();
+    rd.onload = () => {
+      const img = new Image();
+      img.onload = () => {
+        const side = Math.min(420, Math.max(img.width, img.height) || 420);
+        const cv = document.createElement("canvas");
+        cv.width = side; cv.height = side;
+        const cx = cv.getContext("2d");
+        cx.fillStyle = "#ffffff";
+        cx.fillRect(0, 0, side, side);
+        cx.drawImage(img, 0, 0, side, side);
+        const out = cv.toDataURL("image/png");
+        if (out.length > 44000) { showToast("That QR image is too large even after shrinking. Save it smaller and try again.", "err"); return; }
+        set("upiQr", out);
+        showToast("QR loaded. Press Save to keep it.");
+      };
+      img.onerror = () => showToast("That file could not be read as an image.", "err");
+      img.src = String(rd.result || "");
+    };
+    rd.readAsDataURL(file);
+  };
+  const save = async () => {
+    const row = { ...f, gstRate: num(f.gstRate), updatedAt: Date.now() };
+    setBusy(true);
+    try {
+      const next = await commit((d) => { d.billingSettings = row; }, "billing settings");
+      await pushBillingSettings(next, row);
+    } finally { setBusy(false); }
+    showToast("Billing settings saved.");
+  };
+  const fld = (k, label, ph, type) => /* @__PURE__ */ React.createElement("div", null,
+    /* @__PURE__ */ React.createElement("label", { className: lbl }, label),
+    /* @__PURE__ */ React.createElement("input", { type: type || "text", value: f[k] == null ? "" : f[k], onChange: (e) => set(k, e.target.value), placeholder: ph || "", disabled: !isAdmin, className: inCls }));
+  return /* @__PURE__ */ React.createElement("div", { className: "space-y-4 max-w-4xl" },
+    /* @__PURE__ */ React.createElement("div", null,
+      /* @__PURE__ */ React.createElement("h2", { className: "text-lg font-semibold text-slate-800" }, "Bank & GST"),
+      /* @__PURE__ */ React.createElement("p", { className: "text-[12px] text-slate-500" }, "What goes at the top of every bill, and the one account clients are told to pay into. Nothing else is ever printed on a bill.")),
+    /* @__PURE__ */ React.createElement(Card, { title: "The firm", icon: FileText },
+      /* @__PURE__ */ React.createElement("div", { className: "grid md:grid-cols-2 gap-3" },
+        fld("firmName", "Name on the bill"),
+        fld("address", "Address"),
+        /* @__PURE__ */ React.createElement("div", null,
+          /* @__PURE__ */ React.createElement("label", { className: lbl }, "State the firm is registered in"),
+          /* @__PURE__ */ React.createElement("select", { value: f.firmState || "", onChange: (e) => set("firmState", e.target.value), disabled: !isAdmin, className: inCls },
+            /* @__PURE__ */ React.createElement("option", { value: "" }, "— not set —"),
+            INDIAN_STATES.map((x) => /* @__PURE__ */ React.createElement("option", { key: x, value: x }, x))),
+          /* @__PURE__ */ React.createElement("div", { className: "text-[11px] text-slate-400 mt-1" }, "A client in this state is charged CGST + SGST; anywhere else in India is IGST.")),
+        /* @__PURE__ */ React.createElement("div", null,
+          /* @__PURE__ */ React.createElement("label", { className: lbl }, "GST rate on advisory fees (%)"),
+          /* @__PURE__ */ React.createElement("input", { type: "number", step: "0.5", value: f.gstRate, onChange: (e) => set("gstRate", e.target.value), disabled: !isAdmin, className: inCls }),
+          /* @__PURE__ */ React.createElement("div", { className: "text-[11px] text-slate-400 mt-1" }, "Split in half as CGST and SGST within the state. 18% is the usual rate.")),
+        fld("firmGstin", "GSTIN", "32AAAAA0000A1Z5"),
+        fld("pan", "PAN"),
+        fld("sebiReg", "SEBI RIA registration no."),
+        /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-2 gap-3" }, fld("invoicePrefix", "Invoice number prefix", "VIAS"), fld("receiptPrefix", "Receipt number prefix", "VIAS/R")))),
+    /* @__PURE__ */ React.createElement(Card, { title: "Where clients pay", icon: Receipt },
+      /* @__PURE__ */ React.createElement("p", { className: "text-[12px] text-slate-500 mb-3" }, "These details are printed on every bill and repeated in the WhatsApp note, with a line telling the client to pay nowhere else."),
+      /* @__PURE__ */ React.createElement("div", { className: "grid md:grid-cols-2 gap-3" },
+        fld("accountName", "Account name"), fld("bankName", "Bank"),
+        fld("accountNo", "Account number"), fld("ifsc", "IFSC"),
+        fld("branch", "Branch"), fld("upiId", "UPI id", "yourfirm@bank")),
+      /* @__PURE__ */ React.createElement("div", { className: "mt-4 flex items-start gap-4 flex-wrap" },
+        /* @__PURE__ */ React.createElement("div", null,
+          /* @__PURE__ */ React.createElement("label", { className: lbl }, "UPI QR code"),
+          f.upiQr
+            ? /* @__PURE__ */ React.createElement("img", { src: f.upiQr, alt: "UPI QR", className: "w-32 h-32 border border-slate-200 rounded-lg bg-white" })
+            : /* @__PURE__ */ React.createElement("div", { className: "w-32 h-32 border border-dashed border-slate-300 rounded-lg flex items-center justify-center text-[11px] text-slate-400 text-center px-2" }, "No QR yet")),
+        isAdmin && /* @__PURE__ */ React.createElement("div", { className: "flex flex-col gap-2 pt-5" },
+          /* @__PURE__ */ React.createElement("label", { className: "text-xs px-3 py-2 rounded-lg border border-slate-200 text-slate-600 hover:bg-slate-50 cursor-pointer inline-flex items-center gap-1.5" },
+            /* @__PURE__ */ React.createElement(Upload, { size: 14 }), " ", f.upiQr ? "Replace QR" : "Upload QR",
+            /* @__PURE__ */ React.createElement("input", { type: "file", accept: "image/*", className: "hidden", onChange: (e) => { pickQr(e.target.files && e.target.files[0]); e.target.value = ""; } })),
+          f.upiQr && /* @__PURE__ */ React.createElement("button", { onClick: () => set("upiQr", ""), className: "text-xs px-3 py-2 rounded-lg text-rose-600 hover:bg-rose-50 border border-rose-100" }, "Remove QR"),
+          /* @__PURE__ */ React.createElement("div", { className: "text-[11px] text-slate-400 max-w-[220px]" }, "Shrunk to 420px and sent as an inline image, so it shows in the mail rather than being stripped."))),
+      /* @__PURE__ */ React.createElement("div", { className: "mt-4" },
+        /* @__PURE__ */ React.createElement("label", { className: lbl }, "Note at the foot of the bill (optional)"),
+        /* @__PURE__ */ React.createElement("input", { value: f.notes || "", onChange: (e) => set("notes", e.target.value), disabled: !isAdmin, className: inCls }))),
+    isAdmin && /* @__PURE__ */ React.createElement("div", { className: "flex gap-2 items-center" },
+      /* @__PURE__ */ React.createElement("button", { onClick: save, disabled: busy, className: "bg-indigo-600 hover:bg-indigo-700 text-white text-sm px-5 py-2.5 rounded-lg disabled:opacity-50" }, busy ? "Saving…" : "Save billing settings"),
+      /* @__PURE__ */ React.createElement("button", { onClick: () => setPreview(true), className: "text-sm px-4 py-2.5 rounded-lg border border-slate-200 text-slate-600 hover:bg-slate-50" }, "Preview a sample bill"),
+      /* @__PURE__ */ React.createElement("span", { className: "text-[11px] text-slate-400" }, "Saved to the office sheet, so every device shows the same details.")),
+    preview && /* @__PURE__ */ React.createElement(DocModal, {
+      title: "Sample bill", qr: f.upiQr, onClose: () => setPreview(false),
+      html: invoiceHtml({
+        no: docNo(f.invoicePrefix || "VIAS", fyQuarter(new Date()).fyLabel, 1, 1), name: "Sample Client", code: "SAMPLE",
+        gstin: "", placeOfSupply: f.firmState, planName: "Fixed Fee 15000 Per Quarter", basis: "Full quarter",
+        from: ymd(prevQuarter(new Date()).from), to: ymd(prevQuarter(new Date()).to), days: 91, daysInQuarter: 91,
+        fee: 15e3, gstMode: "CGST + SGST", cgst: round2(15e3 * num(f.gstRate) / 200), sgst: round2(15e3 * num(f.gstRate) / 200),
+        igst: 0, total: round2(15e3 * (1 + num(f.gstRate) / 100)), issuedAt: Date.now()
+      }, { ...f, gstRate: num(f.gstRate) })
+    })
+  );
+}
+function FeePlanSetup({ db, user, commit, showToast }) {
   const isAdmin = user?.role === "admin";
   const [q, setQ] = useState("");
   const [editing, setEditing] = useState(null);
@@ -5969,6 +7455,48 @@ function App() {
       } catch (e) {
       }
       try {
+        const remoteBP = await pullBillingProfiles(url);
+        const curBP = await loadDB() || latest;
+        const mergedBP = { ...curBP.billingProfiles || {} };
+        let changedBP = false;
+        for (const [code, v] of Object.entries(remoteBP)) {
+          const mine = mergedBP[code];
+          if (mine && num(mine.updatedAt) >= num(v.updatedAt)) continue;
+          mergedBP[code] = v;
+          changedBP = true;
+        }
+        if (changedBP) await commit((d) => {
+          d.billingProfiles = mergedBP;
+        }, "team sync pull");
+      } catch (e) {
+      }
+      try {
+        const remoteBS = await pullBillingSettings(url);
+        const curBS = await loadDB() || latest;
+        if (remoteBS && num(remoteBS.updatedAt) > num((curBS.billingSettings || {}).updatedAt)) {
+          await commit((d) => {
+            d.billingSettings = remoteBS;
+          }, "team sync pull");
+        }
+      } catch (e) {
+      }
+      try {
+        const remoteIV = await pullInvoices(url);
+        const curIV = await loadDB() || latest;
+        const mergedIV = { ...curIV.invoices || {} };
+        let changedIV = false;
+        for (const [id, v] of Object.entries(remoteIV)) {
+          const mine = mergedIV[id];
+          if (mine && num(mine.updatedAt) >= num(v.updatedAt)) continue;
+          mergedIV[id] = v;
+          changedIV = true;
+        }
+        if (changedIV) await commit((d) => {
+          d.invoices = mergedIV;
+        }, "team sync pull");
+      } catch (e) {
+      }
+      try {
         const remoteX = await pullExecModes(url);
         const curX = await loadDB() || latest;
         const mode = { ...curX.execMode || {} }, at = { ...curX.execModeAt || {} };
@@ -6259,7 +7787,9 @@ function Console({ db, user, commit, undo, refreshPrices, onLogout }) {
     ...user.role === "admin" ? [{ id: "orders", label: "Advice Orders", icon: Send }] : [],
     { id: "pipeline", label: "Pipeline", icon: Contact },
     // Billing: everyone can see the fee plans, only the Principal Officer changes them.
-    { id: "billing", label: "Billing", icon: Receipt },
+    // The dot says a closed quarter has not been billed yet, so it is noticed without
+    // having to remember to open the tab on the first of the month.
+    { id: "billing", label: "Billing", icon: Receipt, dot: user.role === "admin" && Object.keys(db.billingProfiles || {}).length > 0 && (db.lastBillRun || "") !== prevQuarter(new Date()).key },
     // Upload Data and Settings change the shared data, so they are admin-only. Staff are view-only.
     ...user.role === "admin" ? [{ id: "upload", label: "Upload Data", icon: Upload }] : [],
     ...user.role === "admin" ? [{ id: "settings", label: "Settings", icon: Settings }] : []
@@ -6269,12 +7799,14 @@ function Console({ db, user, commit, undo, refreshPrices, onLogout }) {
     {
       key: t.id,
       onClick: () => setTab(t.id),
+      title: t.dot ? "A finished quarter has not been billed yet" : void 0,
       className: "px-3 py-1.5 rounded-lg text-sm flex items-center gap-1.5 vp-navtab",
       style: tab === t.id ? { background: VP_GOLD, color: VP_NAVY, fontWeight: 600 } : { color: "rgba(255,255,255,0.82)" }
     },
     /* @__PURE__ */ React.createElement(t.icon, { size: 15 }),
     " ",
-    t.label
+    t.label,
+    t.dot && /* @__PURE__ */ React.createElement("span", { "aria-hidden": "true", className: "w-1.5 h-1.5 rounded-full", style: { background: tab === t.id ? VP_NAVY : VP_GOLD } })
   ))), /* @__PURE__ */ React.createElement("div", { className: "ml-auto flex items-center gap-2" }, /* @__PURE__ */ React.createElement(
     "button",
     {

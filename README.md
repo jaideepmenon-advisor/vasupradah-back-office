@@ -123,12 +123,114 @@ Risk categories: `Low Risk`, `Medium to Low Risk`, `Medium to High Risk`,
 Client-facing messages (trade alerts, advice, portfolio statements) are
 stamped with the firm's SEBI RIA registration number.
 
-## Billing — fee plan setup
+## Billing
 
-The **Billing** tab is where the firm's fee plans live. It is the first piece of
-the billing module: everything that comes later (fee calculation, proforma,
-invoice, collection) hangs off a plan, so the list has to exist first and has to
-be the same on every device.
+The **Billing** tab runs the quarterly fee cycle end to end: fee plans, who is on
+which plan, the quarter's bills, sending them, and the receipt once the money
+lands. Five sections, in the order you use them.
+
+### How a quarter is billed
+
+Fees are billed **at the start of a quarter for the quarter just finished** —
+Apr–Jun is billed on 1 July. Quarters are Indian financial-year quarters
+(Q1 Apr–Jun, Q2 Jul–Sep, Q3 Oct–Dec, Q4 Jan–Mar) and invoice numbers run
+`VIAS/2026-27/Q1/001`, continuing across the year.
+
+Two kinds of client:
+
+- **Already on the books** — the full quarterly fee.
+- **Joined during the quarter** — charged **from the date of their first executed
+  trade**, pro rata on days. The date comes from the trade book itself: a
+  `?first_trades=1` endpoint scans the `Trades` and `ManualTrades` tabs on the
+  sheet and returns one date per client code, so the whole ~100k-row book never
+  has to travel to the browser. A client with no executed trade is **not billed**,
+  and the run says so by name.
+
+The pro rata is `quarterly fee × days billed ÷ days in that quarter`, on the real
+length of the quarter (91 days for Apr–Jun, 90 for Jan–Mar). A plan on any other
+frequency is converted first: monthly × 3, half-yearly ÷ 2, annual ÷ 4. A
+percentage-of-AUA plan is charged on the client's portfolio value plus cash.
+
+**Billing start** on a client's profile overrides the trade book — for an account
+transferred in with history, or a fee holiday.
+
+### GST
+
+The firm's own state is set in **Bank & GST**. Each client's **place of supply**
+decides the split:
+
+- same state as the firm → **CGST + SGST**, half the rate each
+- another Indian state → **IGST**, the full rate on one line
+- outside India → **zero-rated export**, no GST
+
+Both taxes appear as separate lines on the bill, and the halves are rounded so
+they add back to the exact tax.
+
+For an **NRI**, the place of supply is their **permanent residence state** — a
+field of its own on the billing profile, separate from where they live now —
+because that Indian address is what the place-of-supply rules look to. An NRI
+genuinely outside India can be marked as such and is zero-rated instead. A client
+with no state set is flagged rather than silently billed at nil.
+
+### Auto-generation
+
+The first time the console is opened after a quarter closes, that quarter's bills
+generate on their own — no click. A dot appears on the **Billing** tab in the nav
+until it has happened. Generating does **not** send anything: the bills sit there
+for you to look at, and nothing leaves until you press the email button.
+
+Re-running is safe. **Generate** only adds clients who do not already have a bill
+for that quarter, so you can fix a missing fee plan and run it again without
+billing anyone twice. A bill generated in error can be deleted; one already
+emailed is **cancelled** instead, keeping its number on record.
+
+### Sending
+
+- **Email all unsent** sends every bill in one click, one personalised mail per
+  client, each with its own amount, GST split and payment details. Individual
+  bills can be re-sent any time from the row or the preview.
+- **WhatsApp** opens each client's chat with a short note: the amount, that the
+  bill has gone to their registered email and on what date, and how to pay. It
+  deliberately does not repeat the bill itself.
+- Every bill can be viewed on screen and printed or saved as PDF.
+
+### Where clients pay
+
+**Bank & GST** holds the one account clients may pay into — account name, bank,
+number, IFSC, branch, UPI id and an uploaded **UPI QR**. It is printed on every
+bill and repeated in the WhatsApp note, each time with a line telling the client
+to pay nowhere else. The QR is shrunk to 420px and sent as an **inline image**,
+because Gmail strips `data:` URLs out of `<img src>`.
+
+### Payment and receipts
+
+When the credit shows in the bank, staff open the bill and **Mark paid**: the date
+the credit appeared, the mode, and the bank reference. That produces a numbered
+receipt whose **date is the day the entry was made** — the day the firm is
+certifying it, not the day the money moved; both dates appear on the receipt,
+along with who entered it. Receipts can be emailed or WhatsApped, singly or
+re-sent later, from the **Receipts** section.
+
+### What is stored where
+
+| Tab | Holds |
+| --- | --- |
+| `FeePlans` | the fee plans |
+| `BillingProfiles` | which plan each client is on, residency, state, permanent state, GSTIN, billing start |
+| `BillingSettings` | the firm's GST details and the one payee account, including the QR |
+| `Invoices` | every bill, its GST split, and its receipt once paid |
+
+All four sync newest-wins like the rest of the console. Everyone can see billing;
+only the Principal Officer can change plans, profiles, settings, or send.
+
+**This needs the updated backend deployed** — `?first_trades=1`,
+`?billing_profiles=1`, `?billing_settings=1`, `?invoices=1` and the matching
+POSTs, plus `billing_email`, all live in `Code.gs`.
+
+### Fee plan setup
+
+The firm's fee plans. Everything else in billing hangs off a plan, so the list
+has to exist before anything can be billed.
 
 Plans are stored in the Google Sheet's **`FeePlans`** tab
 (`id | Name | Mode | Amount | Frequency | Timing | GST | Status | Notes | Updated at`)
@@ -161,9 +263,6 @@ Everyone can see the fee plans; only the Principal Officer can create, edit or
 delete them. On an empty setup there's a one-click button to add the nine plans
 already in use. **Load from sheet** / **Save all to sheet** cover a restore or a
 bulk push.
-
-**This needs the updated backend deployed** — `?fee_plans=1` and the `fee_plans`
-POST live in `Code.gs`.
 
 ## Two client cohorts: email approval vs execute link
 

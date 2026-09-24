@@ -62,7 +62,7 @@ function setup() {
 
 function doGet(e) {
   var p = (e && e.parameter) || {};
-  if (!p.prices && !p.alerts && !p.trades && !p.holdings && !p.gridkey && !p.greeting_status && !p.advice_alerts && !p.advice_trace && !p.ping && !p.pipeline && !p.baskets && !p.manual_trades && !p.client_details && !p.exec_modes && !p.advice_contacts && !p.shorten && !p.dedupe && !p.gk_probe && !p.staff && !p.fee_plans) {
+  if (!p.prices && !p.alerts && !p.trades && !p.holdings && !p.gridkey && !p.greeting_status && !p.advice_alerts && !p.advice_trace && !p.ping && !p.pipeline && !p.baskets && !p.manual_trades && !p.client_details && !p.exec_modes && !p.advice_contacts && !p.shorten && !p.dedupe && !p.gk_probe && !p.staff && !p.fee_plans && !p.first_trades && !p.billing_profiles && !p.billing_settings && !p.invoices) {
     return ContentService.createTextOutput("Vasupradah backup endpoint is live (use POST from the console).");
   }
 
@@ -307,6 +307,69 @@ function doGet(e) {
     var fpsh = fpss.getSheetByName("FeePlans");
     if (!fpsh || fpsh.getLastRow() < 2) return ContentService.createTextOutput(JSON.stringify({ ok: true, rows: [] })).setMimeType(ContentService.MimeType.JSON);
     return ContentService.createTextOutput(JSON.stringify({ ok: true, rows: fpsh.getDataRange().getValues() })).setMimeType(ContentService.MimeType.JSON);
+  }
+
+  // Billing: per-client billing setup (which plan, which state, resident or NRI).
+  if (p.billing_profiles) {
+    var bpss = SpreadsheetApp.getActiveSpreadsheet();
+    var bpsh = bpss.getSheetByName("BillingProfiles");
+    if (!bpsh || bpsh.getLastRow() < 2) return ContentService.createTextOutput(JSON.stringify({ ok: true, rows: [] })).setMimeType(ContentService.MimeType.JSON);
+    return ContentService.createTextOutput(JSON.stringify({ ok: true, rows: bpsh.getDataRange().getValues() })).setMimeType(ContentService.MimeType.JSON);
+  }
+
+  // Billing: the firm's own GST registration and the ONE account clients may pay into.
+  if (p.billing_settings) {
+    var bsss = SpreadsheetApp.getActiveSpreadsheet();
+    var bssh = bsss.getSheetByName("BillingSettings");
+    if (!bssh || bssh.getLastRow() < 2) return ContentService.createTextOutput(JSON.stringify({ ok: true, rows: [] })).setMimeType(ContentService.MimeType.JSON);
+    return ContentService.createTextOutput(JSON.stringify({ ok: true, rows: bssh.getDataRange().getValues() })).setMimeType(ContentService.MimeType.JSON);
+  }
+
+  // Billing: issued invoices and their receipts. Optional ?period= narrows to one quarter.
+  if (p.invoices) {
+    var inss = SpreadsheetApp.getActiveSpreadsheet();
+    var insh = inss.getSheetByName("Invoices");
+    if (!insh || insh.getLastRow() < 2) return ContentService.createTextOutput(JSON.stringify({ ok: true, rows: [] })).setMimeType(ContentService.MimeType.JSON);
+    var inAll = insh.getDataRange().getValues();
+    var inWant = String(p.period || "").trim();
+    if (inWant) {
+      var inKeep = [inAll[0]];
+      for (var ii = 1; ii < inAll.length; ii++) if (String(inAll[ii][2]).trim() === inWant) inKeep.push(inAll[ii]);
+      inAll = inKeep;
+    }
+    return ContentService.createTextOutput(JSON.stringify({ ok: true, rows: inAll })).setMimeType(ContentService.MimeType.JSON);
+  }
+
+  // Billing: the earliest executed trade on each account, which is what a first
+  // quarter's fee is charged from. Scanning the whole book here and returning one
+  // date per client keeps this to a few KB instead of shipping ~100k trade rows.
+  if (p.first_trades) {
+    var ftFirst = {};
+    var ftNote = function (code, date) {
+      var c = String(code || "").trim();
+      var d = String(date || "").trim();
+      if (!c || !/^\d{4}-\d{2}-\d{2}$/.test(d)) return;
+      if (!ftFirst[c] || d < ftFirst[c]) ftFirst[c] = d;
+    };
+    try {
+      var ftRows = gkNormalizedTrades_();
+      for (var fti = 0; fti < ftRows.length; fti++) ftNote(ftRows[fti][1], ftRows[fti][0]);
+    } catch (eFt) { /* a broken Trades tab must not take the endpoint down */ }
+    // Trades keyed in by hand live in their own tab and count just the same.
+    try {
+      var ftss = SpreadsheetApp.getActiveSpreadsheet();
+      var ftsh = ftss.getSheetByName("ManualTrades");
+      if (ftsh && ftsh.getLastRow() > 1) {
+        var ftMv = ftsh.getDataRange().getValues();
+        var ftTz = Session.getScriptTimeZone();
+        for (var ftj = 1; ftj < ftMv.length; ftj++) {
+          var ftD = ftMv[ftj][1];
+          if (Object.prototype.toString.call(ftD) === "[object Date]") ftD = Utilities.formatDate(ftD, ftTz, "yyyy-MM-dd");
+          ftNote(ftMv[ftj][2], ftD);
+        }
+      }
+    } catch (eFt2) { /* same */ }
+    return ContentService.createTextOutput(JSON.stringify({ ok: true, first: ftFirst })).setMimeType(ContentService.MimeType.JSON);
   }
 
   if (p.exec_modes) {
@@ -729,6 +792,169 @@ function doPost(e) {
     }
     SpreadsheetApp.flush();
     return ContentService.createTextOutput("ok: fee plans +" + fAdd + " ~" + fUpd);
+  }
+
+  // --- Billing: per-client setup. Upsert by client code. ---
+  if (body.type === "billing_profiles") {
+    var bpHdr = ["Client code", "Name", "Fee plan id", "Fee plan", "Residency", "State", "Permanent state",
+      "GSTIN", "Billing start", "Billing email", "Status", "Notes", "Updated at"];
+    var bpss2 = SpreadsheetApp.getActiveSpreadsheet();
+    var bpsh2 = bpss2.getSheetByName("BillingProfiles");
+    if (!bpsh2) { bpsh2 = bpss2.insertSheet("BillingProfiles"); bpsh2.getRange(1, 1, 1, bpHdr.length).setValues([bpHdr]); }
+    if (bpsh2.getLastRow() < 1) bpsh2.getRange(1, 1, 1, bpHdr.length).setValues([bpHdr]);
+    var bpAll = bpsh2.getLastRow() > 1 ? bpsh2.getRange(2, 1, bpsh2.getLastRow() - 1, bpHdr.length).getValues() : [];
+
+    if (body.action === "delete") {
+      var bpDel = String(body.code || "").trim();
+      if (!bpDel) return ContentService.createTextOutput("error: delete needs a client code");
+      for (var bpd = 0; bpd < bpAll.length; bpd++) {
+        if (String(bpAll[bpd][0]).trim() === bpDel) {
+          bpsh2.deleteRow(bpd + 2); SpreadsheetApp.flush();
+          return ContentService.createTextOutput("ok: billing profile deleted");
+        }
+      }
+      return ContentService.createTextOutput("ok: billing profile not found");
+    }
+
+    var bpIn = Array.isArray(body.rows) ? body.rows : [];
+    var bpAdd = 0, bpUpd = 0;
+    for (var bpi = 0; bpi < bpIn.length; bpi++) {
+      var bpr = bpIn[bpi] || {};
+      var bpCode = String(bpr.code || "").trim();
+      if (!bpCode) continue;
+      var bpRow = [bpCode, String(bpr.name || ""), String(bpr.planId || ""), String(bpr.planName || ""),
+        String(bpr.residency || ""), String(bpr.state || ""), String(bpr.permanentState || ""),
+        String(bpr.gstin || ""), String(bpr.billingStart || ""), String(bpr.email || ""),
+        String(bpr.status || ""), String(bpr.notes || ""), Number(bpr.updatedAt) || Date.now()];
+      var bpHit = -1;
+      for (var bpj = 0; bpj < bpAll.length; bpj++) if (String(bpAll[bpj][0]).trim() === bpCode) { bpHit = bpj; break; }
+      if (bpHit >= 0) { bpsh2.getRange(bpHit + 2, 1, 1, bpHdr.length).setValues([bpRow]); bpAll[bpHit] = bpRow; bpUpd++; }
+      else { bpsh2.appendRow(bpRow); bpAll.push(bpRow); bpAdd++; }
+    }
+    SpreadsheetApp.flush();
+    return ContentService.createTextOutput("ok: billing profiles +" + bpAdd + " ~" + bpUpd);
+  }
+
+  // --- Billing: the firm's GST details and the single account clients pay into.
+  //     One row, rewritten each time. The UPI QR is held as a data URL so the same
+  //     image reaches every device and can be inlined into the bill mail. ---
+  if (body.type === "billing_settings") {
+    var bsHdr = ["Firm name", "Firm state", "Firm GSTIN", "PAN", "SEBI reg", "Address", "GST rate",
+      "Bank name", "Account name", "Account number", "IFSC", "Branch", "UPI id", "UPI QR",
+      "Invoice prefix", "Receipt prefix", "Notes", "Updated at"];
+    var bsss2 = SpreadsheetApp.getActiveSpreadsheet();
+    var bssh2 = bsss2.getSheetByName("BillingSettings");
+    if (!bssh2) { bssh2 = bsss2.insertSheet("BillingSettings"); }
+    var bsIn = body.row || {};
+    var bsQr = String(bsIn.upiQr || "");
+    // A Google Sheets cell tops out at 50,000 characters. Rather than fail the whole
+    // save, drop an oversized QR and say so - the rest of the settings still land.
+    var bsQrNote = "";
+    if (bsQr.length > 45000) { bsQr = ""; bsQrNote = " (UPI QR too large to store - use a smaller image)"; }
+    var bsRow = [String(bsIn.firmName || ""), String(bsIn.firmState || ""), String(bsIn.firmGstin || ""),
+      String(bsIn.pan || ""), String(bsIn.sebiReg || ""), String(bsIn.address || ""), Number(bsIn.gstRate) || 0,
+      String(bsIn.bankName || ""), String(bsIn.accountName || ""), "'" + String(bsIn.accountNo || ""),
+      String(bsIn.ifsc || ""), String(bsIn.branch || ""), String(bsIn.upiId || ""), bsQr,
+      String(bsIn.invoicePrefix || ""), String(bsIn.receiptPrefix || ""), String(bsIn.notes || ""),
+      Number(bsIn.updatedAt) || Date.now()];
+    bssh2.clear();
+    bssh2.getRange(1, 1, 1, bsHdr.length).setValues([bsHdr]);
+    bssh2.getRange(2, 1, 1, bsHdr.length).setValues([bsRow]);
+    SpreadsheetApp.flush();
+    return ContentService.createTextOutput("ok: billing settings saved" + bsQrNote);
+  }
+
+  // --- Billing: issued invoices. Upsert by invoice id; an invoice is never removed
+  //     by a sync, only by an explicit delete (which is for a mistaken run, not for
+  //     cancelling a real bill - cancel sets the status instead). ---
+  if (body.type === "invoices") {
+    var ivHdr = ["id", "Invoice no", "Period", "Client code", "Client name", "Email", "Fee plan",
+      "From", "To", "Days billed", "Days in quarter", "Basis", "Fee", "GST mode", "CGST", "SGST", "IGST",
+      "Total", "Place of supply", "Status", "Issued at", "Emailed at", "WhatsApp at",
+      "Receipt no", "Paid on", "Paid mode", "Paid ref", "Receipt at", "Receipt by", "Updated at"];
+    var ivss2 = SpreadsheetApp.getActiveSpreadsheet();
+    var ivsh2 = ivss2.getSheetByName("Invoices");
+    if (!ivsh2) { ivsh2 = ivss2.insertSheet("Invoices"); ivsh2.getRange(1, 1, 1, ivHdr.length).setValues([ivHdr]); }
+    if (ivsh2.getLastRow() < 1) ivsh2.getRange(1, 1, 1, ivHdr.length).setValues([ivHdr]);
+    var ivAll = ivsh2.getLastRow() > 1 ? ivsh2.getRange(2, 1, ivsh2.getLastRow() - 1, ivHdr.length).getValues() : [];
+
+    if (body.action === "delete") {
+      var ivDel = String(body.id || "").trim();
+      if (!ivDel) return ContentService.createTextOutput("error: delete needs an id");
+      for (var ivd = 0; ivd < ivAll.length; ivd++) {
+        if (String(ivAll[ivd][0]).trim() === ivDel) {
+          ivsh2.deleteRow(ivd + 2); SpreadsheetApp.flush();
+          return ContentService.createTextOutput("ok: invoice deleted");
+        }
+      }
+      return ContentService.createTextOutput("ok: invoice not found");
+    }
+
+    var ivIn = Array.isArray(body.rows) ? body.rows : [];
+    var ivAdd = 0, ivUpd = 0;
+    for (var ivi = 0; ivi < ivIn.length; ivi++) {
+      var iv = ivIn[ivi] || {};
+      var ivId = String(iv.id || "").trim();
+      if (!ivId) continue;
+      var rcp = iv.receipt || {};
+      var ivRow = [ivId, String(iv.no || ""), String(iv.period || ""), String(iv.code || ""), String(iv.name || ""),
+        String(iv.email || ""), String(iv.planName || ""), String(iv.from || ""), String(iv.to || ""),
+        Number(iv.days) || 0, Number(iv.daysInQuarter) || 0, String(iv.basis || ""), Number(iv.fee) || 0,
+        String(iv.gstMode || ""), Number(iv.cgst) || 0, Number(iv.sgst) || 0, Number(iv.igst) || 0,
+        Number(iv.total) || 0, String(iv.placeOfSupply || ""), String(iv.status || ""),
+        Number(iv.issuedAt) || 0, Number(iv.emailedAt) || 0, Number(iv.waAt) || 0,
+        String(rcp.no || ""), String(rcp.paidOn || ""), String(rcp.mode || ""), String(rcp.ref || ""),
+        Number(rcp.at) || 0, String(rcp.by || ""), Number(iv.updatedAt) || Date.now()];
+      var ivHit = -1;
+      for (var ivj = 0; ivj < ivAll.length; ivj++) if (String(ivAll[ivj][0]).trim() === ivId) { ivHit = ivj; break; }
+      if (ivHit >= 0) { ivsh2.getRange(ivHit + 2, 1, 1, ivHdr.length).setValues([ivRow]); ivAll[ivHit] = ivRow; ivUpd++; }
+      else { ivsh2.appendRow(ivRow); ivAll.push(ivRow); ivAdd++; }
+    }
+    SpreadsheetApp.flush();
+    return ContentService.createTextOutput("ok: invoices +" + ivAdd + " ~" + ivUpd);
+  }
+
+  // --- Billing mail. Unlike the advice mail this takes ready-made HTML per
+  //     recipient, because a bill is a table (fee, CGST/SGST or IGST, total) rather
+  //     than a paragraph. The UPI QR rides along as an inline image, since Gmail
+  //     strips data: URLs out of <img src>. ---
+  if (body.type === "billing_email") {
+    var beList = Array.isArray(body.recipients) ? body.recipients : [];
+    var beFrom = String(body.fromName || "Vasupradah Investment Advisory");
+    var beReply = String(body.replyTo || "").trim();
+    var beQr = String(body.qr || "");
+    var beInline = null;
+    var beCut = beQr.indexOf("base64,");
+    if (beCut >= 0) {
+      var beMime = "image/png", beSemi = beQr.indexOf(";");
+      if (beQr.indexOf("data:") === 0 && beSemi > 5) beMime = beQr.substring(5, beSemi);
+      try { beInline = { upiqr: Utilities.newBlob(Utilities.base64Decode(beQr.substring(beCut + 7)), beMime, "upiqr") }; }
+      catch (eQr) { beInline = null; }
+    }
+    var beQuota = 0;
+    try { beQuota = MailApp.getRemainingDailyQuota(); } catch (eQ) { beQuota = 0; }
+    // Which addresses actually took the mail, so the console marks only those as
+    // sent. Marking a bill "mailed" when Gmail refused it would quietly lose it.
+    var beSentTo = [], beSkipped = 0, beFailed = 0, beSeen = {}, beSent = 0;
+    for (var bei = 0; bei < beList.length; bei++) {
+      var be = beList[bei] || {};
+      var beTo = String(be.email || "").trim().toLowerCase();
+      if (!beTo || beTo.indexOf("@") < 1 || beSeen[beTo]) { beSkipped++; continue; }
+      if (beSent >= beQuota) { beSkipped++; continue; }
+      beSeen[beTo] = true;
+      var beOpts = { name: beFrom, htmlBody: String(be.html || "") };
+      if (beInline) beOpts.inlineImages = beInline;
+      if (beReply) beOpts.replyTo = beReply;
+      try { MailApp.sendEmail(beTo, String(be.subject || "Your invoice"), String(be.text || ""), beOpts); beSentTo.push(beTo); beSent++; }
+      catch (eBe) {
+        if (beReply) {
+          delete beOpts.replyTo;
+          try { MailApp.sendEmail(beTo, String(be.subject || "Your invoice"), String(be.text || ""), beOpts); beSentTo.push(beTo); beSent++; }
+          catch (eBe2) { beFailed++; }
+        } else beFailed++;
+      }
+    }
+    return ContentService.createTextOutput(JSON.stringify({ ok: beSent > 0, sent: beSent, sentTo: beSentTo, skipped: beSkipped, failed: beFailed, quota: beQuota }));
   }
 
   if (body.type === "exec_modes") {
