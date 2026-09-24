@@ -62,7 +62,7 @@ function setup() {
 
 function doGet(e) {
   var p = (e && e.parameter) || {};
-  if (!p.prices && !p.alerts && !p.trades && !p.holdings && !p.gridkey && !p.greeting_status && !p.advice_alerts && !p.advice_trace && !p.ping && !p.pipeline && !p.baskets && !p.manual_trades && !p.client_details && !p.exec_modes && !p.advice_contacts && !p.shorten && !p.dedupe && !p.gk_probe && !p.staff && !p.fee_plans && !p.first_trades && !p.billing_profiles && !p.billing_settings && !p.invoices && !p.capgains && !p.gap_scan) {
+  if (!p.prices && !p.alerts && !p.trades && !p.holdings && !p.gridkey && !p.greeting_status && !p.advice_alerts && !p.advice_trace && !p.ping && !p.pipeline && !p.baskets && !p.manual_trades && !p.client_details && !p.exec_modes && !p.advice_contacts && !p.shorten && !p.dedupe && !p.gk_probe && !p.staff && !p.fee_plans && !p.first_trades && !p.billing_profiles && !p.billing_settings && !p.invoices && !p.capgains && !p.gap_scan && !p.mis) {
     return ContentService.createTextOutput("Vasupradah backup endpoint is live (use POST from the console).");
   }
 
@@ -656,6 +656,17 @@ function doGet(e) {
     })).setMimeType(ContentService.MimeType.JSON);
   }
 
+  // The weekly pipeline MIS, built here so the Saturday trigger can send it with
+  // nobody's browser open. ?mis=1 hands the same thing to the console for a preview.
+  if (p.mis) {
+    var misOn = String(p.on || "").trim();
+    var misData = misBuild_(misOn);
+    return ContentService.createTextOutput(JSON.stringify({
+      ok: true, mis: misData, html: misHtml_(misData), text: misText_(misData),
+      config: misConfig_(), tz: Session.getScriptTimeZone(), scheduled: misTriggerInfo_()
+    })).setMimeType(ContentService.MimeType.JSON);
+  }
+
   if (p.exec_modes) {
     var xss = SpreadsheetApp.getActiveSpreadsheet();
     var xsh = xss.getSheetByName("OrderMethod");
@@ -923,6 +934,419 @@ function doGet(e) {
   return ContentService.createTextOutput(JSON.stringify(out)).setMimeType(ContentService.MimeType.JSON);
 }
 
+/* ==================================================================
+ *  WEEKLY PIPELINE MIS
+ *
+ *  Built and sent from here rather than from the console, so the
+ *  Saturday mail goes out whether or not anyone has the app open.
+ *  Run setupMisTrigger() once from the editor, or switch it on from
+ *  the console (Pipeline -> Weekly MIS).
+ * ================================================================== */
+
+var MIS_DEFAULT_TO = ["jaideepmenon@vasupradah.com", "neelakantanpillai@vasupradah.com", "abhishakemathur@vasupradah.com"];
+var MIS_STAGES = [
+  ["new", "New Enquiry"], ["contacted", "Contacted"], ["awaiting", "Response Awaited"],
+  ["discovery", "Discovery / Assessment"], ["risk", "Risk Profiling"], ["proposal", "Proposal / Recommendation"],
+  ["agreement", "Agreement / Engagement"], ["kyc", "KYC / Onboarding"], ["signed", "Signed / Converted"],
+  ["hold", "On Hold"], ["lost", "Lost"]
+];
+
+function misConfig_() {
+  var pr = PropertiesService.getScriptProperties();
+  var raw = String(pr.getProperty("MIS_TO") || "").trim();
+  var to = raw ? raw.split(",").map(function (x) { return x.trim(); }).filter(function (x) { return x.indexOf("@") > 0; }) : MIS_DEFAULT_TO.slice();
+  var day = String(pr.getProperty("MIS_DAY") || "SATURDAY").toUpperCase();
+  var hour = parseInt(pr.getProperty("MIS_HOUR") || "10", 10);
+  if (isNaN(hour) || hour < 0 || hour > 23) hour = 10;
+  return { to: to, day: day, hour: hour };
+}
+function misTriggerInfo_() {
+  var found = null;
+  try {
+    var all = ScriptApp.getProjectTriggers();
+    for (var i = 0; i < all.length; i++) {
+      if (all[i].getHandlerFunction() === "sendPipelineMis") { found = all[i]; break; }
+    }
+  } catch (e) { /* no permission yet */ }
+  var c = misConfig_();
+  return { on: !!found, day: c.day, hour: c.hour, tz: Session.getScriptTimeZone() };
+}
+function misRemoveTriggers_() {
+  var all = ScriptApp.getProjectTriggers();
+  for (var i = 0; i < all.length; i++) {
+    if (all[i].getHandlerFunction() === "sendPipelineMis") ScriptApp.deleteTrigger(all[i]);
+  }
+}
+function misInstallTrigger_() {
+  misRemoveTriggers_();
+  var c = misConfig_();
+  var days = {
+    MONDAY: ScriptApp.WeekDay.MONDAY, TUESDAY: ScriptApp.WeekDay.TUESDAY, WEDNESDAY: ScriptApp.WeekDay.WEDNESDAY,
+    THURSDAY: ScriptApp.WeekDay.THURSDAY, FRIDAY: ScriptApp.WeekDay.FRIDAY, SATURDAY: ScriptApp.WeekDay.SATURDAY,
+    SUNDAY: ScriptApp.WeekDay.SUNDAY
+  };
+  ScriptApp.newTrigger("sendPipelineMis").timeBased().onWeekDay(days[c.day] || ScriptApp.WeekDay.SATURDAY).atHour(c.hour).create();
+  return misTriggerInfo_();
+}
+
+/** Run this ONCE from the editor to start the weekly mail. */
+function setupMisTrigger() {
+  var t = misInstallTrigger_();
+  var msg = "Weekly MIS is on: " + t.day + " around " + t.hour + ":00 " + t.tz + ", to " + misConfig_().to.join(", ");
+  Logger.log(msg);
+  return msg;
+}
+/** Run this to stop it. */
+function stopMisTrigger() {
+  misRemoveTriggers_();
+  return "Weekly MIS trigger removed.";
+}
+/** What the trigger calls. Also safe to run by hand to test. */
+function sendPipelineMis() {
+  var r = misSend_("", misConfig_().to);
+  Logger.log(JSON.stringify(r));
+  return r;
+}
+
+function misDayStr_(d) { return Utilities.formatDate(d, Session.getScriptTimeZone(), "yyyy-MM-dd"); }
+function misPretty_(ymd) {
+  var m = String(ymd || "").match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (!m) return String(ymd || "");
+  var mons = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+  return m[3] + " " + mons[parseInt(m[2], 10) - 1] + " " + m[1];
+}
+function misMoney_(n) {
+  var v = Number(n) || 0;
+  if (!v) return "-";
+  if (v >= 1e7) return "Rs " + (v / 1e7).toFixed(v % 1e7 ? 2 : 0) + " Cr";
+  if (v >= 1e5) return "Rs " + (v / 1e5).toFixed(v % 1e5 ? 2 : 0) + " L";
+  return "Rs " + Math.round(v).toLocaleString("en-IN");
+}
+function misPct_(a, b) { return b > 0 ? Math.round(a / b * 100) : 0; }
+
+/**
+ * Reads the Pipeline tab and works out the week's MIS. `on` is the report date
+ * (yyyy-mm-dd); the week is the seven days ending on it.
+ */
+function misBuild_(on) {
+  var tz = Session.getScriptTimeZone();
+  var today = /^\d{4}-\d{2}-\d{2}$/.test(String(on || "")) ? String(on) : misDayStr_(new Date());
+  var toD = new Date(today + "T00:00:00");
+  var fromD = new Date(toD.getTime() - 6 * 864e5);
+  var weekFrom = misDayStr_(fromD), weekTo = today;
+  var monthKey = today.slice(0, 7);
+  var fyStart = (parseInt(today.slice(5, 7), 10) >= 4 ? parseInt(today.slice(0, 4), 10) : parseInt(today.slice(0, 4), 10) - 1);
+  var fyFrom = fyStart + "-04-01";
+  var fyLabel = fyStart + "-" + String((fyStart + 1) % 100 < 10 ? "0" : "") + ((fyStart + 1) % 100);
+
+  var rows = [];
+  var sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName("Pipeline");
+  if (sh && sh.getLastRow() > 1) {
+    var v = sh.getDataRange().getValues();
+    var head = v[0].map(function (x) { return String(x).trim(); });
+    var ix = {};
+    for (var hi = 0; hi < head.length; hi++) ix[head[hi]] = hi;
+    var pick = function (row, key) {
+      var i = ix[key];
+      if (i == null) return "";
+      var val = row[i];
+      if (Object.prototype.toString.call(val) === "[object Date]") return Utilities.formatDate(val, tz, "yyyy-MM-dd");
+      return val == null ? "" : val;
+    };
+    for (var r = 1; r < v.length; r++) {
+      if (!String(v[r][0] || "").trim()) continue;
+      rows.push({
+        id: String(pick(v[r], "id")), name: String(pick(v[r], "name")).trim(),
+        phone: String(pick(v[r], "phone")).trim(), source: String(pick(v[r], "source")).trim() || "Not stated",
+        enquiryDate: String(pick(v[r], "enquiryDate")).slice(0, 10),
+        corpus: Number(String(pick(v[r], "corpus")).replace(/[^0-9.\-]/g, "")) || 0,
+        assignee: String(pick(v[r], "assignee")).trim() || "Unassigned",
+        stage: String(pick(v[r], "stage")).trim() || "new",
+        nextFollowUp: String(pick(v[r], "nextFollowUp")).slice(0, 10),
+        signedDate: String(pick(v[r], "signedDate")).slice(0, 10),
+        service: String(pick(v[r], "service")).trim() || "Not stated",
+        priority: String(pick(v[r], "priority")).trim(),
+        updatedAt: Number(pick(v[r], "updatedAt")) || 0
+      });
+    }
+  }
+
+  var isActive = function (x) { return x.stage !== "signed" && x.stage !== "lost"; };
+  var inWeek = function (d) { return d && d >= weekFrom && d <= weekTo; };
+  var active = [], signed = [], lost = [];
+  for (var i = 0; i < rows.length; i++) {
+    if (rows[i].stage === "signed") signed.push(rows[i]);
+    else if (rows[i].stage === "lost") lost.push(rows[i]);
+    else active.push(rows[i]);
+  }
+  var corpusOf = function (list) { var t = 0; for (var i2 = 0; i2 < list.length; i2++) t += list[i2].corpus; return t; };
+  var filt = function (list, fn) { var o = []; for (var i3 = 0; i3 < list.length; i3++) if (fn(list[i3])) o.push(list[i3]); return o; };
+
+  var newThisWeek = filt(rows, function (x) { return inWeek(x.enquiryDate); });
+  var signedThisWeek = filt(signed, function (x) { return inWeek(x.signedDate); });
+  var lostThisWeek = filt(lost, function (x) { return x.updatedAt && misDayStr_(new Date(x.updatedAt)) >= weekFrom && misDayStr_(new Date(x.updatedAt)) <= weekTo; });
+  var touchedThisWeek = filt(rows, function (x) { return x.updatedAt && misDayStr_(new Date(x.updatedAt)) >= weekFrom && misDayStr_(new Date(x.updatedAt)) <= weekTo; });
+  var overdue = filt(active, function (x) { return x.nextFollowUp && x.nextFollowUp <= today; });
+  var dueNext = filt(active, function (x) { return x.nextFollowUp && x.nextFollowUp > today && x.nextFollowUp <= misDayStr_(new Date(toD.getTime() + 7 * 864e5)); });
+  // Nothing done to it for a fortnight, and still open.
+  var stale = filt(active, function (x) { return !x.updatedAt || (toD.getTime() - x.updatedAt) > 14 * 864e5; });
+
+  var group = function (list, key) {
+    var m = {}, order = [];
+    for (var i4 = 0; i4 < list.length; i4++) {
+      var k = list[i4][key] || "Not stated";
+      if (!m[k]) { m[k] = { key: k, count: 0, corpus: 0, signed: 0, lost: 0 }; order.push(k); }
+      m[k].count++;
+      m[k].corpus += list[i4].corpus;
+      if (list[i4].stage === "signed") m[k].signed++;
+      if (list[i4].stage === "lost") m[k].lost++;
+    }
+    var out = [];
+    for (var oi = 0; oi < order.length; oi++) {
+      var g = m[order[oi]];
+      g.conv = misPct_(g.signed, g.signed + g.lost);
+      out.push(g);
+    }
+    out.sort(function (a, b) { return b.count - a.count; });
+    return out;
+  };
+  var funnel = [];
+  for (var si = 0; si < MIS_STAGES.length; si++) {
+    var st = MIS_STAGES[si][0];
+    var inSt = filt(rows, function (x) { return x.stage === st; });
+    funnel.push({ id: st, label: MIS_STAGES[si][1], count: inSt.length, corpus: corpusOf(inSt) });
+  }
+  var lite = function (list, n) {
+    var o = [];
+    for (var i5 = 0; i5 < Math.min(list.length, n || 50); i5++) {
+      var x = list[i5];
+      var days = x.nextFollowUp ? Math.round((toD - new Date(x.nextFollowUp + "T00:00:00")) / 864e5) : 0;
+      o.push({ name: x.name, phone: x.phone, stage: x.stage, stageLabel: misStageLabel_(x.stage),
+        assignee: x.assignee, corpus: x.corpus, source: x.source, service: x.service,
+        nextFollowUp: x.nextFollowUp, overdueDays: days, signedDate: x.signedDate, enquiryDate: x.enquiryDate });
+    }
+    return o;
+  };
+
+  return {
+    on: today, weekFrom: weekFrom, weekTo: weekTo, fyLabel: fyLabel, tz: tz,
+    total: rows.length,
+    activeCount: active.length, activeCorpus: corpusOf(active),
+    signedCount: signed.length, lostCount: lost.length,
+    conv: misPct_(signed.length, signed.length + lost.length),
+    signedThisMonth: filt(signed, function (x) { return String(x.signedDate).slice(0, 7) === monthKey; }).length,
+    signedThisFy: filt(signed, function (x) { return x.signedDate && x.signedDate >= fyFrom; }).length,
+    signedCorpusFy: corpusOf(filt(signed, function (x) { return x.signedDate && x.signedDate >= fyFrom; })),
+    week: {
+      newCount: newThisWeek.length, newCorpus: corpusOf(newThisWeek),
+      signedCount: signedThisWeek.length, signedCorpus: corpusOf(signedThisWeek),
+      lostCount: lostThisWeek.length, touched: touchedThisWeek.length,
+      newList: lite(newThisWeek, 25), signedList: lite(signedThisWeek, 25), lostList: lite(lostThisWeek, 25)
+    },
+    funnel: funnel,
+    bySource: group(rows, "source"),
+    byAdvisor: group(rows, "assignee"),
+    byService: group(rows, "service"),
+    overdue: lite(overdue.sort(function (a, b) { return String(a.nextFollowUp).localeCompare(String(b.nextFollowUp)); }), 40),
+    overdueCount: overdue.length,
+    dueNext: lite(dueNext.sort(function (a, b) { return String(a.nextFollowUp).localeCompare(String(b.nextFollowUp)); }), 40),
+    dueNextCount: dueNext.length,
+    stale: lite(stale.sort(function (a, b) { return (a.updatedAt || 0) - (b.updatedAt || 0); }), 25),
+    staleCount: stale.length
+  };
+}
+function misStageLabel_(id) {
+  for (var i = 0; i < MIS_STAGES.length; i++) if (MIS_STAGES[i][0] === id) return MIS_STAGES[i][1];
+  return id;
+}
+function misEsc_(v) {
+  return String(v == null ? "" : v).split("&").join("&amp;").split("<").join("&lt;").split(">").join("&gt;");
+}
+function misHtml_(m) {
+  var NAVY = "#1E2A78", GOLD = "#C9A24B";
+  var card = function (label, value, sub, tone) {
+    return '<td style="padding:6px"><div style="border:1px solid #e2e8f0;border-radius:10px;padding:10px 12px;background:#ffffff">'
+      + '<div style="font-size:10px;letter-spacing:.04em;text-transform:uppercase;color:#64748b">' + misEsc_(label) + '</div>'
+      + '<div style="font-size:19px;font-weight:bold;color:' + (tone || "#0f172a") + '">' + misEsc_(value) + '</div>'
+      + (sub ? '<div style="font-size:11px;color:#94a3b8">' + misEsc_(sub) + '</div>' : "") + '</div></td>';
+  };
+  var h2 = function (t) { return '<div style="font-size:13px;font-weight:bold;color:' + NAVY + ';margin:22px 0 8px">' + misEsc_(t) + '</div>'; };
+  var tbl = function (heads, rows, aligns) {
+    if (!rows.length) return '<div style="font-size:12px;color:#94a3b8;padding:6px 0">Nothing to report.</div>';
+    var out = '<table style="width:100%;border-collapse:collapse;font-size:12px"><tr style="background:#f1f5f9">';
+    for (var i = 0; i < heads.length; i++) {
+      out += '<th style="text-align:' + ((aligns && aligns[i]) || "left") + ';padding:6px 8px;font-size:11px;color:#475569;border-bottom:1px solid #e2e8f0">' + misEsc_(heads[i]) + '</th>';
+    }
+    out += "</tr>";
+    for (var r = 0; r < rows.length; r++) {
+      out += '<tr>';
+      for (var c = 0; c < rows[r].length; c++) {
+        out += '<td style="text-align:' + ((aligns && aligns[c]) || "left") + ';padding:6px 8px;border-bottom:1px solid #f1f5f9;color:#0f172a">' + rows[r][c] + "</td>";
+      }
+      out += "</tr>";
+    }
+    return out + "</table>";
+  };
+
+  var html = '<div style="font-family:Arial,Helvetica,sans-serif;color:#0f172a;font-size:14px;line-height:1.5;max-width:760px">';
+  html += '<div style="border-bottom:3px solid ' + GOLD + ';padding-bottom:10px;margin-bottom:6px">'
+    + '<div style="font-size:17px;font-weight:bold;color:' + NAVY + '">Vasupradah Investment Advisory Services P Ltd</div>'
+    + '<div style="font-size:13px;color:#334155;font-weight:bold;margin-top:4px">Pipeline MIS &ndash; week ended ' + misEsc_(misPretty_(m.weekTo)) + '</div>'
+    + '<div style="font-size:11px;color:#64748b">Covering ' + misEsc_(misPretty_(m.weekFrom)) + ' to ' + misEsc_(misPretty_(m.weekTo))
+    + ' &middot; cumulative figures as at ' + misEsc_(misPretty_(m.on)) + '</div></div>';
+
+  html += h2("Where the pipeline stands");
+  html += '<table style="width:100%;border-collapse:collapse"><tr>'
+    + card("Active prospects", String(m.activeCount), m.total + " on the book")
+    + card("Pipeline corpus", misMoney_(m.activeCorpus), "of active prospects")
+    + card("Signed to date", String(m.signedCount), m.signedThisMonth + " this month")
+    + '</tr><tr>'
+    + card("Conversion", m.conv + "%", "signed of signed plus lost", m.conv >= 33 ? "#047857" : "#0f172a")
+    + card("Overdue follow-ups", String(m.overdueCount), m.dueNextCount + " due in the next 7 days", m.overdueCount > 0 ? "#be123c" : "#047857")
+    + card("Signed this FY " + m.fyLabel, String(m.signedThisFy), misMoney_(m.signedCorpusFy) + " corpus")
+    + "</tr></table>";
+
+  html += h2("This week");
+  html += '<table style="width:100%;border-collapse:collapse"><tr>'
+    + card("New enquiries", String(m.week.newCount), misMoney_(m.week.newCorpus))
+    + card("Converted", String(m.week.signedCount), misMoney_(m.week.signedCorpus), m.week.signedCount > 0 ? "#047857" : "#0f172a")
+    + card("Lost", String(m.week.lostCount), "", m.week.lostCount > 0 ? "#be123c" : "#0f172a")
+    + card("Records worked on", String(m.week.touched), "")
+    + "</tr></table>";
+
+  var wk = [];
+  for (var a = 0; a < m.week.newList.length; a++) {
+    var x = m.week.newList[a];
+    wk.push([misEsc_(x.name), misEsc_(x.source), misEsc_(x.service), misMoney_(x.corpus), misEsc_(x.assignee)]);
+  }
+  html += h2("New enquiries this week (" + m.week.newCount + ")");
+  html += tbl(["Name", "Source", "Service", "Corpus", "Advisor"], wk, ["left", "left", "left", "right", "left"]);
+
+  if (m.week.signedList.length) {
+    var sg = [];
+    for (var b = 0; b < m.week.signedList.length; b++) {
+      var y = m.week.signedList[b];
+      sg.push([misEsc_(y.name), misEsc_(y.source), misMoney_(y.corpus), misEsc_(y.assignee), misEsc_(misPretty_(y.signedDate))]);
+    }
+    html += h2("Converted this week (" + m.week.signedCount + ")");
+    html += tbl(["Name", "Source", "Corpus", "Advisor", "Signed"], sg, ["left", "left", "right", "left", "left"]);
+  }
+
+  html += h2("Stage by stage");
+  var fn = [];
+  for (var f = 0; f < m.funnel.length; f++) {
+    if (!m.funnel[f].count) continue;
+    fn.push([misEsc_(m.funnel[f].label), String(m.funnel[f].count), misMoney_(m.funnel[f].corpus)]);
+  }
+  html += tbl(["Stage", "Count", "Corpus"], fn, ["left", "right", "right"]);
+
+  html += h2("By advisor");
+  var ad = [];
+  for (var d = 0; d < m.byAdvisor.length; d++) {
+    var g = m.byAdvisor[d];
+    ad.push([misEsc_(g.key), String(g.count), misMoney_(g.corpus), String(g.signed), String(g.lost), g.conv + "%"]);
+  }
+  html += tbl(["Advisor", "Prospects", "Corpus", "Signed", "Lost", "Conversion"], ad, ["left", "right", "right", "right", "right", "right"]);
+
+  html += h2("By source");
+  var sr = [];
+  for (var e2 = 0; e2 < m.bySource.length; e2++) {
+    var gs = m.bySource[e2];
+    sr.push([misEsc_(gs.key), String(gs.count), misMoney_(gs.corpus), String(gs.signed), gs.conv + "%"]);
+  }
+  html += tbl(["Source", "Enquiries", "Corpus", "Signed", "Conversion"], sr, ["left", "right", "right", "right", "right"]);
+
+  html += h2("By service");
+  var sv = [];
+  for (var v2 = 0; v2 < m.byService.length; v2++) {
+    sv.push([misEsc_(m.byService[v2].key), String(m.byService[v2].count), misMoney_(m.byService[v2].corpus), String(m.byService[v2].signed)]);
+  }
+  html += tbl(["Service", "Enquiries", "Corpus", "Signed"], sv, ["left", "right", "right", "right"]);
+
+  html += h2("Follow-ups overdue (" + m.overdueCount + ")");
+  var ov = [];
+  for (var o = 0; o < m.overdue.length; o++) {
+    var z = m.overdue[o];
+    ov.push(['<b>' + misEsc_(z.name) + "</b>", misEsc_(z.stageLabel), misEsc_(z.assignee),
+      misEsc_(misPretty_(z.nextFollowUp)), '<span style="color:#be123c">' + z.overdueDays + " day(s)</span>"]);
+  }
+  html += tbl(["Name", "Stage", "Advisor", "Was due", "Overdue by"], ov, ["left", "left", "left", "left", "right"]);
+
+  html += h2("Due in the next 7 days (" + m.dueNextCount + ")");
+  var dn = [];
+  for (var n2 = 0; n2 < m.dueNext.length; n2++) {
+    dn.push([misEsc_(m.dueNext[n2].name), misEsc_(m.dueNext[n2].stageLabel), misEsc_(m.dueNext[n2].assignee), misEsc_(misPretty_(m.dueNext[n2].nextFollowUp))]);
+  }
+  html += tbl(["Name", "Stage", "Advisor", "Due"], dn, ["left", "left", "left", "left"]);
+
+  if (m.staleCount) {
+    html += h2("Untouched for a fortnight (" + m.staleCount + ")");
+    var stl = [];
+    for (var s2 = 0; s2 < m.stale.length; s2++) {
+      stl.push([misEsc_(m.stale[s2].name), misEsc_(m.stale[s2].stageLabel), misEsc_(m.stale[s2].assignee), misMoney_(m.stale[s2].corpus)]);
+    }
+    html += tbl(["Name", "Stage", "Advisor", "Corpus"], stl, ["left", "left", "left", "right"]);
+  }
+
+  html += '<div style="margin-top:22px;font-size:11px;color:#94a3b8;border-top:1px solid #e2e8f0;padding-top:10px">'
+    + "Generated from the Pipeline tab of the office Google Sheet on " + misEsc_(misPretty_(m.on)) + " (" + misEsc_(m.tz) + "). "
+    + "Conversion is signed as a share of signed plus lost; prospects still in play are not counted either way. "
+    + "Internal management information &ndash; not for circulation outside the firm.</div></div>";
+  return html;
+}
+
+/** The same thing short enough to read on a phone. Used for WhatsApp. */
+function misText_(m) {
+  var L = [];
+  L.push("*Vasupradah - Pipeline MIS*");
+  L.push("Week ended " + misPretty_(m.weekTo));
+  L.push("");
+  L.push("*This week*");
+  L.push("New enquiries: " + m.week.newCount + (m.week.newCorpus ? " (" + misMoney_(m.week.newCorpus) + ")" : ""));
+  L.push("Converted: " + m.week.signedCount + (m.week.signedCorpus ? " (" + misMoney_(m.week.signedCorpus) + ")" : ""));
+  L.push("Lost: " + m.week.lostCount);
+  L.push("Worked on: " + m.week.touched);
+  L.push("");
+  L.push("*Overall*");
+  L.push("Active prospects: " + m.activeCount + " - " + misMoney_(m.activeCorpus));
+  L.push("Signed to date: " + m.signedCount + " (" + m.signedThisMonth + " this month, " + m.signedThisFy + " this FY)");
+  L.push("Conversion: " + m.conv + "%");
+  L.push("Overdue follow-ups: " + m.overdueCount + "; due next 7 days: " + m.dueNextCount);
+  if (m.overdue.length) {
+    L.push("");
+    L.push("*Overdue*");
+    for (var i = 0; i < Math.min(m.overdue.length, 8); i++) {
+      L.push("- " + m.overdue[i].name + " (" + m.overdue[i].stageLabel + ", " + m.overdue[i].assignee + ") " + m.overdue[i].overdueDays + "d");
+    }
+    if (m.overdue.length > 8) L.push("...and " + (m.overdue.length - 8) + " more");
+  }
+  L.push("");
+  L.push("Full report is in your email.");
+  return L.join("\n");
+}
+
+function misSend_(on, to) {
+  var list = [];
+  for (var i = 0; i < (to || []).length; i++) {
+    var a = String(to[i] || "").trim().toLowerCase();
+    if (a.indexOf("@") > 0 && list.indexOf(a) < 0) list.push(a);
+  }
+  if (!list.length) return { ok: false, error: "No recipients set for the MIS." };
+  var m, html;
+  try { m = misBuild_(on); html = misHtml_(m); }
+  catch (e) { return { ok: false, error: "Could not build the report: " + e }; }
+  var subject = "Pipeline MIS - week ended " + misPretty_(m.weekTo) + " - " + m.activeCount + " active, " + m.week.newCount + " new, " + m.week.signedCount + " converted";
+  // sentTo is what actually went; to is what was tried. Keeping them apart means a
+  // bounce can never be read as a delivery.
+  var sentTo = [], failed = [];
+  for (var j = 0; j < list.length; j++) {
+    try {
+      MailApp.sendEmail(list[j], subject, misText_(m), { name: "Vasupradah Investment Advisory", htmlBody: html });
+      sentTo.push(list[j]);
+    } catch (eS) { failed.push(list[j]); }
+  }
+  return { ok: sentTo.length > 0, sent: sentTo.length, sentTo: sentTo, to: list, failed: failed, subject: subject, weekTo: m.weekTo };
+}
 function doPost(e) {
   var SECRET = PropertiesService.getScriptProperties().getProperty("SECRET") || "820082"; // matches the Secret in the console; set a "SECRET" script property to override
 
@@ -1266,6 +1690,26 @@ function doPost(e) {
       }
     }
     return ContentService.createTextOutput(JSON.stringify({ ok: beSent > 0, sent: beSent, sentTo: beSentTo, skipped: beSkipped, failed: beFailed, quota: beQuota }));
+  }
+
+  // Send the MIS now, to the configured list or to whoever is named in the call.
+  if (body.type === "mis_send") {
+    var msTo = Array.isArray(body.to) && body.to.length ? body.to : misConfig_().to;
+    var msRes = misSend_(String(body.on || ""), msTo);
+    return ContentService.createTextOutput(JSON.stringify(msRes));
+  }
+
+  // Who it goes to and when, and the weekly trigger itself.
+  if (body.type === "mis_config") {
+    var mcProps = PropertiesService.getScriptProperties();
+    if (Array.isArray(body.to)) mcProps.setProperty("MIS_TO", body.to.join(","));
+    if (body.day != null) mcProps.setProperty("MIS_DAY", String(body.day));
+    if (body.hour != null) mcProps.setProperty("MIS_HOUR", String(parseInt(body.hour, 10) || 0));
+    var mcOn = body.enabled === true || body.enabled === false ? body.enabled : null;
+    if (mcOn === true) misInstallTrigger_();
+    if (mcOn === false) misRemoveTriggers_();
+    if (mcOn === null && misTriggerInfo_().on) misInstallTrigger_();   // re-time a running one
+    return ContentService.createTextOutput(JSON.stringify({ ok: true, config: misConfig_(), scheduled: misTriggerInfo_() }));
   }
 
   if (body.type === "exec_modes") {

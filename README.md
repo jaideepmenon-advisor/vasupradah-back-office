@@ -123,6 +123,64 @@ Risk categories: `Low Risk`, `Medium to Low Risk`, `Medium to High Risk`,
 Client-facing messages (trade alerts, advice, portfolio statements) are
 stamped with the firm's SEBI RIA registration number.
 
+## Weekly pipeline MIS
+
+A management report on the enquiry pipeline, emailed every week. **Pipeline →
+Weekly MIS** opens it: the report exactly as it will arrive, a **Send now**
+button, a WhatsApp summary, and the switch for the schedule.
+
+### It really is automatic
+
+Unlike the rest of the console, this does not need anyone's browser open. The
+report is built and sent by the Google Sheet itself, on an Apps Script weekly
+trigger, so it goes out on a Saturday morning whether or not the console has
+been opened all week.
+
+Default: **Saturday, 10:00**, to `jaideepmenon@`, `neelakantanpillai@` and
+`abhishakemathur@vasupradah.com`. All three are editable, as are the day and the
+hour. Turning it on from the console installs the trigger; turning it off removes
+it. It can also be driven from the Apps Script editor with `setupMisTrigger()`
+and `stopMisTrigger()`.
+
+One caveat the screen states too: Google fires weekly triggers **within** the
+hour you choose, so a 10:00 report may arrive any time up to 11:00.
+
+### What is in it
+
+The week is the seven days ending on the report date. Cumulative figures are as
+at that date.
+
+- **Where the pipeline stands** — active prospects and their corpus, signed to
+  date and this month, **conversion**, overdue follow-ups, signed this financial
+  year with corpus.
+- **This week** — new enquiries, converted, lost, records worked on, each with
+  corpus, then the names behind the first two.
+- **Stage by stage** — count and corpus at each of the eleven stages.
+- **By advisor** — prospects, corpus, signed, lost and conversion each.
+- **By source** and **by service** — the same cut, so you can see which channel
+  actually converts.
+- **Follow-ups overdue**, with how many days each is late, and **due in the next
+  7 days**.
+- **Untouched for a fortnight** — open records nobody has moved.
+
+Conversion is **signed as a share of signed plus lost**, the same definition the
+Pipeline screen uses, so the two always agree. Prospects still in play count
+neither way.
+
+### Sending it by hand
+
+**Send now** mails the same report immediately to whoever is in the list — useful
+mid-week, or to catch up a missed Saturday. The week ending date can be changed
+to re-issue an earlier week.
+
+**WhatsApp** opens a chat with a short version: this week's numbers, the running
+totals, conversion, and the overdue names — enough to read on a phone, with the
+full report left in the inbox. **Copy summary** puts the same text on the
+clipboard for any other chat, and **Print / save PDF** produces a filed copy.
+
+Everyone can open the report; only the Principal Officer can send it or change
+the schedule.
+
 ## Capital gains
 
 The **Capital Gains** tab works out realised and unrealised gains from the trade
