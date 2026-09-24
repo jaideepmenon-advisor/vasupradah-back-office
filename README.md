@@ -183,15 +183,44 @@ only sell where it also suits the client's risk profile, and note that buying th
 stock back starts a fresh holding period, so a long-term holding becomes short
 term again.
 
+### Missing purchases
+
+A sale with nothing to match against is never given a zero cost, so every one of
+them has to be explained or filled before the gains mean anything. The **Missing
+purchases** view — reachable from the red warning — scans the whole book on the
+sheet (`?gap_scan=1&fy=…`), groups the gaps by client and scrip, and puts a name
+to the likely cause from what the book itself shows:
+
+| Cause | How it is spotted | What to do |
+| --- | --- | --- |
+| **Ticker spelled differently** | the same client traded a ticker that reduces to the same letters (`NESTLEIND-BE`, `NESTLE INDIA`) | not a missing purchase — fix the spelling in the feed |
+| **Two codes, one client** | the scrip was bought under another portfolio code carrying the same client name | not a missing purchase — join the accounts in the client master |
+| **Bonus or split** | a clean whole-number ratio of sold to bought (2×, 10× …) | record the extra shares as an opening purchase |
+| **In Holdings, not in trades** | Holdings still shows the position, with an average cost | record an opening purchase at that cost |
+| **Bought before the book starts** | nothing of it was ever bought, and the book begins after | record an opening purchase |
+| **More sold than bought** | anything else | record an opening purchase |
+
+Filter by cause, search by client or scrip, and export the lot to Excel.
+
+Where a purchase really is absent, **record an opening purchase**: tick the rows,
+put a cost against each, and they are written to the **`ManualTrades`** tab as
+`BUY` rows dated the day before the book begins — so they can never be mistaken
+for a trade of the year, and deleting the row undoes it. **Fill costs from
+Holdings** takes the average purchase price already on file in one click; a cost
+can also be typed per row, or filled in the exported Excel and read back with
+**Costs from file**.
+
+The cost you enter decides the gain, so the screen says plainly to take it from a
+contract note rather than guess.
+
 ### What it does not do
 
 Stated on the screen as well as here, because a capital gains figure that quietly
 omits something is worse than none:
 
-- **Sales with no purchase on record** — an opening position carried in from
-  before the trade book starts, or a gap in the feed — are **not** given a zero
-  cost and a phantom gain. They are listed by name, and the totals are flagged as
-  understated.
+- **Sales with no purchase on record** are **not** given a zero cost and a
+  phantom gain. They are listed by name, the totals are flagged as understated,
+  and **Missing purchases** above is there to clear them.
 - **Grandfathering** under s.112A (shares bought before 1 February 2018 may take
   the 31 January 2018 value as cost) is not applied, because that value is not in
   a trade book. Affected holdings are marked `pre-2018`.

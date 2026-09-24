@@ -62,7 +62,7 @@ function setup() {
 
 function doGet(e) {
   var p = (e && e.parameter) || {};
-  if (!p.prices && !p.alerts && !p.trades && !p.holdings && !p.gridkey && !p.greeting_status && !p.advice_alerts && !p.advice_trace && !p.ping && !p.pipeline && !p.baskets && !p.manual_trades && !p.client_details && !p.exec_modes && !p.advice_contacts && !p.shorten && !p.dedupe && !p.gk_probe && !p.staff && !p.fee_plans && !p.first_trades && !p.billing_profiles && !p.billing_settings && !p.invoices && !p.capgains) {
+  if (!p.prices && !p.alerts && !p.trades && !p.holdings && !p.gridkey && !p.greeting_status && !p.advice_alerts && !p.advice_trace && !p.ping && !p.pipeline && !p.baskets && !p.manual_trades && !p.client_details && !p.exec_modes && !p.advice_contacts && !p.shorten && !p.dedupe && !p.gk_probe && !p.staff && !p.fee_plans && !p.first_trades && !p.billing_profiles && !p.billing_settings && !p.invoices && !p.capgains && !p.gap_scan) {
     return ContentService.createTextOutput("Vasupradah backup endpoint is live (use POST from the console).");
   }
 
@@ -517,6 +517,143 @@ function doGet(e) {
     }
     if (cgWant) { out2.realised = realised; out2.lots = lots; }
     return ContentService.createTextOutput(JSON.stringify(out2)).setMimeType(ContentService.MimeType.JSON);
+  }
+
+  // Why a sale had no purchase to match against. Rather than guess, this gathers the
+  // evidence for each gap - what the book holds for that client and scrip, whether a
+  // near-identical ticker was traded instead, whether the same name appears under
+  // another portfolio code, and what Holdings still shows - and lets the console put
+  // a name to it. ?gap_scan=1&fy=2026-27
+  if (p.gap_scan) {
+    var gsFy = String(p.fy || "").trim();
+    var gsY = parseInt(gsFy.substring(0, 4), 10);
+    if (!gsY) return ContentService.createTextOutput(JSON.stringify({ ok: false, error: "fy must look like 2026-27" })).setMimeType(ContentService.MimeType.JSON);
+    var gsTz = Session.getScriptTimeZone();
+    var gsToday = Utilities.formatDate(new Date(), gsTz, "yyyy-MM-dd");
+    var gsFrom = gsY + "-04-01", gsTo = (gsY + 1) + "-03-31";
+    if (gsTo > gsToday) gsTo = gsToday;
+
+    var gsRows = [];
+    try { gsRows = gkNormalizedTrades_(); } catch (eGs) { gsRows = []; }
+    try {
+      var gsMs = SpreadsheetApp.getActiveSpreadsheet().getSheetByName("ManualTrades");
+      if (gsMs && gsMs.getLastRow() > 1) {
+        var gsMv = gsMs.getDataRange().getValues();
+        for (var gi = 1; gi < gsMv.length; gi++) {
+          var gd = gsMv[gi][1];
+          if (Object.prototype.toString.call(gd) === "[object Date]") gd = Utilities.formatDate(gd, gsTz, "yyyy-MM-dd");
+          gsRows.push([String(gd), String(gsMv[gi][2]), String(gsMv[gi][3]), String(gsMv[gi][4]),
+            String(gsMv[gi][5]), Number(gsMv[gi][6]) || 0, Number(gsMv[gi][7]) || 0, Number(gsMv[gi][8]) || 0]);
+        }
+      }
+    } catch (eGs2) { /* ignore */ }
+    gsRows.sort(function (a, b) { return String(a[0]) < String(b[0]) ? -1 : String(a[0]) > String(b[0]) ? 1 : 0; });
+
+    var gsIsBuy = function (a) { return /^(B|BUY|P|PURCHASE)/i.test(String(a || "").trim()); };
+    // A ticker reduced to its bare letters, so NESTLEIND, NESTLEIND-BE and
+    // "Nestle India" all collapse to the same thing when comparing.
+    var gsBare = function (v) { return String(v || "").toUpperCase().replace(/[^A-Z0-9]/g, "").replace(/(BE|EQ|BL|SM|ST)$/, ""); };
+
+    var byCS = {}, names = {}, byClient = {}, bookFrom = "", bookTo = "";
+    for (var r = 0; r < gsRows.length; r++) {
+      var tr = gsRows[r];
+      var dt = String(tr[0] || "").trim(), code = String(tr[1] || "").trim();
+      var sym = String(tr[3] || "").trim().toUpperCase();
+      var qty = Math.abs(Number(tr[5]) || 0);
+      if (!dt || !code || !sym || !qty) continue;
+      if (String(tr[2] || "").trim()) names[code] = String(tr[2]).trim();
+      if (!bookFrom || dt < bookFrom) bookFrom = dt;
+      if (!bookTo || dt > bookTo) bookTo = dt;
+      var k = code + "\u0001" + sym;
+      if (!byCS[k]) byCS[k] = { code: code, sym: sym, bought: 0, sold: 0, first: dt, last: dt, runQty: 0, shortQty: 0, sales: 0, firstSale: "", lastSale: "" };
+      var e = byCS[k];
+      if (dt < e.first) e.first = dt;
+      if (dt > e.last) e.last = dt;
+      if (!byClient[code]) byClient[code] = { first: dt, syms: {} };
+      if (dt < byClient[code].first) byClient[code].first = dt;
+      byClient[code].syms[sym] = (byClient[code].syms[sym] || 0) + (gsIsBuy(tr[4]) ? qty : -qty);
+
+      if (gsIsBuy(tr[4])) { e.bought += qty; e.runQty += qty; }
+      else {
+        e.sold += qty;
+        var have = Math.max(0, e.runQty);
+        var missing = qty - have;
+        e.runQty = have - Math.min(qty, have);
+        if (missing > 1e-9 && dt >= gsFrom && dt <= gsTo) {
+          e.shortQty += missing; e.sales++;
+          if (!e.firstSale || dt < e.firstSale) e.firstSale = dt;
+          if (dt > e.lastSale) e.lastSale = dt;
+        }
+      }
+    }
+
+    // What Holdings still shows, which says whether the position is real.
+    // Quantity and the average purchase price, which is the obvious cost to use for
+    // a carry-in lot that the trade book never saw.
+    var holdQty = {}, holdBuy = {};
+    try {
+      var hs = SpreadsheetApp.getActiveSpreadsheet().getSheetByName("Holdings");
+      if (hs && hs.getLastRow() > 1) {
+        var hv = hs.getDataRange().getValues();
+        for (var hi = 1; hi < hv.length; hi++) {
+          var hc = String(hv[hi][0] || "").trim(), hsym = String(hv[hi][5] || "").trim().toUpperCase();
+          if (!hc || !hsym) continue;
+          holdQty[hc + "\u0001" + hsym] = Number(hv[hi][6]) || 0;
+          holdBuy[hc + "\u0001" + hsym] = Number(hv[hi][7]) || 0;
+        }
+      }
+    } catch (eH) { /* ignore */ }
+
+    // Every portfolio code that answers to the same client name, for the case where
+    // one client's holdings sit under two codes.
+    var codesByName = {};
+    for (var nc in names) {
+      var nk = String(names[nc]).toUpperCase().replace(/\s+/g, " ").trim();
+      if (!nk) continue;
+      if (!codesByName[nk]) codesByName[nk] = [];
+      codesByName[nk].push(nc);
+    }
+
+    var gaps = [];
+    for (var gk in byCS) {
+      var g = byCS[gk];
+      if (!(g.shortQty > 1e-9)) continue;
+      var bare = gsBare(g.sym);
+      // A different spelling of the same ticker that this client did trade.
+      var near = [];
+      var mine = (byClient[g.code] || {}).syms || {};
+      for (var ms in mine) {
+        if (ms === g.sym) continue;
+        var mb = gsBare(ms);
+        if (mb === bare || (mb.length >= 4 && bare.length >= 4 && (mb.indexOf(bare) === 0 || bare.indexOf(mb) === 0))) {
+          near.push({ sym: ms, netQty: Math.round(mine[ms] * 1e4) / 1e4 });
+        }
+      }
+      // The same scrip bought under another code carrying this client's name.
+      var others = [];
+      var myName = String(names[g.code] || "").toUpperCase().replace(/\s+/g, " ").trim();
+      var sibs = codesByName[myName] || [];
+      for (var si = 0; si < sibs.length; si++) {
+        if (sibs[si] === g.code) continue;
+        var ok2 = byCS[sibs[si] + "\u0001" + g.sym];
+        if (ok2 && ok2.bought > 0) others.push({ code: sibs[si], bought: Math.round(ok2.bought * 1e4) / 1e4 });
+      }
+      gaps.push({
+        code: g.code, name: names[g.code] || g.code, sym: g.sym,
+        shortQty: Math.round(g.shortQty * 1e4) / 1e4, sales: g.sales,
+        firstSale: g.firstSale, lastSale: g.lastSale,
+        bought: Math.round(g.bought * 1e4) / 1e4, sold: Math.round(g.sold * 1e4) / 1e4,
+        firstTrade: g.first, clientFirstTrade: (byClient[g.code] || {}).first || "",
+        holdingQty: holdQty[g.code + "\u0001" + g.sym] == null ? null : holdQty[g.code + "\u0001" + g.sym],
+        holdingBuy: holdBuy[g.code + "\u0001" + g.sym] || 0,
+        near: near.slice(0, 5), otherCodes: others.slice(0, 5)
+      });
+    }
+    gaps.sort(function (a, b) { return b.shortQty - a.shortQty; });
+    return ContentService.createTextOutput(JSON.stringify({
+      ok: true, fy: gsFy, from: gsFrom, to: gsTo, bookFrom: bookFrom, bookTo: bookTo,
+      gaps: gaps.slice(0, 2000), gapCount: gaps.length
+    })).setMimeType(ContentService.MimeType.JSON);
   }
 
   if (p.exec_modes) {
@@ -1204,6 +1341,26 @@ function doPost(e) {
         if (String(mAll[mi][0]) === mid) { msh2.deleteRow(mi + 2); SpreadsheetApp.flush(); return ContentService.createTextOutput("ok: manual trade deleted"); }
       }
       return ContentService.createTextOutput("ok: manual trade not found");
+    }
+
+    // Several at once, for filling in a batch of opening positions. Anything whose
+    // id is already there is skipped, so re-sending the same file adds nothing.
+    if (Array.isArray(body.trades)) {
+      var seenIds = {};
+      for (var mz = 0; mz < mAll.length; mz++) seenIds[String(mAll[mz][0])] = true;
+      var mAdd = 0, mSkip = 0, mOut = [];
+      for (var mb = 0; mb < body.trades.length; mb++) {
+        var bt = body.trades[mb] || {};
+        if (!bt.id || seenIds[String(bt.id)]) { mSkip++; continue; }
+        seenIds[String(bt.id)] = true;
+        mOut.push([bt.id, bt.date || "", bt.code || "", bt.name || "", String(bt.symbol || "").toUpperCase(),
+          String(bt.action || "BUY").toUpperCase(), Number(bt.quantity) || 0, Number(bt.price) || 0,
+          Number(bt.amount) || (Number(bt.quantity) || 0) * (Number(bt.price) || 0), bt.note || "", bt.by || "", Date.now()]);
+        mAdd++;
+      }
+      if (mOut.length) msh2.getRange(msh2.getLastRow() + 1, 1, mOut.length, mHdr.length).setValues(mOut);
+      SpreadsheetApp.flush();
+      return ContentService.createTextOutput("ok: manual trades +" + mAdd + " ~" + mSkip);
     }
 
     var t = body.trade || {};
