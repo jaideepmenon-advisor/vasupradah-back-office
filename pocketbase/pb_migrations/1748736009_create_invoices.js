@@ -1,0 +1,46 @@
+// ---- invoices -----------------------------------------------------------------
+migrate((app) => {
+  const c = new Collection({
+    type: "base",
+    name: "invoices",
+    fields: [
+      { name: "key", type: "text", required: true, max: 100 },
+      { name: "invoice_no", type: "text", max: 60 },
+      { name: "period", type: "text", max: 20 },
+      { name: "client_code", type: "text", max: 40 },
+      { name: "client_name", type: "text", max: 200 },
+      { name: "email", type: "text", max: 200 },
+      { name: "fee_plan", type: "text", max: 200 },
+      { name: "date_from", type: "text", max: 10 },
+      { name: "date_to", type: "text", max: 10 },
+      { name: "days_billed", type: "number" },
+      { name: "days_in_quarter", type: "number" },
+      { name: "basis", type: "text", max: 40 },
+      { name: "fee", type: "number" },
+      { name: "gst_mode", type: "text", max: 40 },
+      { name: "cgst", type: "number" },
+      { name: "sgst", type: "number" },
+      { name: "igst", type: "number" },
+      { name: "total", type: "number" },
+      { name: "place_of_supply", type: "text", max: 60 },
+      { name: "status", type: "select", maxSelect: 1, values: ["Unpaid", "Paid", "Cancelled"] },
+      { name: "issued_at_ms", type: "number" },
+      { name: "emailed_at_ms", type: "number" },
+      { name: "whatsapp_at_ms", type: "number" },
+      { name: "receipt_no", type: "text", max: 60 },
+      { name: "paid_on", type: "text", max: 10 },
+      { name: "paid_mode", type: "text", max: 40 },
+      { name: "paid_ref", type: "text", max: 100 },
+      { name: "receipt_at_ms", type: "number" },
+      { name: "receipt_by", type: "text", max: 100 },
+      { name: "updated_ms", type: "number" },
+    ],
+    indexes: [
+      "CREATE UNIQUE INDEX idx_invoices_key ON invoices (key)",
+      "CREATE UNIQUE INDEX idx_invoices_no ON invoices (invoice_no)",
+      "CREATE INDEX idx_invoices_period ON invoices (period)",
+      "CREATE INDEX idx_invoices_code ON invoices (client_code)",
+    ],
+  });
+  app.save(c);
+}, (app) => { app.delete(app.findCollectionByNameOrId("invoices")); });
