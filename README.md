@@ -11,11 +11,42 @@ sent.
 
 ```
 console/
-  VasupradahClientConsole.html   The whole client app: a single, portable
-                                  HTML file (React UI + bundled libraries).
-                                  Open it directly in a browser, or host it
-                                  as a static page. Nothing server-side runs
-                                  from this file.
+  VasupradahClientConsole.html   The app shell: head/styles/root div and the
+                                  <script> tags that load everything below,
+                                  in order. Nothing server-side runs from
+                                  this file or the ones it loads.
+  vendor.js                      Bundled third-party libraries (React,
+                                  ReactDOM, PapaParse, xlsx/SheetJS,
+                                  html2canvas, a QR code generator) - no CDN
+                                  at runtime.
+  app/
+    core.js                      Shared app infrastructure: persistence
+                                  (localStorage), the icon set, generic
+                                  formatting/WhatsApp/date helpers, and
+                                  App/Login/Console/ChangePasswordModal -
+                                  anything used by more than one tab, or by
+                                  none of them directly.
+    report.js, advice.js, performance.js, orders.js, pipeline.js,
+    billing.js, capgains.js, upload.js, settings.js
+                                  One file per item in the console's own
+                                  menu (Portfolio Report, Advice Alerts,
+                                  Performance, Advice Orders, Pipeline,
+                                  Billing, Capital Gains, Upload Data,
+                                  Settings), holding only the components
+                                  exclusive to that tab. settings.js also
+                                  carries the embedded APPS_SCRIPT copy (see
+                                  below), since that's the tab that shows it.
+                                  This split is by dependency (which tab
+                                  actually calls each component), not by
+                                  hand, so every file loads and runs
+                                  correctly regardless of tags order - they
+                                  are plain global <script>s, not ES modules,
+                                  so opening the HTML file directly (file://)
+                                  still works as long as every file here
+                                  stays alongside it. That also means the
+                                  console is no longer a single file you can
+                                  email on its own - copy the whole `console/`
+                                  folder instead.
 
 google-apps-script/
   Code.gs                        The backend, as a plain .gs file for
@@ -41,10 +72,12 @@ order-link-proxy/
 
 ## Architecture
 
-- **`console/VasupradahClientConsole.html`** is a self-contained, offline-first
-  React app. State lives in the browser's `localStorage` (clients, prices,
-  trades, rates). It's meant to be portable — one file you can open locally,
-  email, or host anywhere as static HTML.
+- **`console/`** is a self-contained, offline-first React app, split into one
+  shell HTML file plus `vendor.js` and the per-tab files under `app/` (see
+  Layout above). State lives in the browser's `localStorage` (clients,
+  prices, trades, rates). It's meant to be portable — the whole `console/`
+  folder is what you open locally, host as static HTML, or hand to someone
+  else; none of it needs a server or a build step.
 - **`google-apps-script/Code.gs`** is a Google Apps Script Web App, deployed
   separately, bound to the "ADVISORY CLIENT DATA" Google Sheet. It exposes a
   `doGet`/`doPost` JSON API the console calls (over `fetch`) to back up and

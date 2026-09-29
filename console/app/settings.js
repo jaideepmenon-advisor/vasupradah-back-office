@@ -1,0 +1,4157 @@
+function clientsFromBackup(rows) {
+  const clients = {};
+  let holdingCount = 0;
+  for (const row of rows) {
+    const g = {};
+    for (const k in row) g[normKey(k)] = row[k];
+    const code = String(g.clientcode ?? g.code ?? g.portfoliocode ?? "").trim();
+    const stock = String(g.stock ?? g.symbol ?? "").trim().toUpperCase();
+    if (!code) continue;
+    if (!clients[code]) {
+      clients[code] = {
+        code,
+        name: String(g.name ?? g.clientname ?? "").trim(),
+        email: String(g.email ?? g.emailid ?? "").trim(),
+        whatsapp: waDisplay(g.whatsapp ?? g.mobilenumber ?? g.mobile ?? ""),
+        risk: normalizeRisk(g.riskcategory ?? g.risk ?? ""),
+        holdings: {}
+      };
+    }
+    if (!stock) continue;
+    const quantity = num(g.quantity);
+    const invested = num(g.invested ?? g.investedamount);
+    const current = num(g.currentvalue ?? g.current ?? g.currentamount);
+    const purchasePrice = num(g.purchaseprice) || (quantity ? invested / quantity : 0);
+    const currentPrice = num(g.currentprice) || (quantity ? current / quantity : 0);
+    clients[code].holdings[stock] = {
+      stock,
+      quantity,
+      invested,
+      current,
+      purchasePrice,
+      currentPrice,
+      investedManual: String(g.investedset ?? "").toLowerCase() === "manual",
+      updatedAt: Date.now()
+    };
+    holdingCount++;
+  }
+  return { clients, clientCount: Object.keys(clients).length, holdingCount };
+}
+const APPS_SCRIPT = `/************************************************************************
+ *  Vasupradah Investment Advisory - Client Console  -  Google Apps Script
+ *  Principal Officer: Jaideep Menon  -  SEBI Registered Investment Adviser
+ *
+ *  ====================  SETUP ORDER  (do not skip / reorder)  ==========
+ *
+ *  0. THERE MUST BE ONLY ONE SCRIPT FILE.
+ *     If the left panel shows 'Untitled.gs' as well as 'Code.gs', delete
+ *     Untitled.gs (3 dots -> Delete). Two files = two doGet/doPost = errors.
+ *
+ *  1. Paste this ENTIRE file over everything in Code.gs. Press SAVE.
+ *
+ *  2. Function dropdown (top bar) -> choose 'grantPermissions' -> Run.
+ *     Google asks for permission -> Advanced -> Go to ... -> Allow.
+ *     This grants everything at once and needs NO token to be set yet.
+ *
+ *     If you get "An unknown error has occurred": that is the editor, not
+ *     your code. It is nearly always caused by being signed in to MORE THAN
+ *     ONE Google account. Fix: open the sheet in an Incognito window signed
+ *     in ONLY as the account that owns the sheet, then retry.
+ *
+ *  3. Set the GridKey token. Either:
+ *       (a) Project Settings (gear) -> Script properties -> Add:
+ *             GK_TOKEN       = <your token>
+ *             GK_TRADES_URL  = https://django-backend-prod.gridkey.in/transaction/export_csv/?show_zero_holding=false&filter=%7B%7D
+ *             GK_LEDGER_URL  = <paste when you have it>
+ *       (b) or run 'setGridkeyTokenManually' after pasting values into it.
+ *       (c) or, once step 4 is done, from the app: Settings -> GridKey auto-sync.
+ *
+ *  4. Deploy -> Manage deployments -> pencil -> Version: NEW VERSION -> Deploy.
+ *     ("Who has access" must stay: Anyone.)
+ *
+ *  5. Function dropdown -> 'authorizeGridkey' -> Run.  This does a REAL fetch
+ *     and should log: SUCCESS ... HTTP 200 ... about 101570 lines.
+ *
+ *  6. Function dropdown -> 'setupGridkeyTriggers' -> Run ONCE.
+ *     Installs the 6:00 am and 6:00 pm daily sync. Do this LAST: triggers
+ *     remember the permissions they had when created.
+ *
+ *  7. Project Settings -> timezone must be (GMT+05:30) India.
+ *
+ *  =====================================================================
+ *  Endpoints:
+ *    GET  ?prices=1  ?alerts=1  ?trades=1  ?holdings=1  ?gridkey=1
+ *    POST type=holdings (default) | trades | gridkey_config | gridkey_run
+ ************************************************************************/
+
+// ============================================================================
+//  Vasupradah backend. FIRST TIME: pick "setup" in the function dropdown above
+//  and press Run once - approve the permissions (including "send email as you").
+//  It emails you a confirmation. Then Deploy > Manage deployments > Edit > New version.
+// ============================================================================
+function setup() {
+  var email = Session.getEffectiveUser().getEmail();
+  var quota = MailApp.getRemainingDailyQuota();
+  MailApp.sendEmail(email, "Vasupradah - setup OK",
+    "Authorisation complete. This Google account (" + email + ") can now send email from the console. "
+    + "Gmail sends left today: " + quota + ".");
+  Logger.log("Authorised as " + email + " - Gmail sends left today: " + quota);
+  return "OK - authorised as " + email + ", quota " + quota;
+}
+
+function doGet(e) {
+  var p = (e && e.parameter) || {};
+  if (!p.prices && !p.alerts && !p.trades && !p.holdings && !p.gridkey && !p.greeting_status && !p.advice_alerts && !p.advice_trace && !p.ping && !p.pipeline && !p.baskets && !p.manual_trades && !p.client_details && !p.exec_modes && !p.advice_contacts && !p.shorten && !p.dedupe && !p.gk_probe && !p.staff && !p.fee_plans && !p.first_trades && !p.billing_profiles && !p.billing_settings && !p.invoices && !p.capgains && !p.gap_scan && !p.mis && !p.dbhealth) {
+    return ContentService.createTextOutput("Vasupradah backup endpoint is live (use POST from the console).");
+  }
+
+  // Diagnostics: confirms this deployment is current, which Google account it sends mail as, and
+  // how much Gmail quota is left today. Used by Settings -> Email diagnostics.
+  if (p.ping) {
+    var pq = 0; try { pq = MailApp.getRemainingDailyQuota(); } catch (ePq) { pq = -1; }
+    var pu = ""; try { pu = Session.getEffectiveUser().getEmail(); } catch (ePu) { pu = ""; }
+    return ContentService.createTextOutput(JSON.stringify({ ok: true, version: "2026-09-05-pipeline", canSendEmail: pq >= 0, quota: pq, user: pu, tz: Session.getScriptTimeZone(), shortener: String(gkProps_().getProperty("SHORT_PROVIDER") || "isgd") })).setMimeType(ContentService.MimeType.JSON);
+  }
+
+  // Staff list on its own. The sign-in screen asks for this every time someone who
+  // isn't on this device's list types their name, and it used to come back through
+  // ?holdings=1 - which also builds the whole trade book and holdings table, stalls,
+  // and left staff staring at "Checking with office sheet..." until it gave up.
+  if (p.staff) {
+    var stfOut = [];
+    try {
+      var stfJson = PropertiesService.getScriptProperties().getProperty("staff");
+      if (stfJson) { stfOut = JSON.parse(stfJson); }
+    } catch (eStf) { stfOut = []; }
+    if (!(stfOut instanceof Array)) stfOut = [];
+    return ContentService.createTextOutput(JSON.stringify({ ok: true, staff: stfOut })).setMimeType(ContentService.MimeType.JSON);
+  }
+
+  // Diagnose why a trade is not showing: what does the export actually return, what did the
+  // last sync do, and how big is the tab (a bloated sheet can hit Google's cell ceiling).
+  if (p.gk_probe) {
+    if (String(p.token || "") !== (PropertiesService.getScriptProperties().getProperty("SECRET") || "820082")) {
+      return ContentService.createTextOutput(JSON.stringify({ ok: false, error: "bad token" })).setMimeType(ContentService.MimeType.JSON);
+    }
+    var pr = gkProps_();
+    var which = String(p.gk_probe) === "ledger" ? "ledger" : "trades";
+    var purl = String(which === "ledger" ? (pr.getProperty("GK_LEDGER_URL") || "") : (pr.getProperty("GK_TRADES_URL") || "")).trim();
+    var sheetName = which === "ledger" ? GK_LEDGER_SHEET : GK_TRADES_SHEET;
+    var pss = SpreadsheetApp.getActiveSpreadsheet();
+    var psh = pss.getSheetByName(sheetName);
+    var out = {
+      ok: true, which: which, hasUrl: !!purl,
+      lastSync: pr.getProperty("GK_LAST_SYNC") || "", lastResult: pr.getProperty("GK_LAST_RESULT") || "",
+      sheetRows: psh ? Math.max(0, psh.getLastRow() - 1) : 0,
+      sheetCols: psh ? psh.getLastColumn() : 0,
+      sheetCells: psh ? psh.getLastRow() * psh.getLastColumn() : 0
+    };
+    if (!purl) { out.error = "no export URL saved for " + which; return ContentService.createTextOutput(JSON.stringify(out)).setMimeType(ContentService.MimeType.JSON); }
+    try {
+      var parsedP = gkParseCsv_(sheetName, gkFetch_(purl));
+      var prows = parsedP.rows;
+      out.exportRows = prows.length - 1;
+      out.header = prows[0];
+      // find the column that looks most like a date and summarise its range
+      var bestCol = -1, bestHits = 0, ci, ri, hits, canon;
+      for (ci = 0; ci < parsedP.W; ci++) {
+        hits = 0;
+        for (ri = 1; ri < Math.min(prows.length, 60); ri++) if (gkDatePart_(String(prows[ri][ci] || ""))) hits++;
+        if (hits > bestHits) { bestHits = hits; bestCol = ci; }
+      }
+      if (bestCol >= 0) {
+        var minD = "", maxD = "", found = false, want = String(p.on || "");
+        var wantCanon = want ? gkDatePart_(want) : "";
+        for (ri = 1; ri < prows.length; ri++) {
+          canon = gkDatePart_(String(prows[ri][bestCol] || ""));
+          if (!canon) continue;
+          if (!minD || canon < minD) minD = canon;
+          if (!maxD || canon > maxD) maxD = canon;
+          if (wantCanon && canon === wantCanon) found = true;
+        }
+        out.dateColumn = prows[0][bestCol];
+        out.earliest = minD; out.latest = maxD;
+        if (wantCanon) { out.askedFor = wantCanon; out.presentInExport = found; }
+      }
+    } catch (eP) { out.fetchError = String(eP.message || eP); }
+    // Stock-level check: where does a given symbol actually appear?
+    if (p.sym) {
+      var wantSym = String(p.sym).trim().toUpperCase();
+      out.symbol = wantSym;
+      try {
+        var nts = gkNormalizedTrades_(), hits = 0, lastD = "";
+        for (var si = 0; si < nts.length; si++) {
+          if (String(nts[si][3]).trim().toUpperCase() !== wantSym) continue;
+          hits++;
+          if (String(nts[si][0]) > lastD) lastD = String(nts[si][0]);
+        }
+        out.tradesForSymbol = hits;
+        out.lastTradeForSymbol = lastD;
+      } catch (eS) { out.symbolTradeError = String(eS.message || eS); }
+      // and is it a live position in the holdings the console reads?
+      try {
+        var hs = SpreadsheetApp.getActiveSpreadsheet().getSheetByName("Holdings");
+        var hcount = 0;
+        if (hs && hs.getLastRow() > 1) {
+          var hv = hs.getRange(2, 1, hs.getLastRow() - 1, hs.getLastColumn()).getValues();
+          for (var hi = 0; hi < hv.length; hi++) {
+            for (var hj = 0; hj < hv[hi].length; hj++) {
+              if (String(hv[hi][hj]).trim().toUpperCase() === wantSym) { hcount++; break; }
+            }
+          }
+        }
+        out.holdingRowsForSymbol = hcount;
+      } catch (eH) { out.symbolHoldingError = String(eH.message || eH); }
+      // and does the broker's combined-holdings export still carry it?
+      try {
+        var curl = String(gkProps_().getProperty("GK_COMBINED_URL") || gkProps_().getProperty("GK_HOLDINGS_URL") || "").trim();
+        if (curl) {
+          var cp = gkParseCsv_("CombinedHoldings", gkFetch_(curl));
+          var cHits = 0;
+          for (var ci2 = 1; ci2 < cp.rows.length; ci2++) {
+            for (var cj2 = 0; cj2 < cp.rows[ci2].length; cj2++) {
+              if (String(cp.rows[ci2][cj2]).trim().toUpperCase() === wantSym) { cHits++; break; }
+            }
+          }
+          out.combinedRowsForSymbol = cHits;
+        }
+      } catch (eC) { out.symbolCombinedError = String(eC.message || eC); }
+    }
+
+    // Sheet-side checks run regardless of whether the export can be fetched, because
+    // "does the console's feed see this date?" is the question that actually matters.
+    if (psh && psh.getLastRow() > 1 && p.on) {
+      var wc2 = gkDatePart_(String(p.on)), inSheet2 = 0, rj, cj;
+      var sv2 = psh.getRange(2, 1, psh.getLastRow() - 1, psh.getLastColumn()).getValues();
+      for (rj = 0; rj < sv2.length; rj++) {
+        for (cj = 0; cj < sv2[rj].length; cj++) {
+          var cc2 = gkCanon_(sv2[rj][cj]);
+          if (cc2 && cc2.slice(0, 10) === wc2) { inSheet2++; break; }
+        }
+      }
+      out.rowsInSheetOnThatDate = inSheet2;
+      try {
+        var nt2 = gkNormalizedTrades_(), nOn2 = 0;
+        for (rj = 0; rj < nt2.length; rj++) if (String(nt2[rj][0]).slice(0, 10) === wc2) nOn2++;
+        out.normalisedTotal = nt2.length;
+        out.normalisedOnThatDate = nOn2;
+      } catch (eN2) { out.normaliseError = String(eN2.message || eN2); }
+    }
+    return ContentService.createTextOutput(JSON.stringify(out)).setMimeType(ContentService.MimeType.JSON);
+  }
+
+  // Clean rows duplicated by the earlier comparison bug. Token-guarded because it rewrites a tab.
+  if (p.dedupe) {
+    if (String(p.token || "") !== (PropertiesService.getScriptProperties().getProperty("SECRET") || "820082")) {
+      return ContentService.createTextOutput(JSON.stringify({ ok: false, error: "bad token" })).setMimeType(ContentService.MimeType.JSON);
+    }
+    var names = String(p.dedupe) === "1" ? ["Trades", "Ledger"] : String(p.dedupe).split(",");
+    var out = [];
+    for (var di = 0; di < names.length; di++) {
+      try { out.push(gkDedupeSheet_(String(names[di]).trim())); }
+      catch (eD) { out.push({ sheet: names[di], error: String(eD.message || eD) }); }
+    }
+    return ContentService.createTextOutput(JSON.stringify({ ok: true, results: out })).setMimeType(ContentService.MimeType.JSON);
+  }
+
+  // Shorten an execute link (used for WhatsApp, where a URL cannot be hidden behind text).
+  // Cached in a "ShortLinks" tab so the same order link is only ever shortened once.
+  if (p.shorten) {
+    var longUrl = String(p.u || "").trim();
+    if (!longUrl) return ContentService.createTextOutput(JSON.stringify({ ok: false, error: "no url" })).setMimeType(ContentService.MimeType.JSON);
+    var lss = SpreadsheetApp.getActiveSpreadsheet();
+    var lsh = lss.getSheetByName("ShortLinks");
+    if (!lsh) { lsh = lss.insertSheet("ShortLinks"); lsh.getRange(1, 1, 1, 3).setValues([["long", "short", "at"]]); }
+    if (lsh.getLastRow() > 1) {
+      var lv = lsh.getRange(2, 1, lsh.getLastRow() - 1, 2).getValues();
+      for (var li = 0; li < lv.length; li++) {
+        if (String(lv[li][0]) === longUrl && String(lv[li][1])) {
+          return ContentService.createTextOutput(JSON.stringify({ ok: true, short: String(lv[li][1]), cached: true })).setMimeType(ContentService.MimeType.JSON);
+        }
+      }
+    }
+    var sp = gkProps_();
+    var prov = String(sp.getProperty("SHORT_PROVIDER") || "isgd");
+    var stok = String(sp.getProperty("SHORT_TOKEN") || "");
+    var sbase = String(sp.getProperty("SHORT_BASE") || "");
+    var shortUrl = "";
+    try {
+      if (prov === "off") {
+        return ContentService.createTextOutput(JSON.stringify({ ok: false, error: "shortening is switched off" })).setMimeType(ContentService.MimeType.JSON);
+      } else if (prov === "bitly") {
+        if (!stok) throw new Error("no bitly token");
+        var payload = { long_url: longUrl };
+        if (sbase) payload.domain = sbase;                 // your own branded Bitly domain, if you have one
+        var br = UrlFetchApp.fetch("https://api-ssl.bitly.com/v4/shorten", {
+          method: "post", contentType: "application/json",
+          headers: { Authorization: "Bearer " + stok },
+          payload: JSON.stringify(payload), muteHttpExceptions: true });
+        if (br.getResponseCode() < 300) {
+          var bj = JSON.parse(br.getContentText() || "{}");
+          if (bj.link) shortUrl = String(bj.link);
+        }
+      } else if (prov === "custom") {
+        // Your own redirect service: it should return the short URL as plain text.
+        if (!sbase) throw new Error("no custom endpoint");
+        var cr = UrlFetchApp.fetch(sbase + (sbase.indexOf("?") >= 0 ? "&" : "?") + "url=" + encodeURIComponent(longUrl), { muteHttpExceptions: true });
+        if (cr.getResponseCode() === 200) {
+          var ct = String(cr.getContentText() || "").trim();
+          if (ct.indexOf("http") === 0) shortUrl = ct;
+        }
+      } else if (prov === "tinyurl") {
+        var tr = UrlFetchApp.fetch("https://tinyurl.com/api-create.php?url=" + encodeURIComponent(longUrl), { muteHttpExceptions: true });
+        if (tr.getResponseCode() === 200) {
+          var tt = String(tr.getContentText() || "").trim();
+          if (tt.indexOf("http") === 0) shortUrl = tt;
+        }
+      } else {   // default: is.gd - free, no account, no tracking
+        var ir = UrlFetchApp.fetch("https://is.gd/create.php?format=simple&url=" + encodeURIComponent(longUrl), { muteHttpExceptions: true });
+        if (ir.getResponseCode() === 200) {
+          var it = String(ir.getContentText() || "").trim();
+          if (it.indexOf("http") === 0) shortUrl = it;
+        }
+      }
+    } catch (eSh) { shortUrl = ""; }
+    if (shortUrl && shortUrl.length >= longUrl.length) shortUrl = "";   // no point if it isn't shorter
+    if (!shortUrl) return ContentService.createTextOutput(JSON.stringify({ ok: false, error: "shortener unavailable" })).setMimeType(ContentService.MimeType.JSON);
+    lsh.appendRow([longUrl, shortUrl, Date.now()]);
+    SpreadsheetApp.flush();
+    return ContentService.createTextOutput(JSON.stringify({ ok: true, short: shortUrl })).setMimeType(ContentService.MimeType.JSON);
+  }
+
+  // Client contact/KYC details (PAN, address, phone, email). Own tab, upsert-only.
+  if (p.client_details) {
+    var css1 = SpreadsheetApp.getActiveSpreadsheet();
+    var csh1 = css1.getSheetByName("ClientDetails");
+    if (!csh1 || csh1.getLastRow() < 2) return ContentService.createTextOutput(JSON.stringify({ ok: true, rows: [] })).setMimeType(ContentService.MimeType.JSON);
+    return ContentService.createTextOutput(JSON.stringify({ ok: true, rows: csh1.getDataRange().getValues() })).setMimeType(ContentService.MimeType.JSON);
+  }
+
+  // Stock baskets by risk category, kept in the "Baskets" tab so they survive a device reset.
+  // Per-client order method (email approval vs execute link), kept in "OrderMethod"
+  // so the choice survives a device reset and reaches every staff device.
+  // Advice contact set: the mobile a client uses to open an order link, which is
+  // often NOT the WhatsApp number in Holdings. Kept in "AdviceContacts".
+  if (p.advice_contacts) {
+    var acss = SpreadsheetApp.getActiveSpreadsheet();
+    var acsh = acss.getSheetByName("AdviceContacts");
+    if (!acsh || acsh.getLastRow() < 2) return ContentService.createTextOutput(JSON.stringify({ ok: true, rows: [] })).setMimeType(ContentService.MimeType.JSON);
+    return ContentService.createTextOutput(JSON.stringify({ ok: true, rows: acsh.getDataRange().getValues() })).setMimeType(ContentService.MimeType.JSON);
+  }
+
+  // Billing: the fee plans the firm charges on, kept in "FeePlans" so the list is the
+  // same on every device and survives a device reset.
+  if (p.fee_plans) {
+    var fpss = SpreadsheetApp.getActiveSpreadsheet();
+    var fpsh = fpss.getSheetByName("FeePlans");
+    if (!fpsh || fpsh.getLastRow() < 2) return ContentService.createTextOutput(JSON.stringify({ ok: true, rows: [] })).setMimeType(ContentService.MimeType.JSON);
+    return ContentService.createTextOutput(JSON.stringify({ ok: true, rows: fpsh.getDataRange().getValues() })).setMimeType(ContentService.MimeType.JSON);
+  }
+
+  // Billing: per-client billing setup (which plan, which state, resident or NRI).
+  if (p.billing_profiles) {
+    var bpss = SpreadsheetApp.getActiveSpreadsheet();
+    var bpsh = bpss.getSheetByName("BillingProfiles");
+    if (!bpsh || bpsh.getLastRow() < 2) return ContentService.createTextOutput(JSON.stringify({ ok: true, rows: [] })).setMimeType(ContentService.MimeType.JSON);
+    return ContentService.createTextOutput(JSON.stringify({ ok: true, rows: bpsh.getDataRange().getValues() })).setMimeType(ContentService.MimeType.JSON);
+  }
+
+  // Billing: the firm's own GST registration and the ONE account clients may pay into.
+  if (p.billing_settings) {
+    var bsss = SpreadsheetApp.getActiveSpreadsheet();
+    var bssh = bsss.getSheetByName("BillingSettings");
+    if (!bssh || bssh.getLastRow() < 2) return ContentService.createTextOutput(JSON.stringify({ ok: true, rows: [] })).setMimeType(ContentService.MimeType.JSON);
+    return ContentService.createTextOutput(JSON.stringify({ ok: true, rows: bssh.getDataRange().getValues() })).setMimeType(ContentService.MimeType.JSON);
+  }
+
+  // Billing: issued invoices and their receipts. Optional ?period= narrows to one quarter.
+  if (p.invoices) {
+    var inss = SpreadsheetApp.getActiveSpreadsheet();
+    var insh = inss.getSheetByName("Invoices");
+    if (!insh || insh.getLastRow() < 2) return ContentService.createTextOutput(JSON.stringify({ ok: true, rows: [] })).setMimeType(ContentService.MimeType.JSON);
+    var inAll = insh.getDataRange().getValues();
+    var inWant = String(p.period || "").trim();
+    if (inWant) {
+      var inKeep = [inAll[0]];
+      for (var ii = 1; ii < inAll.length; ii++) if (String(inAll[ii][2]).trim() === inWant) inKeep.push(inAll[ii]);
+      inAll = inKeep;
+    }
+    return ContentService.createTextOutput(JSON.stringify({ ok: true, rows: inAll })).setMimeType(ContentService.MimeType.JSON);
+  }
+
+  // Billing: the earliest executed trade on each account, which is what a first
+  // quarter's fee is charged from. Scanning the whole book here and returning one
+  // date per client keeps this to a few KB instead of shipping ~100k trade rows.
+  if (p.first_trades) {
+    var ftFirst = {};
+    var ftNote = function (code, date) {
+      var c = String(code || "").trim();
+      var d = String(date || "").trim();
+      if (!c || !/^\\d{4}-\\d{2}-\\d{2}$/.test(d)) return;
+      if (!ftFirst[c] || d < ftFirst[c]) ftFirst[c] = d;
+    };
+    try {
+      var ftRows = gkNormalizedTrades_();
+      for (var fti = 0; fti < ftRows.length; fti++) ftNote(ftRows[fti][1], ftRows[fti][0]);
+    } catch (eFt) { /* a broken Trades tab must not take the endpoint down */ }
+    // Trades keyed in by hand live in their own tab and count just the same.
+    try {
+      var ftss = SpreadsheetApp.getActiveSpreadsheet();
+      var ftsh = ftss.getSheetByName("ManualTrades");
+      if (ftsh && ftsh.getLastRow() > 1) {
+        var ftMv = ftsh.getDataRange().getValues();
+        var ftTz = Session.getScriptTimeZone();
+        for (var ftj = 1; ftj < ftMv.length; ftj++) {
+          var ftD = ftMv[ftj][1];
+          if (Object.prototype.toString.call(ftD) === "[object Date]") ftD = Utilities.formatDate(ftD, ftTz, "yyyy-MM-dd");
+          ftNote(ftMv[ftj][2], ftD);
+        }
+      }
+    } catch (eFt2) { /* same */ }
+    return ContentService.createTextOutput(JSON.stringify({ ok: true, first: ftFirst })).setMimeType(ContentService.MimeType.JSON);
+  }
+
+  // Capital gains. The whole trade book is matched FIFO here, on the sheet, because
+  // shipping ~100k trades to the browser to do it there is not workable. What comes
+  // back is one year's realised gains and the lots still open - small enough to send,
+  // and the browser prices the open lots itself from the live feed.
+  //   ?capgains=1&fy=2026-27          every client, totals only
+  //   ?capgains=1&fy=2026-27&code=X   that client, with every matched sale
+  if (p.capgains) {
+    var cgFy = String(p.fy || "").trim();                       // "2026-27"
+    var cgY = parseInt(cgFy.substring(0, 4), 10);
+    if (!cgY) return ContentService.createTextOutput(JSON.stringify({ ok: false, error: "fy must look like 2026-27" })).setMimeType(ContentService.MimeType.JSON);
+    var cgWant = String(p.code || "").trim();
+    var cgFrom = cgY + "-04-01", cgTo = (cgY + 1) + "-03-31";
+    var cgTz = Session.getScriptTimeZone();
+    var cgToday = Utilities.formatDate(new Date(), cgTz, "yyyy-MM-dd");
+    if (cgTo > cgToday) cgTo = cgToday;                          // a running year stops today
+
+    var cgRows = [];
+    try { cgRows = gkNormalizedTrades_(); } catch (eCg) { cgRows = []; }
+    // Hand-keyed trades count as much as fed ones.
+    try {
+      var cgMs = SpreadsheetApp.getActiveSpreadsheet().getSheetByName("ManualTrades");
+      if (cgMs && cgMs.getLastRow() > 1) {
+        var cgMv = cgMs.getDataRange().getValues();
+        for (var cgi = 1; cgi < cgMv.length; cgi++) {
+          var cgD = cgMv[cgi][1];
+          if (Object.prototype.toString.call(cgD) === "[object Date]") cgD = Utilities.formatDate(cgD, cgTz, "yyyy-MM-dd");
+          cgRows.push([String(cgD), String(cgMv[cgi][2]), String(cgMv[cgi][3]), String(cgMv[cgi][4]),
+            String(cgMv[cgi][5]), Number(cgMv[cgi][6]) || 0, Number(cgMv[cgi][7]) || 0, Number(cgMv[cgi][8]) || 0]);
+        }
+      }
+    } catch (eCg2) { /* a broken manual tab must not sink the report */ }
+
+    // Oldest first, so FIFO means what it says.
+    cgRows.sort(function (a, b) { return String(a[0]) < String(b[0]) ? -1 : String(a[0]) > String(b[0]) ? 1 : 0; });
+
+    // More than twelve months held is long term for listed equity.
+    var cgIsLong = function (buy, sell) {
+      var b = buy.split("-"), sl = sell.split("-");
+      var by = +b[0], bm = +b[1], bd = +b[2];
+      // Same date a year on. Where that date does not exist - 29 February - the
+      // anniversary is the last day of the month; letting JS roll it into March
+      // would read the holding a day short and call a long holding short.
+      var lastDay = new Date(by + 1, bm, 0).getDate();
+      var edge = new Date(by + 1, bm - 1, Math.min(bd, lastDay));
+      var sd = new Date(+sl[0], +sl[1] - 1, +sl[2]);
+      return sd > edge;
+    };
+    var cgBuy = function (act) { return /^(B|BUY|P|PURCHASE)/i.test(String(act || "").trim()); };
+
+    var books = {}, names = {}, realised = [], unmatched = [], totals = {};
+    var tally = function (code) {
+      if (!totals[code]) totals[code] = { code: code, name: names[code] || code, stGain: 0, stLoss: 0, ltGain: 0, ltLoss: 0, sells: 0 };
+      return totals[code];
+    };
+    for (var r = 0; r < cgRows.length; r++) {
+      var tr = cgRows[r];
+      var dt = String(tr[0] || "").trim(), code = String(tr[1] || "").trim();
+      var sym = String(tr[3] || "").trim().toUpperCase();
+      if (!dt || !code || !sym) continue;
+      if (String(tr[2] || "").trim()) names[code] = String(tr[2]).trim();
+      var qty = Math.abs(Number(tr[5]) || 0);
+      if (!qty) continue;
+      var amt = Math.abs(Number(tr[7]) || 0);
+      if (!amt) amt = qty * Math.abs(Number(tr[6]) || 0);
+      var key = code + "\\u0001" + sym;
+      if (!books[key]) books[key] = [];
+
+      if (cgBuy(tr[4])) {
+        books[key].push({ date: dt, qty: qty, cost: amt });
+        continue;
+      }
+      // A sale: eat the oldest lots first. The client gets a row in the totals for
+      // any sale inside the window even if nothing matches, so an account that sold
+      // something is never silently missing from the report.
+      if (dt >= cgFrom && dt <= cgTo) tally(code);
+      var left = qty, proceedsRate = amt / qty, book = books[key];
+      while (left > 0 && book.length) {
+        var lot = book[0];
+        var take = Math.min(left, lot.qty);
+        var lotRate = lot.cost / lot.qty;
+        var cost = lotRate * take, proceeds = proceedsRate * take;
+        var gain = proceeds - cost;
+        var isLong = cgIsLong(lot.date, dt);
+        if (dt >= cgFrom && dt <= cgTo) {
+          var t = tally(code);
+          t.sells++;
+          if (isLong) { if (gain >= 0) t.ltGain += gain; else t.ltLoss += -gain; }
+          else { if (gain >= 0) t.stGain += gain; else t.stLoss += -gain; }
+          if (cgWant && code === cgWant) {
+            realised.push({ sym: sym, buyDate: lot.date, sellDate: dt, qty: take,
+              cost: Math.round(cost * 100) / 100, proceeds: Math.round(proceeds * 100) / 100,
+              gain: Math.round(gain * 100) / 100, term: isLong ? "LONG" : "SHORT" });
+          }
+        }
+        lot.qty -= take; lot.cost -= cost; left -= take;
+        if (lot.qty <= 1e-9) book.shift();
+      }
+      // Sold more than the book knows was bought - an opening position carried in,
+      // or a gap in the feed. Never invent a zero cost for it; say so instead.
+      if (left > 1e-9 && dt >= cgFrom && dt <= cgTo) {
+        unmatched.push({ code: code, name: names[code] || code, sym: sym, date: dt, qty: Math.round(left * 1e4) / 1e4 });
+      }
+    }
+
+    // What is still held, bucketed long/short as at today, which is when the browser
+    // will price it. A lot bought before 1 Feb 2018 is marked: s.112A grandfathering
+    // needs the 31 Jan 2018 value, which is not in a trade book.
+    var open = [], lots = [];
+    for (var k in books) {
+      if (!books[k].length) continue;
+      var parts = k.split("\\u0001"), oc = parts[0], os = parts[1];
+      if (cgWant && oc !== cgWant) {
+        // still needed for the all-client view, just not lot by lot
+      }
+      var bucket = {};
+      for (var li = 0; li < books[k].length; li++) {
+        var L = books[k][li];
+        if (L.qty <= 1e-9) continue;
+        var term = cgIsLong(L.date, cgToday) ? "LONG" : "SHORT";
+        if (!bucket[term]) bucket[term] = { code: oc, name: names[oc] || oc, sym: os, term: term, qty: 0, cost: 0, oldest: L.date, preGf: 0 };
+        var bk = bucket[term];
+        bk.qty += L.qty; bk.cost += L.cost;
+        if (L.date < bk.oldest) bk.oldest = L.date;
+        if (L.date < "2018-02-01") bk.preGf += L.qty;
+        if (cgWant && oc === cgWant) {
+          lots.push({ sym: os, date: L.date, qty: Math.round(L.qty * 1e4) / 1e4,
+            cost: Math.round(L.cost * 100) / 100, term: term });
+        }
+      }
+      for (var bt in bucket) {
+        bucket[bt].qty = Math.round(bucket[bt].qty * 1e4) / 1e4;
+        bucket[bt].cost = Math.round(bucket[bt].cost * 100) / 100;
+        open.push(bucket[bt]);
+      }
+    }
+    var out2 = { ok: true, fy: cgFy, from: cgFrom, to: cgTo, asOn: cgToday, code: cgWant,
+      clients: [], open: open, unmatched: unmatched.slice(0, 500) };
+    for (var tc in totals) {
+      var tt = totals[tc];
+      tt.stGain = Math.round(tt.stGain * 100) / 100; tt.stLoss = Math.round(tt.stLoss * 100) / 100;
+      tt.ltGain = Math.round(tt.ltGain * 100) / 100; tt.ltLoss = Math.round(tt.ltLoss * 100) / 100;
+      out2.clients.push(tt);
+    }
+    if (cgWant) { out2.realised = realised; out2.lots = lots; }
+    return ContentService.createTextOutput(JSON.stringify(out2)).setMimeType(ContentService.MimeType.JSON);
+  }
+
+  // Why a sale had no purchase to match against. Rather than guess, this gathers the
+  // evidence for each gap - what the book holds for that client and scrip, whether a
+  // near-identical ticker was traded instead, whether the same name appears under
+  // another portfolio code, and what Holdings still shows - and lets the console put
+  // a name to it. ?gap_scan=1&fy=2026-27
+  if (p.gap_scan) {
+    var gsFy = String(p.fy || "").trim();
+    var gsY = parseInt(gsFy.substring(0, 4), 10);
+    if (!gsY) return ContentService.createTextOutput(JSON.stringify({ ok: false, error: "fy must look like 2026-27" })).setMimeType(ContentService.MimeType.JSON);
+    var gsTz = Session.getScriptTimeZone();
+    var gsToday = Utilities.formatDate(new Date(), gsTz, "yyyy-MM-dd");
+    var gsFrom = gsY + "-04-01", gsTo = (gsY + 1) + "-03-31";
+    if (gsTo > gsToday) gsTo = gsToday;
+
+    var gsRows = [];
+    try { gsRows = gkNormalizedTrades_(); } catch (eGs) { gsRows = []; }
+    try {
+      var gsMs = SpreadsheetApp.getActiveSpreadsheet().getSheetByName("ManualTrades");
+      if (gsMs && gsMs.getLastRow() > 1) {
+        var gsMv = gsMs.getDataRange().getValues();
+        for (var gi = 1; gi < gsMv.length; gi++) {
+          var gd = gsMv[gi][1];
+          if (Object.prototype.toString.call(gd) === "[object Date]") gd = Utilities.formatDate(gd, gsTz, "yyyy-MM-dd");
+          gsRows.push([String(gd), String(gsMv[gi][2]), String(gsMv[gi][3]), String(gsMv[gi][4]),
+            String(gsMv[gi][5]), Number(gsMv[gi][6]) || 0, Number(gsMv[gi][7]) || 0, Number(gsMv[gi][8]) || 0]);
+        }
+      }
+    } catch (eGs2) { /* ignore */ }
+    gsRows.sort(function (a, b) { return String(a[0]) < String(b[0]) ? -1 : String(a[0]) > String(b[0]) ? 1 : 0; });
+
+    var gsIsBuy = function (a) { return /^(B|BUY|P|PURCHASE)/i.test(String(a || "").trim()); };
+    // A ticker reduced to its bare letters, so NESTLEIND, NESTLEIND-BE and
+    // "Nestle India" all collapse to the same thing when comparing.
+    var gsBare = function (v) { return String(v || "").toUpperCase().replace(/[^A-Z0-9]/g, "").replace(/(BE|EQ|BL|SM|ST)$/, ""); };
+
+    var byCS = {}, names = {}, byClient = {}, bookFrom = "", bookTo = "";
+    for (var r = 0; r < gsRows.length; r++) {
+      var tr = gsRows[r];
+      var dt = String(tr[0] || "").trim(), code = String(tr[1] || "").trim();
+      var sym = String(tr[3] || "").trim().toUpperCase();
+      var qty = Math.abs(Number(tr[5]) || 0);
+      if (!dt || !code || !sym || !qty) continue;
+      if (String(tr[2] || "").trim()) names[code] = String(tr[2]).trim();
+      if (!bookFrom || dt < bookFrom) bookFrom = dt;
+      if (!bookTo || dt > bookTo) bookTo = dt;
+      var k = code + "\\u0001" + sym;
+      if (!byCS[k]) byCS[k] = { code: code, sym: sym, bought: 0, sold: 0, first: dt, last: dt, runQty: 0, shortQty: 0, sales: 0, firstSale: "", lastSale: "" };
+      var e = byCS[k];
+      if (dt < e.first) e.first = dt;
+      if (dt > e.last) e.last = dt;
+      if (!byClient[code]) byClient[code] = { first: dt, syms: {} };
+      if (dt < byClient[code].first) byClient[code].first = dt;
+      byClient[code].syms[sym] = (byClient[code].syms[sym] || 0) + (gsIsBuy(tr[4]) ? qty : -qty);
+
+      if (gsIsBuy(tr[4])) { e.bought += qty; e.runQty += qty; }
+      else {
+        e.sold += qty;
+        var have = Math.max(0, e.runQty);
+        var missing = qty - have;
+        e.runQty = have - Math.min(qty, have);
+        if (missing > 1e-9 && dt >= gsFrom && dt <= gsTo) {
+          e.shortQty += missing; e.sales++;
+          if (!e.firstSale || dt < e.firstSale) e.firstSale = dt;
+          if (dt > e.lastSale) e.lastSale = dt;
+        }
+      }
+    }
+
+    // What Holdings still shows, which says whether the position is real.
+    // Quantity and the average purchase price, which is the obvious cost to use for
+    // a carry-in lot that the trade book never saw.
+    var holdQty = {}, holdBuy = {};
+    try {
+      var hs = SpreadsheetApp.getActiveSpreadsheet().getSheetByName("Holdings");
+      if (hs && hs.getLastRow() > 1) {
+        var hv = hs.getDataRange().getValues();
+        for (var hi = 1; hi < hv.length; hi++) {
+          var hc = String(hv[hi][0] || "").trim(), hsym = String(hv[hi][5] || "").trim().toUpperCase();
+          if (!hc || !hsym) continue;
+          holdQty[hc + "\\u0001" + hsym] = Number(hv[hi][6]) || 0;
+          holdBuy[hc + "\\u0001" + hsym] = Number(hv[hi][7]) || 0;
+        }
+      }
+    } catch (eH) { /* ignore */ }
+
+    // Every portfolio code that answers to the same client name, for the case where
+    // one client's holdings sit under two codes.
+    var codesByName = {};
+    for (var nc in names) {
+      var nk = String(names[nc]).toUpperCase().replace(/\\s+/g, " ").trim();
+      if (!nk) continue;
+      if (!codesByName[nk]) codesByName[nk] = [];
+      codesByName[nk].push(nc);
+    }
+
+    var gaps = [];
+    for (var gk in byCS) {
+      var g = byCS[gk];
+      if (!(g.shortQty > 1e-9)) continue;
+      var bare = gsBare(g.sym);
+      // A different spelling of the same ticker that this client did trade.
+      var near = [];
+      var mine = (byClient[g.code] || {}).syms || {};
+      for (var ms in mine) {
+        if (ms === g.sym) continue;
+        var mb = gsBare(ms);
+        if (mb === bare || (mb.length >= 4 && bare.length >= 4 && (mb.indexOf(bare) === 0 || bare.indexOf(mb) === 0))) {
+          near.push({ sym: ms, netQty: Math.round(mine[ms] * 1e4) / 1e4 });
+        }
+      }
+      // The same scrip bought under another code carrying this client's name.
+      var others = [];
+      var myName = String(names[g.code] || "").toUpperCase().replace(/\\s+/g, " ").trim();
+      var sibs = codesByName[myName] || [];
+      for (var si = 0; si < sibs.length; si++) {
+        if (sibs[si] === g.code) continue;
+        var ok2 = byCS[sibs[si] + "\\u0001" + g.sym];
+        if (ok2 && ok2.bought > 0) others.push({ code: sibs[si], bought: Math.round(ok2.bought * 1e4) / 1e4 });
+      }
+      gaps.push({
+        code: g.code, name: names[g.code] || g.code, sym: g.sym,
+        shortQty: Math.round(g.shortQty * 1e4) / 1e4, sales: g.sales,
+        firstSale: g.firstSale, lastSale: g.lastSale,
+        bought: Math.round(g.bought * 1e4) / 1e4, sold: Math.round(g.sold * 1e4) / 1e4,
+        firstTrade: g.first, clientFirstTrade: (byClient[g.code] || {}).first || "",
+        holdingQty: holdQty[g.code + "\\u0001" + g.sym] == null ? null : holdQty[g.code + "\\u0001" + g.sym],
+        holdingBuy: holdBuy[g.code + "\\u0001" + g.sym] || 0,
+        near: near.slice(0, 5), otherCodes: others.slice(0, 5)
+      });
+    }
+    gaps.sort(function (a, b) { return b.shortQty - a.shortQty; });
+    return ContentService.createTextOutput(JSON.stringify({
+      ok: true, fy: gsFy, from: gsFrom, to: gsTo, bookFrom: bookFrom, bookTo: bookTo,
+      gaps: gaps.slice(0, 2000), gapCount: gaps.length
+    })).setMimeType(ContentService.MimeType.JSON);
+  }
+
+  // The weekly pipeline MIS, built here so the Saturday trigger can send it with
+  // nobody's browser open. ?mis=1 hands the same thing to the console for a preview.
+  if (p.mis) {
+    var misOn = String(p.on || "").trim();
+    var misData = misBuild_(misOn);
+    return ContentService.createTextOutput(JSON.stringify({
+      ok: true, mis: misData, html: misHtml_(misData), text: misText_(misData),
+      config: misConfig_(), tz: Session.getScriptTimeZone(), scheduled: misTriggerInfo_()
+    })).setMimeType(ContentService.MimeType.JSON);
+  }
+
+  // How close this spreadsheet is to being the wrong place to keep the data.
+  // Measures what a Google Sheet actually limits - the 10 million cell ceiling and
+  // the 6 minute cap on one Apps Script run - against what the trade book costs to
+  // read today, and how fast it is growing. ?dbhealth=1 (add &deep=1 to also time
+  // the FIFO match on top of the read).
+  if (p.dbhealth) {
+    var SHEET_CELL_CAP = 1e7, RUN_MS_CAP = 360000;
+    var dhStart = new Date().getTime();
+    var ss = SpreadsheetApp.getActiveSpreadsheet();
+    var sheets = ss.getSheets();
+    var tabs = [], gridCells = 0, usedCells = 0;
+    for (var i = 0; i < sheets.length; i++) {
+      var sh = sheets[i];
+      // The cap counts every cell in the grid, not just the ones with something in
+      // them, so an over-allocated tab burns quota while looking empty.
+      var mr = sh.getMaxRows(), mc = sh.getMaxColumns();
+      var lr = sh.getLastRow(), lc = sh.getLastColumn();
+      var grid = mr * mc, used = lr * lc;
+      gridCells += grid; usedCells += used;
+      tabs.push({ name: sh.getName(), rows: lr, cols: lc, maxRows: mr, maxCols: mc,
+        gridCells: grid, usedCells: used, wasted: grid - used });
+    }
+    tabs.sort(function (a, b) { return b.gridCells - a.gridCells; });
+
+    // The read everything downstream pays for, timed once and reused.
+    var tRaw = 0, tNorm = 0, tFifo = 0, tradeRows = 0, rawRows = 0, normRows = [];
+    var tSh = ss.getSheetByName("Trades");
+    if (tSh) {
+      var t0 = new Date().getTime();
+      var rawVals = tSh.getDataRange().getValues();
+      tRaw = new Date().getTime() - t0;
+      rawRows = rawVals.length;
+      rawVals = null;
+      var t1 = new Date().getTime();
+      try { normRows = gkNormalizedTrades_(); } catch (eN) { normRows = []; }
+      tNorm = new Date().getTime() - t1;
+      tradeRows = normRows.length;
+    }
+    if (String(p.deep || "") === "1" && normRows.length) {
+      var t2 = new Date().getTime();
+      var book = {}, legs = 0;
+      for (var r = 0; r < normRows.length; r++) {
+        var tr = normRows[r];
+        var k = String(tr[1]) + "\\u0001" + String(tr[3]).toUpperCase();
+        if (!book[k]) book[k] = [];
+        var q = Math.abs(Number(tr[5]) || 0);
+        if (/^(B|BUY|P|PURCHASE)/i.test(String(tr[4]))) book[k].push(q);
+        else { var left = q; while (left > 0 && book[k].length) { var take = Math.min(left, book[k][0]); book[k][0] -= take; left -= take; legs++; if (book[k][0] <= 0) book[k].shift(); } }
+      }
+      tFifo = new Date().getTime() - t2;
+    }
+
+    // Trades a month over the last two years, which is what says when the ceiling
+    // arrives rather than how close it is today.
+    var byMonth = {}, order = [];
+    for (var g = 0; g < normRows.length; g++) {
+      var mkey = String(normRows[g][0] || "").slice(0, 7);
+      if (!/^\\d{4}-\\d{2}$/.test(mkey)) continue;
+      if (!byMonth[mkey]) { byMonth[mkey] = 0; order.push(mkey); }
+      byMonth[mkey]++;
+    }
+    order.sort();
+    var growth = [];
+    for (var o = Math.max(0, order.length - 24); o < order.length; o++) growth.push({ month: order[o], trades: byMonth[order[o]] });
+    var recent = growth.slice(Math.max(0, growth.length - 6));
+    var perMonth = 0;
+    for (var rr = 0; rr < recent.length; rr++) perMonth += recent[rr].trades;
+    perMonth = recent.length ? Math.round(perMonth / recent.length) : 0;
+    var tradeCols = tSh ? Math.max(1, tSh.getLastColumn()) : 1;
+    var headroom = SHEET_CELL_CAP - gridCells;
+    var monthsToCap = perMonth > 0 ? Math.floor(headroom / (perMonth * tradeCols)) : -1;
+
+    // What it would take to blow the 6 minute limit: the read is the shared cost of
+    // every trade-reading endpoint, so that is the number that matters.
+    var heaviest = tNorm + tFifo;
+    var pctOfRun = Math.round(heaviest / RUN_MS_CAP * 1000) / 10;
+    var pctOfCells = Math.round(gridCells / SHEET_CELL_CAP * 1000) / 10;
+
+    var reasons = [], level = "fine";
+    var raise = function (lvl, why) {
+      reasons.push(why);
+      if (lvl === "move" || level === "move") level = "move";
+      else if (lvl === "watch") level = "watch";
+    };
+    if (pctOfCells >= 70) raise("move", pctOfCells + "% of the 10 million cell ceiling is already allocated.");
+    else if (pctOfCells >= 40) raise("watch", pctOfCells + "% of the cell ceiling is allocated.");
+    if (heaviest >= 120000) raise("move", "Reading the trade book takes " + Math.round(heaviest / 1000) + "s of the 360s an Apps Script run gets.");
+    else if (heaviest >= 45000) raise("watch", "Reading the trade book takes " + Math.round(heaviest / 1000) + "s, " + pctOfRun + "% of one run's budget.");
+    if (monthsToCap >= 0 && monthsToCap <= 12) raise("move", "At " + perMonth + " trades a month the cell ceiling is about " + monthsToCap + " month(s) away.");
+    else if (monthsToCap > 12 && monthsToCap <= 36) raise("watch", "At " + perMonth + " trades a month the ceiling is roughly " + monthsToCap + " month(s) away.");
+    var wasteTotal = 0;
+    for (var w = 0; w < tabs.length; w++) wasteTotal += tabs[w].wasted;
+    if (wasteTotal > 1e6) raise("watch", Math.round(wasteTotal / 1e5) / 10 + "M cells are allocated but empty - deleting unused rows and columns frees them.");
+    if (!reasons.length) reasons.push("Nothing is close to a limit. The spreadsheet is a reasonable place to keep this for now.");
+
+    return ContentService.createTextOutput(JSON.stringify({
+      ok: true, at: Utilities.formatDate(new Date(), Session.getScriptTimeZone(), "yyyy-MM-dd HH:mm"),
+      tz: Session.getScriptTimeZone(), deep: String(p.deep || "") === "1",
+      cellCap: SHEET_CELL_CAP, runMsCap: RUN_MS_CAP,
+      gridCells: gridCells, usedCells: usedCells, wastedCells: wasteTotal, pctOfCells: pctOfCells,
+      tabCount: tabs.length, tabs: tabs,
+      trades: { rawRows: rawRows, normalisedRows: tradeRows, cols: tradeCols },
+      timings: { rawReadMs: tRaw, normaliseMs: tNorm, fifoMs: tFifo, totalMs: heaviest, pctOfRun: pctOfRun,
+        diagnosticMs: new Date().getTime() - dhStart },
+      growth: { byMonth: growth, perMonth: perMonth, monthsToCap: monthsToCap },
+      verdict: { level: level, reasons: reasons }
+    })).setMimeType(ContentService.MimeType.JSON);
+  }
+
+  if (p.exec_modes) {
+    var xss = SpreadsheetApp.getActiveSpreadsheet();
+    var xsh = xss.getSheetByName("OrderMethod");
+    if (!xsh || xsh.getLastRow() < 2) return ContentService.createTextOutput(JSON.stringify({ ok: true, rows: [] })).setMimeType(ContentService.MimeType.JSON);
+    return ContentService.createTextOutput(JSON.stringify({ ok: true, rows: xsh.getDataRange().getValues() })).setMimeType(ContentService.MimeType.JSON);
+  }
+
+  if (p.baskets) {
+    var bss = SpreadsheetApp.getActiveSpreadsheet();
+    var bsh = bss.getSheetByName("Baskets");
+    if (!bsh || bsh.getLastRow() < 2) return ContentService.createTextOutput(JSON.stringify({ ok: true, rows: [] })).setMimeType(ContentService.MimeType.JSON);
+    return ContentService.createTextOutput(JSON.stringify({ ok: true, rows: bsh.getDataRange().getValues() })).setMimeType(ContentService.MimeType.JSON);
+  }
+
+  // Manually entered trades. Kept in their OWN tab so the GridKey sync can never touch them.
+  if (p.manual_trades) {
+    var mss = SpreadsheetApp.getActiveSpreadsheet();
+    var msh = mss.getSheetByName("ManualTrades");
+    if (!msh || msh.getLastRow() < 2) return ContentService.createTextOutput(JSON.stringify({ ok: true, rows: [] })).setMimeType(ContentService.MimeType.JSON);
+    return ContentService.createTextOutput(JSON.stringify({ ok: true, rows: msh.getDataRange().getValues() })).setMimeType(ContentService.MimeType.JSON);
+  }
+
+  // Enquiry & onboarding pipeline (CRM). One row per prospect in the "Pipeline" tab.
+  if (p.pipeline) {
+    var pss = SpreadsheetApp.getActiveSpreadsheet();
+    var psh = pss.getSheetByName("Pipeline");
+    if (!psh || psh.getLastRow() < 2) return ContentService.createTextOutput(JSON.stringify({ ok: true, rows: [] })).setMimeType(ContentService.MimeType.JSON);
+    var pv = psh.getDataRange().getValues();
+    return ContentService.createTextOutput(JSON.stringify({ ok: true, rows: pv })).setMimeType(ContentService.MimeType.JSON);
+  }
+
+  // Advice trace: the running audit log of every advice actually sent (append-only). Returns the
+  // most recent rows (header + up to last 2000) so the console can display and export the record.
+  if (p.advice_trace) {
+    var tss = SpreadsheetApp.getActiveSpreadsheet();
+    var tsh = tss.getSheetByName("AdviceTrace");
+    if (!tsh || tsh.getLastRow() < 1) return ContentService.createTextOutput(JSON.stringify({ ok: true, rows: [] })).setMimeType(ContentService.MimeType.JSON);
+    var tv = tsh.getDataRange().getValues();
+    var thead = tv[0], tdata = tv.slice(1);
+    if (tdata.length > 2000) tdata = tdata.slice(tdata.length - 2000);
+    return ContentService.createTextOutput(JSON.stringify({ ok: true, rows: [thead].concat(tdata) })).setMimeType(ContentService.MimeType.JSON);
+  }
+
+  // Advice alerts pushed by the Principal Officer, so staff on any device can send them from
+  // the Advice Alerts tab. Stored one row per (batch x client) in the "AdviceAlerts" tab.
+  if (p.advice_alerts) {
+    var ass = SpreadsheetApp.getActiveSpreadsheet();
+    var ash = ass.getSheetByName("AdviceAlerts");
+    if (!ash || ash.getLastRow() < 1) return ContentService.createTextOutput(JSON.stringify({ ok: true, rows: [] })).setMimeType(ContentService.MimeType.JSON);
+    var avals = ash.getDataRange().getValues();
+    return ContentService.createTextOutput(JSON.stringify({ ok: true, rows: avals })).setMimeType(ContentService.MimeType.JSON);
+  }
+
+  // Result of the last greeting-email broadcast (so the console can confirm how many went out).
+  if (p.greeting_status) {
+    var gv = PropertiesService.getScriptProperties().getProperty("GK_LAST_GREETING");
+    var gj = {};
+    try { gj = gv ? JSON.parse(gv) : {}; } catch (eg) { gj = {}; }
+    return ContentService.createTextOutput(JSON.stringify({ ok: true, result: gj.result || "", at: gj.at || 0 })).setMimeType(ContentService.MimeType.JSON);
+  }
+
+  // GridKey auto-sync status. NEVER returns the token itself - only whether one is set.
+  if (p.gridkey) {
+    var gp = PropertiesService.getScriptProperties();
+    var st = {
+      ok: true,
+      tokenSet: !!String(gp.getProperty("GK_TOKEN") || "").trim(),
+      tradesUrl: gp.getProperty("GK_TRADES_URL") || "",
+      ledgerUrl: gp.getProperty("GK_LEDGER_URL") || "",
+      holdingsUrl: gp.getProperty("GK_HOLDINGS_URL") || "",
+      lastSync: gp.getProperty("GK_LAST_SYNC") || "",
+      lastResult: gp.getProperty("GK_LAST_RESULT") || "",
+      tradesRows: gp.getProperty("GK_TRADES_ROWS") || "",
+      ledgerRows: gp.getProperty("GK_LEDGER_ROWS") || "",
+      triggers: gkTriggerCount_(),
+      timezone: Session.getScriptTimeZone()
+    };
+    return ContentService.createTextOutput(JSON.stringify(st)).setMimeType(ContentService.MimeType.JSON);
+  }
+  // Return Sheet1 as a {SYMBOL: current price} map for the live portfolio
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sheet = ss.getSheetByName("Sheet1") || ss.getSheets()[0];
+  var out = { ok: true, prices: {}, cash: {}, cashCode: {}, status: {}, statusCode: {}, alerts: [], trades: [], holdings: [], count: 0 };
+  var values = sheet.getDataRange().getValues();
+  if (values.length) {
+    var head = values[0].map(function (x) { return String(x).toLowerCase(); });
+    function col(words, dflt) {
+      for (var i = 0; i < head.length; i++)
+        for (var w = 0; w < words.length; w++)
+          if (head[i].indexOf(words[w]) >= 0) return i;
+      return dflt;
+    }
+    var symC = col(["symbol", "scrip", "nse", "ticker", "stock"], 0);
+    var prC = col(["current", "cmp", "ltp", "last", "clos", "price", "rate"], 1);
+    for (var r = 1; r < values.length; r++) {
+      var sym = String(values[r][symC] || "").trim().toUpperCase();
+      var pr = parseFloat(String(values[r][prC]).replace(/[^0-9.\\-]/g, ""));
+      if (sym && !isNaN(pr)) out.prices[sym] = pr;
+    }
+    out.count = Object.keys(out.prices).length;
+  }
+
+  // Enrich prices with CMP from the combined-holdings export, so every currently-held stock
+  // has a live price even if it isn't in Sheet1 (this is what removes the Rs.0 / -100% rows).
+  var cmpMap = gkCombinedPrices_();
+  for (var cs in cmpMap) { if (out.prices[cs] == null) out.prices[cs] = cmpMap[cs]; }
+  out.count = Object.keys(out.prices).length;
+
+  // Cash balances per client from a tab named "Cash"
+  var cashSheet = ss.getSheetByName("Cash");
+  if (cashSheet) {
+    var cv = cashSheet.getDataRange().getValues();
+    if (cv.length) {
+      var ch = cv[0].map(function (x) { return String(x).toLowerCase(); });
+      function ccol(words, dflt) {
+        for (var i = 0; i < ch.length; i++)
+          for (var w = 0; w < words.length; w++)
+            if (ch[i].indexOf(words[w]) >= 0) return i;
+        return dflt;
+      }
+      var nameC = ccol(["name", "investor", "holder", "client"], 0);
+      var amtC = ccol(["cash", "balance", "available", "ledger", "fund", "amount"], 1);
+      var codeC = ccol(["code", "ucc", "portfolio"], -1);
+      var statC = ccol(["status", "residen", "nre", "nro", "account", "type"], -1);
+      var usedFallback = -1;
+      if (codeC < 0 && ch.length >= 3) {
+        for (var i = 0; i < ch.length; i++) { if (i !== nameC && i !== amtC && i !== statC) { codeC = i; usedFallback = i; break; } }
+      }
+      if (statC < 0 && ch.length >= 4) {
+        for (var j = 0; j < ch.length; j++) { if (j !== nameC && j !== amtC && j !== codeC && j !== usedFallback) { statC = j; break; } }
+      }
+      for (var k = 1; k < cv.length; k++) {
+        var am = parseFloat(String(cv[k][amtC]).replace(/[^0-9.\\-]/g, ""));
+        var nm = String(cv[k][nameC] || "").trim();
+        var cd = codeC >= 0 ? String(cv[k][codeC] || "").trim() : "";
+        var st = statC >= 0 ? String(cv[k][statC] || "").trim() : "";
+        if (!isNaN(am)) {
+          if (nm) out.cash[nm] = am;
+          if (cd) out.cashCode[cd] = am;
+        }
+        if (st) {
+          if (nm) out.status[nm] = st;
+          if (cd) out.statusCode[cd] = st;
+        }
+      }
+    }
+  }
+
+  // Cash from the GridKey LEDGER tab. Column "Broker ledger balance" is the account's
+  // available cash; keyed on Portfolio code (each portfolio kept separate, not combined).
+  // This overlays anything from the Cash tab so the ledger is the source of truth for cash.
+  var ledgerSheet = ss.getSheetByName("Ledger");
+  if (ledgerSheet) {
+    var lv = ledgerSheet.getDataRange().getValues();
+    if (lv.length > 1) {
+      var lh = lv[0].map(function (x) { return String(x).toLowerCase().replace(/[^a-z0-9]/g, ""); });
+      function lcol() {
+        for (var a = 0; a < arguments.length; a++) {
+          var idx = lh.indexOf(arguments[a]);
+          if (idx >= 0) return idx;
+        }
+        return -1;
+      }
+      var lPCode = lcol("portfoliocode");
+      var lCCode = lcol("clientcode");
+      var lName = lcol("clientname", "portfolioname");
+      // Prefer the broker ledger balance; fall back to available/ledger balance if absent.
+      var lBal = lcol("brokerledgerbalance");
+      if (lBal < 0) lBal = lcol("availableledgerbalance", "ledgerbalance", "balance");
+      for (var li = 1; li < lv.length; li++) {
+        var lrow = lv[li];
+        if (lBal < 0) break;
+        var amt = parseFloat(String(lrow[lBal]).replace(/[^0-9.\\-]/g, ""));
+        if (isNaN(amt)) continue;
+        var pcode = lPCode >= 0 ? String(lrow[lPCode] || "").trim() : "";
+        var lnm = lName >= 0 ? String(lrow[lName] || "").trim() : "";
+        // Key cash on Portfolio code to match how Holdings accounts are keyed.
+        if (pcode) out.cashCode[pcode] = amt;
+        else if (lCCode >= 0 && String(lrow[lCCode] || "").trim()) out.cashCode[String(lrow[lCCode]).trim()] = amt;
+        if (lnm) out.cash[lnm] = amt;
+      }
+    }
+  }
+
+  // Buy/Sell alerts from a tab named "Alerts" - returned as a list of objects
+  var alertSheet = ss.getSheetByName("Alerts") || ss.getSheetByName("Advice");
+  if (alertSheet) {
+    var av = alertSheet.getDataRange().getValues();
+    if (av.length > 1) {
+      var keys = av[0].map(function (x) {
+        return String(x).toLowerCase().replace(/[^a-z0-9]/g, "");
+      });
+      for (var a = 1; a < av.length; a++) {
+        var rowVals = av[a];
+        var blank = true, obj = {};
+        for (var c = 0; c < keys.length; c++) {
+          if (!keys[c]) continue;
+          var v = rowVals[c];
+          obj[keys[c]] = v;
+          if (String(v).trim() !== "") blank = false;
+        }
+        if (!blank) out.alerts.push(obj);
+      }
+    }
+  }
+
+  // Trades from a tab named "Trades" - always returned as compact arrays
+  // [Date, Client code, Client name, Symbol, Action, Quantity, Price, Amount].
+  // The tab may hold EITHER the app's own 8-column backup format, OR a raw broker/GridKey
+  // export (29 columns: Portfolio code, Nse code, Bill amount, ...). We detect which and
+  // normalise here so the payload stays small and the app doesn't care which one it is.
+  var tradeSheet = ss.getSheetByName("Trades");
+  if (tradeSheet) {
+    var allTrades = gkNormalizedTrades_();
+    // The full book is ~100k trades, which is far too large to ship in one response - the
+    // request stalls and the console ends up showing stale data. Allow the caller to narrow
+    // it: ?code= (one client), ?sym= (one stock), ?since=YYYY-MM-DD, ?limit=.
+    var fCode = String(p.code || "").trim();
+    var fSym = String(p.sym || "").trim().toUpperCase();
+    var fSince = String(p.since || "").trim();
+    var lim = parseInt(p.limit || "0", 10);
+    if (fCode || fSym || fSince) {
+      var picked = [];
+      for (var ti = 0; ti < allTrades.length; ti++) {
+        var tr = allTrades[ti];
+        if (fCode && String(tr[1]).trim() !== fCode) continue;
+        if (fSym && String(tr[3]).trim().toUpperCase() !== fSym) continue;
+        if (fSince && String(tr[0]) < fSince) continue;
+        picked.push(tr);
+      }
+      allTrades = picked;
+    }
+    out.tradesTotal = allTrades.length;
+    if (lim > 0 && allTrades.length > lim) allTrades = allTrades.slice(allTrades.length - lim);
+    out.trades = allTrades;
+  }
+
+  // Holdings (team sync): the client/holdings backup table, returned as row arrays (header skipped)
+  var holdSheet = ss.getSheetByName("Holdings");
+  if (holdSheet) {
+    var hv = holdSheet.getDataRange().getValues();
+    var htz = Session.getScriptTimeZone();
+    for (var hi = 1; hi < hv.length; hi++) {
+      var hrow = hv[hi], hblank = true;
+      for (var hc = 0; hc < hrow.length; hc++) { if (String(hrow[hc]).trim() !== "") { hblank = false; break; } }
+      if (hblank) continue;
+      var hout = [];
+      for (var hc2 = 0; hc2 < hrow.length; hc2++) {
+        var hval = hrow[hc2];
+        if (Object.prototype.toString.call(hval) === "[object Date]") { hval = Utilities.formatDate(hval, htz, "yyyy-MM-dd HH:mm"); }
+        hout.push(hval);
+      }
+      out.holdings.push(hout);
+    }
+  }
+
+  // Staff list (for team sign-in from a fresh device). We store it as a JSON string
+  // in PropertiesService; the app updates it on every backup so this reflects the
+  // Principal Officer's latest Enable/Disable choices.
+  try {
+    var staffJson = PropertiesService.getScriptProperties().getProperty("staff");
+    if (staffJson) { out.staff = JSON.parse(staffJson); }
+  } catch (e) { /* never block the pull on a bad properties value */ }
+
+  return ContentService.createTextOutput(JSON.stringify(out)).setMimeType(ContentService.MimeType.JSON);
+}
+
+/* ==================================================================
+ *  WEEKLY PIPELINE MIS
+ *
+ *  Built and sent from here rather than from the console, so the
+ *  Saturday mail goes out whether or not anyone has the app open.
+ *  Run setupMisTrigger() once from the editor, or switch it on from
+ *  the console (Pipeline -> Weekly MIS).
+ * ================================================================== */
+
+var MIS_DEFAULT_TO = ["jaideepmenon@vasupradah.com", "neelakantanpillai@vasupradah.com", "abhishakemathur@vasupradah.com"];
+var MIS_STAGES = [
+  ["new", "New Enquiry"], ["contacted", "Contacted"], ["awaiting", "Response Awaited"],
+  ["discovery", "Discovery / Assessment"], ["risk", "Risk Profiling"], ["proposal", "Proposal / Recommendation"],
+  ["agreement", "Agreement / Engagement"], ["kyc", "KYC / Onboarding"], ["signed", "Signed / Converted"],
+  ["hold", "On Hold"], ["lost", "Lost"]
+];
+
+function misConfig_() {
+  var pr = PropertiesService.getScriptProperties();
+  var raw = String(pr.getProperty("MIS_TO") || "").trim();
+  var to = raw ? raw.split(",").map(function (x) { return x.trim(); }).filter(function (x) { return x.indexOf("@") > 0; }) : MIS_DEFAULT_TO.slice();
+  var day = String(pr.getProperty("MIS_DAY") || "SATURDAY").toUpperCase();
+  var hour = parseInt(pr.getProperty("MIS_HOUR") || "10", 10);
+  if (isNaN(hour) || hour < 0 || hour > 23) hour = 10;
+  return { to: to, day: day, hour: hour };
+}
+function misTriggerInfo_() {
+  var found = null;
+  try {
+    var all = ScriptApp.getProjectTriggers();
+    for (var i = 0; i < all.length; i++) {
+      if (all[i].getHandlerFunction() === "sendPipelineMis") { found = all[i]; break; }
+    }
+  } catch (e) { /* no permission yet */ }
+  var c = misConfig_();
+  return { on: !!found, day: c.day, hour: c.hour, tz: Session.getScriptTimeZone() };
+}
+function misRemoveTriggers_() {
+  var all = ScriptApp.getProjectTriggers();
+  for (var i = 0; i < all.length; i++) {
+    if (all[i].getHandlerFunction() === "sendPipelineMis") ScriptApp.deleteTrigger(all[i]);
+  }
+}
+function misInstallTrigger_() {
+  misRemoveTriggers_();
+  var c = misConfig_();
+  var days = {
+    MONDAY: ScriptApp.WeekDay.MONDAY, TUESDAY: ScriptApp.WeekDay.TUESDAY, WEDNESDAY: ScriptApp.WeekDay.WEDNESDAY,
+    THURSDAY: ScriptApp.WeekDay.THURSDAY, FRIDAY: ScriptApp.WeekDay.FRIDAY, SATURDAY: ScriptApp.WeekDay.SATURDAY,
+    SUNDAY: ScriptApp.WeekDay.SUNDAY
+  };
+  ScriptApp.newTrigger("sendPipelineMis").timeBased().onWeekDay(days[c.day] || ScriptApp.WeekDay.SATURDAY).atHour(c.hour).create();
+  return misTriggerInfo_();
+}
+
+/** Run this ONCE from the editor to start the weekly mail. */
+function setupMisTrigger() {
+  var t = misInstallTrigger_();
+  var msg = "Weekly MIS is on: " + t.day + " around " + t.hour + ":00 " + t.tz + ", to " + misConfig_().to.join(", ");
+  Logger.log(msg);
+  return msg;
+}
+/** Run this to stop it. */
+function stopMisTrigger() {
+  misRemoveTriggers_();
+  return "Weekly MIS trigger removed.";
+}
+/** What the trigger calls. Also safe to run by hand to test. */
+function sendPipelineMis() {
+  var r = misSend_("", misConfig_().to);
+  Logger.log(JSON.stringify(r));
+  return r;
+}
+
+function misDayStr_(d) { return Utilities.formatDate(d, Session.getScriptTimeZone(), "yyyy-MM-dd"); }
+function misPretty_(ymd) {
+  var m = String(ymd || "").match(/^(\\d{4})-(\\d{2})-(\\d{2})/);
+  if (!m) return String(ymd || "");
+  var mons = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+  return m[3] + " " + mons[parseInt(m[2], 10) - 1] + " " + m[1];
+}
+function misMoney_(n) {
+  var v = Number(n) || 0;
+  if (!v) return "-";
+  if (v >= 1e7) return "Rs " + (v / 1e7).toFixed(v % 1e7 ? 2 : 0) + " Cr";
+  if (v >= 1e5) return "Rs " + (v / 1e5).toFixed(v % 1e5 ? 2 : 0) + " L";
+  return "Rs " + Math.round(v).toLocaleString("en-IN");
+}
+function misPct_(a, b) { return b > 0 ? Math.round(a / b * 100) : 0; }
+
+/**
+ * Reads the Pipeline tab and works out the week's MIS. \`on\` is the report date
+ * (yyyy-mm-dd); the week is the seven days ending on it.
+ */
+function misBuild_(on) {
+  var tz = Session.getScriptTimeZone();
+  var today = /^\\d{4}-\\d{2}-\\d{2}$/.test(String(on || "")) ? String(on) : misDayStr_(new Date());
+  var toD = new Date(today + "T00:00:00");
+  var fromD = new Date(toD.getTime() - 6 * 864e5);
+  var weekFrom = misDayStr_(fromD), weekTo = today;
+  var monthKey = today.slice(0, 7);
+  var fyStart = (parseInt(today.slice(5, 7), 10) >= 4 ? parseInt(today.slice(0, 4), 10) : parseInt(today.slice(0, 4), 10) - 1);
+  var fyFrom = fyStart + "-04-01";
+  var fyLabel = fyStart + "-" + String((fyStart + 1) % 100 < 10 ? "0" : "") + ((fyStart + 1) % 100);
+
+  var rows = [];
+  var sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName("Pipeline");
+  if (sh && sh.getLastRow() > 1) {
+    var v = sh.getDataRange().getValues();
+    var head = v[0].map(function (x) { return String(x).trim(); });
+    var ix = {};
+    for (var hi = 0; hi < head.length; hi++) ix[head[hi]] = hi;
+    var pick = function (row, key) {
+      var i = ix[key];
+      if (i == null) return "";
+      var val = row[i];
+      if (Object.prototype.toString.call(val) === "[object Date]") return Utilities.formatDate(val, tz, "yyyy-MM-dd");
+      return val == null ? "" : val;
+    };
+    for (var r = 1; r < v.length; r++) {
+      if (!String(v[r][0] || "").trim()) continue;
+      rows.push({
+        id: String(pick(v[r], "id")), name: String(pick(v[r], "name")).trim(),
+        phone: String(pick(v[r], "phone")).trim(), source: String(pick(v[r], "source")).trim() || "Not stated",
+        enquiryDate: String(pick(v[r], "enquiryDate")).slice(0, 10),
+        corpus: Number(String(pick(v[r], "corpus")).replace(/[^0-9.\\-]/g, "")) || 0,
+        assignee: String(pick(v[r], "assignee")).trim() || "Unassigned",
+        stage: String(pick(v[r], "stage")).trim() || "new",
+        nextFollowUp: String(pick(v[r], "nextFollowUp")).slice(0, 10),
+        signedDate: String(pick(v[r], "signedDate")).slice(0, 10),
+        service: String(pick(v[r], "service")).trim() || "Not stated",
+        priority: String(pick(v[r], "priority")).trim(),
+        updatedAt: Number(pick(v[r], "updatedAt")) || 0
+      });
+    }
+  }
+
+  var isActive = function (x) { return x.stage !== "signed" && x.stage !== "lost"; };
+  var inWeek = function (d) { return d && d >= weekFrom && d <= weekTo; };
+  var active = [], signed = [], lost = [];
+  for (var i = 0; i < rows.length; i++) {
+    if (rows[i].stage === "signed") signed.push(rows[i]);
+    else if (rows[i].stage === "lost") lost.push(rows[i]);
+    else active.push(rows[i]);
+  }
+  var corpusOf = function (list) { var t = 0; for (var i2 = 0; i2 < list.length; i2++) t += list[i2].corpus; return t; };
+  var filt = function (list, fn) { var o = []; for (var i3 = 0; i3 < list.length; i3++) if (fn(list[i3])) o.push(list[i3]); return o; };
+
+  var newThisWeek = filt(rows, function (x) { return inWeek(x.enquiryDate); });
+  var signedThisWeek = filt(signed, function (x) { return inWeek(x.signedDate); });
+  var lostThisWeek = filt(lost, function (x) { return x.updatedAt && misDayStr_(new Date(x.updatedAt)) >= weekFrom && misDayStr_(new Date(x.updatedAt)) <= weekTo; });
+  var touchedThisWeek = filt(rows, function (x) { return x.updatedAt && misDayStr_(new Date(x.updatedAt)) >= weekFrom && misDayStr_(new Date(x.updatedAt)) <= weekTo; });
+  var overdue = filt(active, function (x) { return x.nextFollowUp && x.nextFollowUp <= today; });
+  var dueNext = filt(active, function (x) { return x.nextFollowUp && x.nextFollowUp > today && x.nextFollowUp <= misDayStr_(new Date(toD.getTime() + 7 * 864e5)); });
+  // Nothing done to it for a fortnight, and still open.
+  var stale = filt(active, function (x) { return !x.updatedAt || (toD.getTime() - x.updatedAt) > 14 * 864e5; });
+
+  var group = function (list, key) {
+    var m = {}, order = [];
+    for (var i4 = 0; i4 < list.length; i4++) {
+      var k = list[i4][key] || "Not stated";
+      if (!m[k]) { m[k] = { key: k, count: 0, corpus: 0, signed: 0, lost: 0 }; order.push(k); }
+      m[k].count++;
+      m[k].corpus += list[i4].corpus;
+      if (list[i4].stage === "signed") m[k].signed++;
+      if (list[i4].stage === "lost") m[k].lost++;
+    }
+    var out = [];
+    for (var oi = 0; oi < order.length; oi++) {
+      var g = m[order[oi]];
+      g.conv = misPct_(g.signed, g.signed + g.lost);
+      out.push(g);
+    }
+    out.sort(function (a, b) { return b.count - a.count; });
+    return out;
+  };
+  var funnel = [];
+  for (var si = 0; si < MIS_STAGES.length; si++) {
+    var st = MIS_STAGES[si][0];
+    var inSt = filt(rows, function (x) { return x.stage === st; });
+    funnel.push({ id: st, label: MIS_STAGES[si][1], count: inSt.length, corpus: corpusOf(inSt) });
+  }
+  var lite = function (list, n) {
+    var o = [];
+    for (var i5 = 0; i5 < Math.min(list.length, n || 50); i5++) {
+      var x = list[i5];
+      var days = x.nextFollowUp ? Math.round((toD - new Date(x.nextFollowUp + "T00:00:00")) / 864e5) : 0;
+      o.push({ name: x.name, phone: x.phone, stage: x.stage, stageLabel: misStageLabel_(x.stage),
+        assignee: x.assignee, corpus: x.corpus, source: x.source, service: x.service,
+        nextFollowUp: x.nextFollowUp, overdueDays: days, signedDate: x.signedDate, enquiryDate: x.enquiryDate });
+    }
+    return o;
+  };
+
+  return {
+    on: today, weekFrom: weekFrom, weekTo: weekTo, fyLabel: fyLabel, tz: tz,
+    total: rows.length,
+    activeCount: active.length, activeCorpus: corpusOf(active),
+    signedCount: signed.length, lostCount: lost.length,
+    conv: misPct_(signed.length, signed.length + lost.length),
+    signedThisMonth: filt(signed, function (x) { return String(x.signedDate).slice(0, 7) === monthKey; }).length,
+    signedThisFy: filt(signed, function (x) { return x.signedDate && x.signedDate >= fyFrom; }).length,
+    signedCorpusFy: corpusOf(filt(signed, function (x) { return x.signedDate && x.signedDate >= fyFrom; })),
+    week: {
+      newCount: newThisWeek.length, newCorpus: corpusOf(newThisWeek),
+      signedCount: signedThisWeek.length, signedCorpus: corpusOf(signedThisWeek),
+      lostCount: lostThisWeek.length, touched: touchedThisWeek.length,
+      newList: lite(newThisWeek, 25), signedList: lite(signedThisWeek, 25), lostList: lite(lostThisWeek, 25)
+    },
+    funnel: funnel,
+    bySource: group(rows, "source"),
+    byAdvisor: group(rows, "assignee"),
+    byService: group(rows, "service"),
+    overdue: lite(overdue.sort(function (a, b) { return String(a.nextFollowUp).localeCompare(String(b.nextFollowUp)); }), 40),
+    overdueCount: overdue.length,
+    dueNext: lite(dueNext.sort(function (a, b) { return String(a.nextFollowUp).localeCompare(String(b.nextFollowUp)); }), 40),
+    dueNextCount: dueNext.length,
+    stale: lite(stale.sort(function (a, b) { return (a.updatedAt || 0) - (b.updatedAt || 0); }), 25),
+    staleCount: stale.length
+  };
+}
+function misStageLabel_(id) {
+  for (var i = 0; i < MIS_STAGES.length; i++) if (MIS_STAGES[i][0] === id) return MIS_STAGES[i][1];
+  return id;
+}
+function misEsc_(v) {
+  return String(v == null ? "" : v).split("&").join("&amp;").split("<").join("&lt;").split(">").join("&gt;");
+}
+function misHtml_(m) {
+  var NAVY = "#1E2A78", GOLD = "#C9A24B";
+  var card = function (label, value, sub, tone) {
+    return '<td style="padding:6px"><div style="border:1px solid #e2e8f0;border-radius:10px;padding:10px 12px;background:#ffffff">'
+      + '<div style="font-size:10px;letter-spacing:.04em;text-transform:uppercase;color:#64748b">' + misEsc_(label) + '</div>'
+      + '<div style="font-size:19px;font-weight:bold;color:' + (tone || "#0f172a") + '">' + misEsc_(value) + '</div>'
+      + (sub ? '<div style="font-size:11px;color:#94a3b8">' + misEsc_(sub) + '</div>' : "") + '</div></td>';
+  };
+  var h2 = function (t) { return '<div style="font-size:13px;font-weight:bold;color:' + NAVY + ';margin:22px 0 8px">' + misEsc_(t) + '</div>'; };
+  var tbl = function (heads, rows, aligns) {
+    if (!rows.length) return '<div style="font-size:12px;color:#94a3b8;padding:6px 0">Nothing to report.</div>';
+    var out = '<table style="width:100%;border-collapse:collapse;font-size:12px"><tr style="background:#f1f5f9">';
+    for (var i = 0; i < heads.length; i++) {
+      out += '<th style="text-align:' + ((aligns && aligns[i]) || "left") + ';padding:6px 8px;font-size:11px;color:#475569;border-bottom:1px solid #e2e8f0">' + misEsc_(heads[i]) + '</th>';
+    }
+    out += "</tr>";
+    for (var r = 0; r < rows.length; r++) {
+      out += '<tr>';
+      for (var c = 0; c < rows[r].length; c++) {
+        out += '<td style="text-align:' + ((aligns && aligns[c]) || "left") + ';padding:6px 8px;border-bottom:1px solid #f1f5f9;color:#0f172a">' + rows[r][c] + "</td>";
+      }
+      out += "</tr>";
+    }
+    return out + "</table>";
+  };
+
+  var html = '<div style="font-family:Arial,Helvetica,sans-serif;color:#0f172a;font-size:14px;line-height:1.5;max-width:760px">';
+  html += '<div style="border-bottom:3px solid ' + GOLD + ';padding-bottom:10px;margin-bottom:6px">'
+    + '<div style="font-size:17px;font-weight:bold;color:' + NAVY + '">Vasupradah Investment Advisory Services P Ltd</div>'
+    + '<div style="font-size:13px;color:#334155;font-weight:bold;margin-top:4px">Pipeline MIS &ndash; week ended ' + misEsc_(misPretty_(m.weekTo)) + '</div>'
+    + '<div style="font-size:11px;color:#64748b">Covering ' + misEsc_(misPretty_(m.weekFrom)) + ' to ' + misEsc_(misPretty_(m.weekTo))
+    + ' &middot; cumulative figures as at ' + misEsc_(misPretty_(m.on)) + '</div></div>';
+
+  html += h2("Where the pipeline stands");
+  html += '<table style="width:100%;border-collapse:collapse"><tr>'
+    + card("Active prospects", String(m.activeCount), m.total + " on the book")
+    + card("Pipeline corpus", misMoney_(m.activeCorpus), "of active prospects")
+    + card("Signed to date", String(m.signedCount), m.signedThisMonth + " this month")
+    + '</tr><tr>'
+    + card("Conversion", m.conv + "%", "signed of signed plus lost", m.conv >= 33 ? "#047857" : "#0f172a")
+    + card("Overdue follow-ups", String(m.overdueCount), m.dueNextCount + " due in the next 7 days", m.overdueCount > 0 ? "#be123c" : "#047857")
+    + card("Signed this FY " + m.fyLabel, String(m.signedThisFy), misMoney_(m.signedCorpusFy) + " corpus")
+    + "</tr></table>";
+
+  html += h2("This week");
+  html += '<table style="width:100%;border-collapse:collapse"><tr>'
+    + card("New enquiries", String(m.week.newCount), misMoney_(m.week.newCorpus))
+    + card("Converted", String(m.week.signedCount), misMoney_(m.week.signedCorpus), m.week.signedCount > 0 ? "#047857" : "#0f172a")
+    + card("Lost", String(m.week.lostCount), "", m.week.lostCount > 0 ? "#be123c" : "#0f172a")
+    + card("Records worked on", String(m.week.touched), "")
+    + "</tr></table>";
+
+  var wk = [];
+  for (var a = 0; a < m.week.newList.length; a++) {
+    var x = m.week.newList[a];
+    wk.push([misEsc_(x.name), misEsc_(x.source), misEsc_(x.service), misMoney_(x.corpus), misEsc_(x.assignee)]);
+  }
+  html += h2("New enquiries this week (" + m.week.newCount + ")");
+  html += tbl(["Name", "Source", "Service", "Corpus", "Advisor"], wk, ["left", "left", "left", "right", "left"]);
+
+  if (m.week.signedList.length) {
+    var sg = [];
+    for (var b = 0; b < m.week.signedList.length; b++) {
+      var y = m.week.signedList[b];
+      sg.push([misEsc_(y.name), misEsc_(y.source), misMoney_(y.corpus), misEsc_(y.assignee), misEsc_(misPretty_(y.signedDate))]);
+    }
+    html += h2("Converted this week (" + m.week.signedCount + ")");
+    html += tbl(["Name", "Source", "Corpus", "Advisor", "Signed"], sg, ["left", "left", "right", "left", "left"]);
+  }
+
+  html += h2("Stage by stage");
+  var fn = [];
+  for (var f = 0; f < m.funnel.length; f++) {
+    if (!m.funnel[f].count) continue;
+    fn.push([misEsc_(m.funnel[f].label), String(m.funnel[f].count), misMoney_(m.funnel[f].corpus)]);
+  }
+  html += tbl(["Stage", "Count", "Corpus"], fn, ["left", "right", "right"]);
+
+  html += h2("By advisor");
+  var ad = [];
+  for (var d = 0; d < m.byAdvisor.length; d++) {
+    var g = m.byAdvisor[d];
+    ad.push([misEsc_(g.key), String(g.count), misMoney_(g.corpus), String(g.signed), String(g.lost), g.conv + "%"]);
+  }
+  html += tbl(["Advisor", "Prospects", "Corpus", "Signed", "Lost", "Conversion"], ad, ["left", "right", "right", "right", "right", "right"]);
+
+  html += h2("By source");
+  var sr = [];
+  for (var e2 = 0; e2 < m.bySource.length; e2++) {
+    var gs = m.bySource[e2];
+    sr.push([misEsc_(gs.key), String(gs.count), misMoney_(gs.corpus), String(gs.signed), gs.conv + "%"]);
+  }
+  html += tbl(["Source", "Enquiries", "Corpus", "Signed", "Conversion"], sr, ["left", "right", "right", "right", "right"]);
+
+  html += h2("By service");
+  var sv = [];
+  for (var v2 = 0; v2 < m.byService.length; v2++) {
+    sv.push([misEsc_(m.byService[v2].key), String(m.byService[v2].count), misMoney_(m.byService[v2].corpus), String(m.byService[v2].signed)]);
+  }
+  html += tbl(["Service", "Enquiries", "Corpus", "Signed"], sv, ["left", "right", "right", "right"]);
+
+  html += h2("Follow-ups overdue (" + m.overdueCount + ")");
+  var ov = [];
+  for (var o = 0; o < m.overdue.length; o++) {
+    var z = m.overdue[o];
+    ov.push(['<b>' + misEsc_(z.name) + "</b>", misEsc_(z.stageLabel), misEsc_(z.assignee),
+      misEsc_(misPretty_(z.nextFollowUp)), '<span style="color:#be123c">' + z.overdueDays + " day(s)</span>"]);
+  }
+  html += tbl(["Name", "Stage", "Advisor", "Was due", "Overdue by"], ov, ["left", "left", "left", "left", "right"]);
+
+  html += h2("Due in the next 7 days (" + m.dueNextCount + ")");
+  var dn = [];
+  for (var n2 = 0; n2 < m.dueNext.length; n2++) {
+    dn.push([misEsc_(m.dueNext[n2].name), misEsc_(m.dueNext[n2].stageLabel), misEsc_(m.dueNext[n2].assignee), misEsc_(misPretty_(m.dueNext[n2].nextFollowUp))]);
+  }
+  html += tbl(["Name", "Stage", "Advisor", "Due"], dn, ["left", "left", "left", "left"]);
+
+  if (m.staleCount) {
+    html += h2("Untouched for a fortnight (" + m.staleCount + ")");
+    var stl = [];
+    for (var s2 = 0; s2 < m.stale.length; s2++) {
+      stl.push([misEsc_(m.stale[s2].name), misEsc_(m.stale[s2].stageLabel), misEsc_(m.stale[s2].assignee), misMoney_(m.stale[s2].corpus)]);
+    }
+    html += tbl(["Name", "Stage", "Advisor", "Corpus"], stl, ["left", "left", "left", "right"]);
+  }
+
+  html += '<div style="margin-top:22px;font-size:11px;color:#94a3b8;border-top:1px solid #e2e8f0;padding-top:10px">'
+    + "Generated from the Pipeline tab of the office Google Sheet on " + misEsc_(misPretty_(m.on)) + " (" + misEsc_(m.tz) + "). "
+    + "Conversion is signed as a share of signed plus lost; prospects still in play are not counted either way. "
+    + "Internal management information &ndash; not for circulation outside the firm.</div></div>";
+  return html;
+}
+
+/** The same thing short enough to read on a phone. Used for WhatsApp. */
+function misText_(m) {
+  var L = [];
+  L.push("*Vasupradah - Pipeline MIS*");
+  L.push("Week ended " + misPretty_(m.weekTo));
+  L.push("");
+  L.push("*This week*");
+  L.push("New enquiries: " + m.week.newCount + (m.week.newCorpus ? " (" + misMoney_(m.week.newCorpus) + ")" : ""));
+  L.push("Converted: " + m.week.signedCount + (m.week.signedCorpus ? " (" + misMoney_(m.week.signedCorpus) + ")" : ""));
+  L.push("Lost: " + m.week.lostCount);
+  L.push("Worked on: " + m.week.touched);
+  L.push("");
+  L.push("*Overall*");
+  L.push("Active prospects: " + m.activeCount + " - " + misMoney_(m.activeCorpus));
+  L.push("Signed to date: " + m.signedCount + " (" + m.signedThisMonth + " this month, " + m.signedThisFy + " this FY)");
+  L.push("Conversion: " + m.conv + "%");
+  L.push("Overdue follow-ups: " + m.overdueCount + "; due next 7 days: " + m.dueNextCount);
+  if (m.overdue.length) {
+    L.push("");
+    L.push("*Overdue*");
+    for (var i = 0; i < Math.min(m.overdue.length, 8); i++) {
+      L.push("- " + m.overdue[i].name + " (" + m.overdue[i].stageLabel + ", " + m.overdue[i].assignee + ") " + m.overdue[i].overdueDays + "d");
+    }
+    if (m.overdue.length > 8) L.push("...and " + (m.overdue.length - 8) + " more");
+  }
+  L.push("");
+  L.push("Full report is in your email.");
+  return L.join("\\n");
+}
+
+function misSend_(on, to) {
+  var list = [];
+  for (var i = 0; i < (to || []).length; i++) {
+    var a = String(to[i] || "").trim().toLowerCase();
+    if (a.indexOf("@") > 0 && list.indexOf(a) < 0) list.push(a);
+  }
+  if (!list.length) return { ok: false, error: "No recipients set for the MIS." };
+  var m, html;
+  try { m = misBuild_(on); html = misHtml_(m); }
+  catch (e) { return { ok: false, error: "Could not build the report: " + e }; }
+  var subject = "Pipeline MIS - week ended " + misPretty_(m.weekTo) + " - " + m.activeCount + " active, " + m.week.newCount + " new, " + m.week.signedCount + " converted";
+  // sentTo is what actually went; to is what was tried. Keeping them apart means a
+  // bounce can never be read as a delivery.
+  var sentTo = [], failed = [];
+  for (var j = 0; j < list.length; j++) {
+    try {
+      MailApp.sendEmail(list[j], subject, misText_(m), { name: "Vasupradah Investment Advisory", htmlBody: html });
+      sentTo.push(list[j]);
+    } catch (eS) { failed.push(list[j]); }
+  }
+  return { ok: sentTo.length > 0, sent: sentTo.length, sentTo: sentTo, to: list, failed: failed, subject: subject, weekTo: m.weekTo };
+}
+function doPost(e) {
+  var SECRET = PropertiesService.getScriptProperties().getProperty("SECRET") || "820082"; // matches the Secret in the console; set a "SECRET" script property to override
+
+  var body;
+  try {
+    body = JSON.parse((e && e.postData && e.postData.contents) || "{}");
+  } catch (err) {
+    return ContentService.createTextOutput("error: bad JSON");
+  }
+  if (String(body.token) !== SECRET) {
+    return ContentService.createTextOutput("error: token mismatch");
+  }
+
+  // Staff list: whenever the app sends one along with a backup, publish it so a fresh
+  // device can read who is enabled at the login screen (before any local data exists).
+  if (Array.isArray(body.staff)) {
+    try { PropertiesService.getScriptProperties().setProperty("staff", JSON.stringify(body.staff)); } catch (e) { /* ignore */ }
+  }
+
+  // ...and the console can publish it on its own, the moment the Principal Officer
+  // enables or disables someone. Waiting for the next full backup meant a new joiner
+  // could not sign in from their own device, and a revoked name still could.
+  if (body.type === "staff") {
+    return ContentService.createTextOutput("ok: staff list saved (" + (Array.isArray(body.staff) ? body.staff.length : 0) + ")");
+  }
+
+  // --- GridKey auto-sync: save the token / URLs (token is stored server-side only) ---
+  if (body.type === "gridkey_config") {
+    var gp2 = PropertiesService.getScriptProperties();
+    // Only overwrite the token when a new one is actually supplied, so you can edit the
+    // URLs without having to retype the token every time.
+    if (typeof body.gkToken === "string" && body.gkToken.trim()) gp2.setProperty("GK_TOKEN", body.gkToken.trim());
+    if (typeof body.gkTradesUrl === "string") gp2.setProperty("GK_TRADES_URL", body.gkTradesUrl.trim());
+    if (typeof body.gkLedgerUrl === "string") gp2.setProperty("GK_LEDGER_URL", body.gkLedgerUrl.trim());
+    if (typeof body.gkHoldingsUrl === "string") gp2.setProperty("GK_HOLDINGS_URL", body.gkHoldingsUrl.trim());
+    if (body.clearToken === true) gp2.deleteProperty("GK_TOKEN");
+    return ContentService.createTextOutput("ok: gridkey config saved");
+  }
+
+  // --- GridKey auto-sync: run the fetch right now (same code the 6am/6pm triggers use) ---
+  if (body.type === "gridkey_run") {
+    var r = runGridkeySync(true);
+    return ContentService.createTextOutput("ok: " + r);
+  }
+
+  // --- Short-link provider settings. Stored on Google's server, never in the browser. ---
+  if (body.type === "shortener_config") {
+    var spx = gkProps_();
+    if (body.provider) spx.setProperty("SHORT_PROVIDER", String(body.provider));
+    if (body.shortToken != null && String(body.shortToken).trim()) spx.setProperty("SHORT_TOKEN", String(body.shortToken).trim());
+    if (body.base != null) spx.setProperty("SHORT_BASE", String(body.base).trim());
+    return ContentService.createTextOutput("ok: shortener set to " + String(body.provider || spx.getProperty("SHORT_PROVIDER") || "isgd"));
+  }
+
+  // --- Client details (PAN / address / contact). Upsert by client code; a row is only ever
+  //     replaced by a newer version of itself, never cleared by a reload or a fresh device. ---
+  if (body.type === "client_details") {
+    var cdHdr = ["code", "pan", "address", "phone", "email", "notes", "updatedAt"];
+    var cds = SpreadsheetApp.getActiveSpreadsheet();
+    var cdsh = cds.getSheetByName("ClientDetails");
+    if (!cdsh) { cdsh = cds.insertSheet("ClientDetails"); cdsh.getRange(1, 1, 1, cdHdr.length).setValues([cdHdr]); }
+    if (cdsh.getLastRow() < 1) cdsh.getRange(1, 1, 1, cdHdr.length).setValues([cdHdr]);
+    var cdAll = cdsh.getLastRow() > 1 ? cdsh.getRange(2, 1, cdsh.getLastRow() - 1, cdHdr.length).getValues() : [];
+    var cdIn = Array.isArray(body.rows) ? body.rows : (body.row ? [body.row] : []);
+    var cdA = 0, cdU = 0;
+    for (var ci = 0; ci < cdIn.length; ci++) {
+      var cr = cdIn[ci] || {};
+      var ccode = String(cr.code || "").trim();
+      if (!ccode) continue;
+      var crow = [ccode, String(cr.pan || "").toUpperCase(), String(cr.address || ""), String(cr.phone || ""),
+        String(cr.email || ""), String(cr.notes || ""), Date.now()];
+      var chit = -1;
+      for (var cj = 0; cj < cdAll.length; cj++) if (String(cdAll[cj][0]).trim() === ccode) { chit = cj; break; }
+      if (chit >= 0) { cdsh.getRange(chit + 2, 1, 1, cdHdr.length).setValues([crow]); cdAll[chit] = crow; cdU++; }
+      else { cdsh.appendRow(crow); cdAll.push(crow); cdA++; }
+    }
+    SpreadsheetApp.flush();
+    return ContentService.createTextOutput("ok: client details +" + cdA + " ~" + cdU);
+  }
+
+  // --- Stock baskets. Append/update only: a basket row is removed solely when you delete it
+  //     here, never by a reload, a fresh device or an empty local copy. ---
+  // Upsert by client code, so changing a client from one model to the other later
+  // just rewrites that row.
+  // Upsert by client code so a re-upload corrects rows instead of duplicating them.
+  if (body.type === "advice_contacts") {
+    var acHdr = ["Client code", "Name", "Email", "Country code", "Mobile", "Risk category", "PAN", "Updated at"];
+    var acss2 = SpreadsheetApp.getActiveSpreadsheet();
+    var acsh2 = acss2.getSheetByName("AdviceContacts");
+    if (!acsh2) { acsh2 = acss2.insertSheet("AdviceContacts"); acsh2.getRange(1, 1, 1, acHdr.length).setValues([acHdr]); }
+    // Refresh the header if the tab predates the separate country-code column.
+    if (acsh2.getLastRow() < 1 || String(acsh2.getRange(1, 4).getValue()).toLowerCase().indexOf("country") < 0) {
+      acsh2.getRange(1, 1, 1, acHdr.length).setValues([acHdr]);
+    }
+    var acAll = acsh2.getLastRow() > 1 ? acsh2.getRange(2, 1, acsh2.getLastRow() - 1, acHdr.length).getValues() : [];
+    var acIn = Array.isArray(body.rows) ? body.rows : [];
+    var acAdd = 0, acUpd = 0;
+    for (var ai = 0; ai < acIn.length; ai++) {
+      var ar = acIn[ai] || {};
+      var aCode = String(ar.code || "").trim();
+      if (!aCode) continue;
+      // Country code and mobile are stored as text so a leading zero or "+" survives.
+      var aRow = [aCode, String(ar.name || ""), String(ar.email || ""), "'" + String(ar.cc || ""),
+        "'" + String(ar.mobile || ""), String(ar.risk || ""), String(ar.pan || ""), Date.now()];
+      var aHit = -1;
+      for (var aj = 0; aj < acAll.length; aj++) if (String(acAll[aj][0]).trim() === aCode) { aHit = aj; break; }
+      if (aHit >= 0) { acsh2.getRange(aHit + 2, 1, 1, acHdr.length).setValues([aRow]); acAll[aHit] = aRow; acUpd++; }
+      else { acsh2.appendRow(aRow); acAll.push(aRow); acAdd++; }
+    }
+    SpreadsheetApp.flush();
+    return ContentService.createTextOutput("ok: advice contacts +" + acAdd + " ~" + acUpd);
+  }
+
+  // --- Billing fee plans. Upsert by id; a plan leaves the sheet only on an explicit
+  //     delete, never because a device turned up with an empty local copy. ---
+  if (body.type === "fee_plans") {
+    var fHdr = ["id", "Name", "Mode", "Amount", "Frequency", "Timing", "GST", "Status", "Notes", "Updated at"];
+    var fss2 = SpreadsheetApp.getActiveSpreadsheet();
+    var fsh2 = fss2.getSheetByName("FeePlans");
+    if (!fsh2) { fsh2 = fss2.insertSheet("FeePlans"); fsh2.getRange(1, 1, 1, fHdr.length).setValues([fHdr]); }
+    if (fsh2.getLastRow() < 1) fsh2.getRange(1, 1, 1, fHdr.length).setValues([fHdr]);
+    var fAll = fsh2.getLastRow() > 1 ? fsh2.getRange(2, 1, fsh2.getLastRow() - 1, fHdr.length).getValues() : [];
+
+    if (body.action === "delete") {
+      var fdId = String(body.id || "").trim();
+      if (!fdId) return ContentService.createTextOutput("error: delete needs an id");
+      for (var fd = 0; fd < fAll.length; fd++) {
+        if (String(fAll[fd][0]).trim() === fdId) {
+          fsh2.deleteRow(fd + 2);
+          SpreadsheetApp.flush();
+          return ContentService.createTextOutput("ok: fee plan deleted");
+        }
+      }
+      return ContentService.createTextOutput("ok: fee plan not found");
+    }
+
+    var fIn = Array.isArray(body.rows) ? body.rows : [];
+    var fAdd = 0, fUpd = 0;
+    for (var fi = 0; fi < fIn.length; fi++) {
+      var fr = fIn[fi] || {};
+      var fId = String(fr.id || "").trim();
+      var fName = String(fr.name || "").trim();
+      if (!fId || !fName) continue;
+      var fRow = [fId, fName, String(fr.mode || ""), Number(fr.amount) || 0, String(fr.frequency || ""),
+        String(fr.timing || ""), String(fr.gst || ""), String(fr.status || ""), String(fr.notes || ""),
+        Number(fr.updatedAt) || Date.now()];
+      var fHit = -1;
+      for (var fj = 0; fj < fAll.length; fj++) if (String(fAll[fj][0]).trim() === fId) { fHit = fj; break; }
+      if (fHit >= 0) { fsh2.getRange(fHit + 2, 1, 1, fHdr.length).setValues([fRow]); fAll[fHit] = fRow; fUpd++; }
+      else { fsh2.appendRow(fRow); fAll.push(fRow); fAdd++; }
+    }
+    SpreadsheetApp.flush();
+    return ContentService.createTextOutput("ok: fee plans +" + fAdd + " ~" + fUpd);
+  }
+
+  // --- Billing: per-client setup. Upsert by client code. ---
+  if (body.type === "billing_profiles") {
+    var bpHdr = ["Client code", "Name", "Fee plan id", "Fee plan", "Residency", "State", "Permanent state",
+      "GSTIN", "Billing start", "Billing email", "Status", "Notes", "Updated at"];
+    var bpss2 = SpreadsheetApp.getActiveSpreadsheet();
+    var bpsh2 = bpss2.getSheetByName("BillingProfiles");
+    if (!bpsh2) { bpsh2 = bpss2.insertSheet("BillingProfiles"); bpsh2.getRange(1, 1, 1, bpHdr.length).setValues([bpHdr]); }
+    if (bpsh2.getLastRow() < 1) bpsh2.getRange(1, 1, 1, bpHdr.length).setValues([bpHdr]);
+    var bpAll = bpsh2.getLastRow() > 1 ? bpsh2.getRange(2, 1, bpsh2.getLastRow() - 1, bpHdr.length).getValues() : [];
+
+    if (body.action === "delete") {
+      var bpDel = String(body.code || "").trim();
+      if (!bpDel) return ContentService.createTextOutput("error: delete needs a client code");
+      for (var bpd = 0; bpd < bpAll.length; bpd++) {
+        if (String(bpAll[bpd][0]).trim() === bpDel) {
+          bpsh2.deleteRow(bpd + 2); SpreadsheetApp.flush();
+          return ContentService.createTextOutput("ok: billing profile deleted");
+        }
+      }
+      return ContentService.createTextOutput("ok: billing profile not found");
+    }
+
+    var bpIn = Array.isArray(body.rows) ? body.rows : [];
+    var bpAdd = 0, bpUpd = 0;
+    for (var bpi = 0; bpi < bpIn.length; bpi++) {
+      var bpr = bpIn[bpi] || {};
+      var bpCode = String(bpr.code || "").trim();
+      if (!bpCode) continue;
+      var bpRow = [bpCode, String(bpr.name || ""), String(bpr.planId || ""), String(bpr.planName || ""),
+        String(bpr.residency || ""), String(bpr.state || ""), String(bpr.permanentState || ""),
+        String(bpr.gstin || ""), String(bpr.billingStart || ""), String(bpr.email || ""),
+        String(bpr.status || ""), String(bpr.notes || ""), Number(bpr.updatedAt) || Date.now()];
+      var bpHit = -1;
+      for (var bpj = 0; bpj < bpAll.length; bpj++) if (String(bpAll[bpj][0]).trim() === bpCode) { bpHit = bpj; break; }
+      if (bpHit >= 0) { bpsh2.getRange(bpHit + 2, 1, 1, bpHdr.length).setValues([bpRow]); bpAll[bpHit] = bpRow; bpUpd++; }
+      else { bpsh2.appendRow(bpRow); bpAll.push(bpRow); bpAdd++; }
+    }
+    SpreadsheetApp.flush();
+    return ContentService.createTextOutput("ok: billing profiles +" + bpAdd + " ~" + bpUpd);
+  }
+
+  // --- Billing: the firm's GST details and the single account clients pay into.
+  //     One row, rewritten each time. The UPI QR is held as a data URL so the same
+  //     image reaches every device and can be inlined into the bill mail. ---
+  if (body.type === "billing_settings") {
+    // Appended to, never reordered, so a sheet written by an older console still reads.
+    var bsHdr = ["Firm name", "Firm state", "Firm GSTIN", "PAN", "SEBI reg", "Address", "GST rate",
+      "Bank name", "Account name", "Account number", "IFSC", "Branch", "UPI id", "UPI QR",
+      "Invoice prefix", "Receipt prefix", "Notes", "Updated at",
+      "CIN", "Account type", "Invoice seed FY", "Invoice seed no", "Receipt seed FY", "Receipt seed no", "Number by quarter",
+      "CG short rate", "CG long rate", "CG long exemption", "CG cess"];
+    var bsss2 = SpreadsheetApp.getActiveSpreadsheet();
+    var bssh2 = bsss2.getSheetByName("BillingSettings");
+    if (!bssh2) { bssh2 = bsss2.insertSheet("BillingSettings"); }
+    var bsIn = body.row || {};
+    var bsQr = String(bsIn.upiQr || "");
+    // A Google Sheets cell tops out at 50,000 characters. Rather than fail the whole
+    // save, drop an oversized QR and say so - the rest of the settings still land.
+    var bsQrNote = "";
+    if (bsQr.length > 45000) { bsQr = ""; bsQrNote = " (UPI QR too large to store - use a smaller image)"; }
+    var bsRow = [String(bsIn.firmName || ""), String(bsIn.firmState || ""), String(bsIn.firmGstin || ""),
+      String(bsIn.pan || ""), String(bsIn.sebiReg || ""), String(bsIn.address || ""), Number(bsIn.gstRate) || 0,
+      String(bsIn.bankName || ""), String(bsIn.accountName || ""), "'" + String(bsIn.accountNo || ""),
+      String(bsIn.ifsc || ""), String(bsIn.branch || ""), String(bsIn.upiId || ""), bsQr,
+      String(bsIn.invoicePrefix || ""), String(bsIn.receiptPrefix || ""), String(bsIn.notes || ""),
+      Number(bsIn.updatedAt) || Date.now(),
+      String(bsIn.cin || ""), String(bsIn.accountType || ""),
+      String(bsIn.invoiceSeedFy || ""), Number(bsIn.invoiceSeedNo) || 0,
+      String(bsIn.receiptSeedFy || ""), Number(bsIn.receiptSeedNo) || 0,
+      bsIn.numberByQuarter ? "yes" : "no",
+      bsIn.cgStcgRate == null ? "" : Number(bsIn.cgStcgRate),
+      bsIn.cgLtcgRate == null ? "" : Number(bsIn.cgLtcgRate),
+      bsIn.cgLtcgExempt == null ? "" : Number(bsIn.cgLtcgExempt),
+      bsIn.cgCess == null ? "" : Number(bsIn.cgCess)];
+    bssh2.clear();
+    bssh2.getRange(1, 1, 1, bsHdr.length).setValues([bsHdr]);
+    bssh2.getRange(2, 1, 1, bsHdr.length).setValues([bsRow]);
+    SpreadsheetApp.flush();
+    return ContentService.createTextOutput("ok: billing settings saved" + bsQrNote);
+  }
+
+  // --- Billing: issued invoices. Upsert by invoice id; an invoice is never removed
+  //     by a sync, only by an explicit delete (which is for a mistaken run, not for
+  //     cancelling a real bill - cancel sets the status instead). ---
+  if (body.type === "invoices") {
+    var ivHdr = ["id", "Invoice no", "Period", "Client code", "Client name", "Email", "Fee plan",
+      "From", "To", "Days billed", "Days in quarter", "Basis", "Fee", "GST mode", "CGST", "SGST", "IGST",
+      "Total", "Place of supply", "Status", "Issued at", "Emailed at", "WhatsApp at",
+      "Receipt no", "Paid on", "Paid mode", "Paid ref", "Receipt at", "Receipt by", "Updated at"];
+    var ivss2 = SpreadsheetApp.getActiveSpreadsheet();
+    var ivsh2 = ivss2.getSheetByName("Invoices");
+    if (!ivsh2) { ivsh2 = ivss2.insertSheet("Invoices"); ivsh2.getRange(1, 1, 1, ivHdr.length).setValues([ivHdr]); }
+    if (ivsh2.getLastRow() < 1) ivsh2.getRange(1, 1, 1, ivHdr.length).setValues([ivHdr]);
+    var ivAll = ivsh2.getLastRow() > 1 ? ivsh2.getRange(2, 1, ivsh2.getLastRow() - 1, ivHdr.length).getValues() : [];
+
+    if (body.action === "delete") {
+      var ivDel = String(body.id || "").trim();
+      if (!ivDel) return ContentService.createTextOutput("error: delete needs an id");
+      for (var ivd = 0; ivd < ivAll.length; ivd++) {
+        if (String(ivAll[ivd][0]).trim() === ivDel) {
+          ivsh2.deleteRow(ivd + 2); SpreadsheetApp.flush();
+          return ContentService.createTextOutput("ok: invoice deleted");
+        }
+      }
+      return ContentService.createTextOutput("ok: invoice not found");
+    }
+
+    var ivIn = Array.isArray(body.rows) ? body.rows : [];
+    var ivAdd = 0, ivUpd = 0;
+    for (var ivi = 0; ivi < ivIn.length; ivi++) {
+      var iv = ivIn[ivi] || {};
+      var ivId = String(iv.id || "").trim();
+      if (!ivId) continue;
+      var rcp = iv.receipt || {};
+      var ivRow = [ivId, String(iv.no || ""), String(iv.period || ""), String(iv.code || ""), String(iv.name || ""),
+        String(iv.email || ""), String(iv.planName || ""), String(iv.from || ""), String(iv.to || ""),
+        Number(iv.days) || 0, Number(iv.daysInQuarter) || 0, String(iv.basis || ""), Number(iv.fee) || 0,
+        String(iv.gstMode || ""), Number(iv.cgst) || 0, Number(iv.sgst) || 0, Number(iv.igst) || 0,
+        Number(iv.total) || 0, String(iv.placeOfSupply || ""), String(iv.status || ""),
+        Number(iv.issuedAt) || 0, Number(iv.emailedAt) || 0, Number(iv.waAt) || 0,
+        String(rcp.no || ""), String(rcp.paidOn || ""), String(rcp.mode || ""), String(rcp.ref || ""),
+        Number(rcp.at) || 0, String(rcp.by || ""), Number(iv.updatedAt) || Date.now()];
+      var ivHit = -1;
+      for (var ivj = 0; ivj < ivAll.length; ivj++) if (String(ivAll[ivj][0]).trim() === ivId) { ivHit = ivj; break; }
+      if (ivHit >= 0) { ivsh2.getRange(ivHit + 2, 1, 1, ivHdr.length).setValues([ivRow]); ivAll[ivHit] = ivRow; ivUpd++; }
+      else { ivsh2.appendRow(ivRow); ivAll.push(ivRow); ivAdd++; }
+    }
+    SpreadsheetApp.flush();
+    return ContentService.createTextOutput("ok: invoices +" + ivAdd + " ~" + ivUpd);
+  }
+
+  // --- Billing mail. Unlike the advice mail this takes ready-made HTML per
+  //     recipient, because a bill is a table (fee, CGST/SGST or IGST, total) rather
+  //     than a paragraph. The UPI QR rides along as an inline image, since Gmail
+  //     strips data: URLs out of <img src>. ---
+  if (body.type === "billing_email") {
+    var beList = Array.isArray(body.recipients) ? body.recipients : [];
+    var beFrom = String(body.fromName || "Vasupradah Investment Advisory");
+    var beReply = String(body.replyTo || "").trim();
+    // The QR differs per bill now - it carries that client's amount and invoice
+    // number - so it is built per recipient, with body.qr left as a shared fallback.
+    var beQrOf = function (raw) {
+      var q = String(raw || "");
+      var cut = q.indexOf("base64,");
+      if (cut < 0) return null;
+      var mime = "image/png", semi = q.indexOf(";");
+      if (q.indexOf("data:") === 0 && semi > 5) mime = q.substring(5, semi);
+      try { return { upiqr: Utilities.newBlob(Utilities.base64Decode(q.substring(cut + 7)), mime, "upiqr.png") }; }
+      catch (eQr) { return null; }
+    };
+    var beShared = beQrOf(body.qr);
+    var beQuota = 0;
+    try { beQuota = MailApp.getRemainingDailyQuota(); } catch (eQ) { beQuota = 0; }
+    // Which addresses actually took the mail, so the console marks only those as
+    // sent. Marking a bill "mailed" when Gmail refused it would quietly lose it.
+    var beSentTo = [], beSkipped = 0, beFailed = 0, beSeen = {}, beSent = 0;
+    for (var bei = 0; bei < beList.length; bei++) {
+      var be = beList[bei] || {};
+      var beTo = String(be.email || "").trim().toLowerCase();
+      if (!beTo || beTo.indexOf("@") < 1 || beSeen[beTo]) { beSkipped++; continue; }
+      if (beSent >= beQuota) { beSkipped++; continue; }
+      beSeen[beTo] = true;
+      var beHtml = String(be.html || "");
+      var beOpts = { name: beFrom, htmlBody: beHtml };
+      var beImg = beQrOf(be.qr) || beShared;
+      if (beImg) beOpts.inlineImages = beImg;
+      if (beReply) beOpts.replyTo = beReply;
+      // The bill is the mail body AND a PDF to keep, since a body cannot be filed.
+      // The QR is inlined as a real image in the PDF, cid: being a mail-only thing.
+      if (be.pdfName) {
+        try {
+          var bePdfHtml = beImg && be.qr
+            ? beHtml.split('src="cid:upiqr"').join('src="' + String(be.qr) + '"')
+            : beHtml;
+          beOpts.attachments = [Utilities.newBlob(bePdfHtml, "text/html", String(be.pdfName) + ".html")
+            .getAs("application/pdf").setName(String(be.pdfName) + ".pdf")];
+        } catch (ePdf) { /* a bill that cannot be rendered still goes out as the body */ }
+      }
+      try { MailApp.sendEmail(beTo, String(be.subject || "Your invoice"), String(be.text || ""), beOpts); beSentTo.push(beTo); beSent++; }
+      catch (eBe) {
+        if (beReply) {
+          delete beOpts.replyTo;
+          try { MailApp.sendEmail(beTo, String(be.subject || "Your invoice"), String(be.text || ""), beOpts); beSentTo.push(beTo); beSent++; }
+          catch (eBe2) { beFailed++; }
+        } else beFailed++;
+      }
+    }
+    return ContentService.createTextOutput(JSON.stringify({ ok: beSent > 0, sent: beSent, sentTo: beSentTo, skipped: beSkipped, failed: beFailed, quota: beQuota }));
+  }
+
+  // Send the MIS now, to the configured list or to whoever is named in the call.
+  if (body.type === "mis_send") {
+    var msTo = Array.isArray(body.to) && body.to.length ? body.to : misConfig_().to;
+    var msRes = misSend_(String(body.on || ""), msTo);
+    return ContentService.createTextOutput(JSON.stringify(msRes));
+  }
+
+  // Who it goes to and when, and the weekly trigger itself.
+  if (body.type === "mis_config") {
+    var mcProps = PropertiesService.getScriptProperties();
+    if (Array.isArray(body.to)) mcProps.setProperty("MIS_TO", body.to.join(","));
+    if (body.day != null) mcProps.setProperty("MIS_DAY", String(body.day));
+    if (body.hour != null) mcProps.setProperty("MIS_HOUR", String(parseInt(body.hour, 10) || 0));
+    var mcOn = body.enabled === true || body.enabled === false ? body.enabled : null;
+    if (mcOn === true) misInstallTrigger_();
+    if (mcOn === false) misRemoveTriggers_();
+    if (mcOn === null && misTriggerInfo_().on) misInstallTrigger_();   // re-time a running one
+    return ContentService.createTextOutput(JSON.stringify({ ok: true, config: misConfig_(), scheduled: misTriggerInfo_() }));
+  }
+
+  if (body.type === "exec_modes") {
+    var xHdr = ["Client code", "Name", "Method", "Updated at"];
+    var xss2 = SpreadsheetApp.getActiveSpreadsheet();
+    var xsh2 = xss2.getSheetByName("OrderMethod");
+    if (!xsh2) { xsh2 = xss2.insertSheet("OrderMethod"); xsh2.getRange(1, 1, 1, xHdr.length).setValues([xHdr]); }
+    if (xsh2.getLastRow() < 1) xsh2.getRange(1, 1, 1, xHdr.length).setValues([xHdr]);
+    var xAll = xsh2.getLastRow() > 1 ? xsh2.getRange(2, 1, xsh2.getLastRow() - 1, xHdr.length).getValues() : [];
+    var xIn = Array.isArray(body.rows) ? body.rows : [];
+    var xAdd = 0, xUpd = 0;
+    for (var xi = 0; xi < xIn.length; xi++) {
+      var xr = xIn[xi] || {};
+      var xCode = String(xr.code || "").trim();
+      if (!xCode) continue;
+      var xMethod = String(xr.method || "").toLowerCase() === "gateway" ? "gateway" : "email";
+      var xRow = [xCode, String(xr.name || ""), xMethod, Date.now()];
+      var xHit = -1;
+      for (var xj = 0; xj < xAll.length; xj++) if (String(xAll[xj][0]).trim() === xCode) { xHit = xj; break; }
+      if (xHit >= 0) { xsh2.getRange(xHit + 2, 1, 1, xHdr.length).setValues([xRow]); xAll[xHit] = xRow; xUpd++; }
+      else { xsh2.appendRow(xRow); xAll.push(xRow); xAdd++; }
+    }
+    SpreadsheetApp.flush();
+    return ContentService.createTextOutput("ok: order methods +" + xAdd + " ~" + xUpd);
+  }
+
+  if (body.type === "baskets") {
+    var bHdr = ["category", "symbol", "rationale", "suitability", "smallcase", "report", "updatedAt"];
+    var bss2 = SpreadsheetApp.getActiveSpreadsheet();
+    var bsh2 = bss2.getSheetByName("Baskets");
+    if (!bsh2) { bsh2 = bss2.insertSheet("Baskets"); bsh2.getRange(1, 1, 1, bHdr.length).setValues([bHdr]); }
+    if (bsh2.getLastRow() < 1) bsh2.getRange(1, 1, 1, bHdr.length).setValues([bHdr]);
+    var bAll = bsh2.getLastRow() > 1 ? bsh2.getRange(2, 1, bsh2.getLastRow() - 1, bHdr.length).getValues() : [];
+    var bKey = function (c, sym) { return String(c).trim().toLowerCase() + "\\u0001" + String(sym).trim().toUpperCase(); };
+
+    if (body.action === "delete") {
+      var dk = bKey(body.category, body.symbol);
+      for (var bd = 0; bd < bAll.length; bd++) {
+        if (bKey(bAll[bd][0], bAll[bd][1]) === dk) { bsh2.deleteRow(bd + 2); SpreadsheetApp.flush(); return ContentService.createTextOutput("ok: basket row deleted"); }
+      }
+      return ContentService.createTextOutput("ok: basket row not found");
+    }
+
+    // Default: upsert a list of rows. Anything already in the sheet and not in this payload is LEFT ALONE.
+    var bIn = Array.isArray(body.rows) ? body.rows : [];
+    var bAdded = 0, bUpd = 0;
+    for (var bi = 0; bi < bIn.length; bi++) {
+      var br = bIn[bi] || {};
+      if (!br.symbol || !br.category) continue;
+      var row = [String(br.category), String(br.symbol).toUpperCase(), String(br.rationale || ""),
+        String(br.suitability || ""), String(br.smallcase || ""), String(br.report || ""), Date.now()];
+      var hit = -1, k = bKey(br.category, br.symbol);
+      for (var bj = 0; bj < bAll.length; bj++) if (bKey(bAll[bj][0], bAll[bj][1]) === k) { hit = bj; break; }
+      if (hit >= 0) { bsh2.getRange(hit + 2, 1, 1, bHdr.length).setValues([row]); bAll[hit] = row; bUpd++; }
+      else { bsh2.appendRow(row); bAll.push(row); bAdded++; }
+    }
+    SpreadsheetApp.flush();
+    return ContentService.createTextOutput("ok: baskets +" + bAdded + " ~" + bUpd);
+  }
+
+  // --- Manually entered trades. Own tab, append-only; removed only on an explicit delete. ---
+  if (body.type === "manual_trade") {
+    var mHdr = ["id", "Date", "Code", "Name", "Symbol", "Action", "Quantity", "Price", "Amount", "Note", "EnteredBy", "EnteredAt"];
+    var mss2 = SpreadsheetApp.getActiveSpreadsheet();
+    var msh2 = mss2.getSheetByName("ManualTrades");
+    if (!msh2) { msh2 = mss2.insertSheet("ManualTrades"); msh2.getRange(1, 1, 1, mHdr.length).setValues([mHdr]); }
+    if (msh2.getLastRow() < 1) msh2.getRange(1, 1, 1, mHdr.length).setValues([mHdr]);
+    var mAll = msh2.getLastRow() > 1 ? msh2.getRange(2, 1, msh2.getLastRow() - 1, mHdr.length).getValues() : [];
+
+    if (body.action === "delete") {
+      var mid = String(body.id || "");
+      for (var mi = 0; mi < mAll.length; mi++) {
+        if (String(mAll[mi][0]) === mid) { msh2.deleteRow(mi + 2); SpreadsheetApp.flush(); return ContentService.createTextOutput("ok: manual trade deleted"); }
+      }
+      return ContentService.createTextOutput("ok: manual trade not found");
+    }
+
+    // Several at once, for filling in a batch of opening positions. Anything whose
+    // id is already there is skipped, so re-sending the same file adds nothing.
+    if (Array.isArray(body.trades)) {
+      var seenIds = {};
+      for (var mz = 0; mz < mAll.length; mz++) seenIds[String(mAll[mz][0])] = true;
+      var mAdd = 0, mSkip = 0, mOut = [];
+      for (var mb = 0; mb < body.trades.length; mb++) {
+        var bt = body.trades[mb] || {};
+        if (!bt.id || seenIds[String(bt.id)]) { mSkip++; continue; }
+        seenIds[String(bt.id)] = true;
+        mOut.push([bt.id, bt.date || "", bt.code || "", bt.name || "", String(bt.symbol || "").toUpperCase(),
+          String(bt.action || "BUY").toUpperCase(), Number(bt.quantity) || 0, Number(bt.price) || 0,
+          Number(bt.amount) || (Number(bt.quantity) || 0) * (Number(bt.price) || 0), bt.note || "", bt.by || "", Date.now()]);
+        mAdd++;
+      }
+      if (mOut.length) msh2.getRange(msh2.getLastRow() + 1, 1, mOut.length, mHdr.length).setValues(mOut);
+      SpreadsheetApp.flush();
+      return ContentService.createTextOutput("ok: manual trades +" + mAdd + " ~" + mSkip);
+    }
+
+    var t = body.trade || {};
+    if (!t.id) return ContentService.createTextOutput("error: manual trade needs an id");
+    for (var mk = 0; mk < mAll.length; mk++) if (String(mAll[mk][0]) === String(t.id)) return ContentService.createTextOutput("ok: manual trade already recorded");
+    msh2.appendRow([t.id, t.date || "", t.code || "", t.name || "", String(t.symbol || "").toUpperCase(),
+      String(t.action || "").toUpperCase(), Number(t.quantity) || 0, Number(t.price) || 0,
+      Number(t.amount) || (Number(t.quantity) || 0) * (Number(t.price) || 0), t.note || "", t.by || "", Date.now()]);
+    SpreadsheetApp.flush();
+    return ContentService.createTextOutput("ok: manual trade added");
+  }
+
+  // --- Enquiry & onboarding pipeline (CRM). action = upsert | delete | replaceAll. ---
+  if (body.type === "pipeline") {
+    var pHdr = ["id", "name", "phone", "email", "source", "enquiryDate", "corpus", "basket", "assignee", "priority",
+      "stage", "nextFollowUp", "pan", "ckyc", "notes", "signedDate", "kycDocs", "check", "log", "updatedAt",
+      "service", "meetingLink", "meetingTime"];
+    var pss2 = SpreadsheetApp.getActiveSpreadsheet();
+    var psh2 = pss2.getSheetByName("Pipeline");
+    if (!psh2) { psh2 = pss2.insertSheet("Pipeline"); psh2.getRange(1, 1, 1, pHdr.length).setValues([pHdr]); }
+    if (psh2.getLastRow() < 1) psh2.getRange(1, 1, 1, pHdr.length).setValues([pHdr]);
+
+    function pRowOf(rec) {
+      var row = [];
+      for (var k = 0; k < pHdr.length; k++) {
+        var key = pHdr[k], v = rec[key];
+        if (key === "kycDocs" || key === "check" || key === "log") v = JSON.stringify(v || (key === "log" ? [] : {}));
+        row.push(v == null ? "" : v);
+      }
+      return row;
+    }
+    var pAll = psh2.getLastRow() > 1 ? psh2.getRange(2, 1, psh2.getLastRow() - 1, pHdr.length).getValues() : [];
+
+    if (body.action === "replaceAll") {
+      var inRecs = Array.isArray(body.data) ? body.data : [];
+      // Safety valve: never let an empty/near-empty device wipe a populated sheet.
+      if (!body.force && pAll.length >= 3 && inRecs.length < pAll.length / 2) {
+        return ContentService.createTextOutput("error: refusing to replace " + pAll.length + " pipeline record(s) with " + inRecs.length + " (send force:true to override)");
+      }
+      if (psh2.getLastRow() > 1) psh2.getRange(2, 1, psh2.getLastRow() - 1, pHdr.length).clearContent();
+      if (inRecs.length) {
+        var outRows = [];
+        for (var ri = 0; ri < inRecs.length; ri++) outRows.push(pRowOf(inRecs[ri]));
+        psh2.getRange(2, 1, outRows.length, pHdr.length).setValues(outRows);
+      }
+      SpreadsheetApp.flush();
+      return ContentService.createTextOutput("ok: pipeline replaced " + inRecs.length);
+    }
+
+    if (body.action === "delete") {
+      var delId = String(body.id || "");
+      for (var di = 0; di < pAll.length; di++) {
+        if (String(pAll[di][0]) === delId) { psh2.deleteRow(di + 2); SpreadsheetApp.flush(); return ContentService.createTextOutput("ok: pipeline deleted"); }
+      }
+      return ContentService.createTextOutput("ok: pipeline id not found");
+    }
+
+    // default: upsert one record (match on id, else append)
+    var rec = body.record || {};
+    if (!rec.id) return ContentService.createTextOutput("error: pipeline record needs an id");
+    var newRow = pRowOf(rec);
+    for (var ui = 0; ui < pAll.length; ui++) {
+      if (String(pAll[ui][0]) === String(rec.id)) {
+        psh2.getRange(ui + 2, 1, 1, pHdr.length).setValues([newRow]);
+        SpreadsheetApp.flush();
+        return ContentService.createTextOutput("ok: pipeline updated");
+      }
+    }
+    psh2.getRange(psh2.getLastRow() + 1, 1, 1, pHdr.length).setValues([newRow]);
+    SpreadsheetApp.flush();
+    return ContentService.createTextOutput("ok: pipeline added");
+  }
+
+  // --- Advice trace: append one row per advice actually sent (email/WhatsApp). Append-only audit
+  //     log kept in the "AdviceTrace" tab. Never cleared by the console. ---
+  if (body.type === "advice_trace") {
+    var trIn = Array.isArray(body.rows) ? body.rows : [];
+    var tss3 = SpreadsheetApp.getActiveSpreadsheet();
+    var thdr = ["At", "SentBy", "Channel", "BatchId", "Title", "Side", "Stock", "Code", "Name", "Amount", "Qty", "Model", "Subject"];
+    var tsh3 = tss3.getSheetByName("AdviceTrace");
+    if (!tsh3) { tsh3 = tss3.insertSheet("AdviceTrace"); tsh3.getRange(1, 1, 1, thdr.length).setValues([thdr]); }
+    var tout = [];
+    for (var tri = 0; tri < trIn.length; tri++) {
+      var te = trIn[tri] || {};
+      tout.push([te.at || Date.now(), te.by || "", te.channel || "", te.batchId || "", te.title || "", te.side || "", te.stock || "",
+        te.code || "", te.name || "", te.amount == null ? "" : te.amount, te.qty == null ? "" : te.qty, te.model || "", te.subject || ""]);
+    }
+    if (tout.length) tsh3.getRange(tsh3.getLastRow() + 1, 1, tout.length, thdr.length).setValues(tout);
+    SpreadsheetApp.flush();
+    return ContentService.createTextOutput("ok: trace " + tout.length);
+  }
+
+  // --- Advice alerts: the Principal Officer pushes generated advice batches so staff on any
+  //     device see them in the Advice Alerts tab and can send them to customers. Replace-all. ---
+  if (body.type === "advice_alerts") {
+    var alerts2 = Array.isArray(body.alerts) ? body.alerts : [];
+    var ass2 = SpreadsheetApp.getActiveSpreadsheet();
+    var ash2 = ass2.getSheetByName("AdviceAlerts") || ass2.insertSheet("AdviceAlerts");
+    ash2.clearContents();
+    var ahdr = ["BatchId", "At", "By", "Title", "Model", "Side", "Stock", "Code", "Name", "Email", "WhatsApp", "Amount", "Qty", "Subject", "Body", "WaBody"];
+    var arows = [ahdr];
+    for (var ai = 0; ai < alerts2.length; ai++) {
+      var ab = alerts2[ai] || {};
+      var adisp = ab.dispatch || [];
+      for (var aj = 0; aj < adisp.length; aj++) {
+        var ad = adisp[aj] || {};
+        arows.push([ab.id || "", ab.at || "", ab.by || "", ab.title || "", ab.model || "", ab.side || "", ab.stock || "",
+          ad.code || "", ad.name || "", ad.email || "", ad.whatsapp || "", ad.amount == null ? "" : ad.amount, ad.qty == null ? "" : ad.qty, ad.subject || "", ad.body || "", ad.waBody || ""]);
+      }
+    }
+    ash2.getRange(1, 1, arows.length, ahdr.length).setValues(arows);
+    SpreadsheetApp.flush();
+    return ContentService.createTextOutput("ok: advice alerts " + (arows.length - 1));
+  }
+
+  // --- Broadcast email: image and/or message to all clients. If the subject or body contains
+  //     {name}, each client gets an individual, personalised email; otherwise one BCC email. ---
+  if (body.type === "greeting_email") {
+    var gres;
+    try {
+      // Recipients may be plain emails (["a@x.com", ...]) or objects ([{email, name}, ...]).
+      var seen = {}, recips = [];
+      var inList = body.recipients || [];
+      for (var gi = 0; gi < inList.length; gi++) {
+        var it = inList[gi], em = "", nm = "", bd = "", sj = "";
+        if (it && typeof it === "object") {
+          em = String(it.email || "").trim().toLowerCase(); nm = String(it.name || "").trim();
+          bd = it.body ? String(it.body) : ""; sj = it.subject ? String(it.subject) : "";
+        } else { em = String(it || "").trim().toLowerCase(); }
+        if (em && em.indexOf("@") > 0 && !seen[em]) { seen[em] = true; recips.push({ email: em, name: nm, body: bd, subject: sj }); }
+      }
+      if (!recips.length) {
+        gres = "error: no client email addresses to send to";
+      } else {
+        var subjectT = String(body.subject || "A message from Vasupradah Investment Advisory");
+        var textT = String(body.bodyText || "");
+        var fromName = String(body.fromName || "Vasupradah Investment Advisory");
+        var personalize = !!body.personalize || subjectT.indexOf("{name}") >= 0 || textT.indexOf("{name}") >= 0;
+
+        // Build the inline image blob once (reused for every send).
+        var inlineImages = null;
+        var img = String(body.image || "");
+        var ci = img.indexOf("base64,");
+        if (ci >= 0) {
+          var b64 = img.substring(ci + 7);
+          var mime = "image/jpeg";
+          var semi = img.indexOf(";");
+          if (img.indexOf("data:") === 0 && semi > 5) mime = img.substring(5, semi);
+          inlineImages = { greeting: Utilities.newBlob(Utilities.base64Decode(b64), mime, "greeting") };
+        }
+
+        var nameFor = function (n) { return (n && n.length) ? n : "Investor"; };
+        var subName = function (s, n) { return s.split("{name}").join(nameFor(n)); };
+        // Turn plain text into simple HTML: newlines -> <br>, and leading "* " bullets -> "* ".
+        var htmlOf = function (t) {
+          var lines = t.split(String.fromCharCode(10)), out = [];
+          for (var li = 0; li < lines.length; li++) {
+            var ln = lines[li], i = 0;
+            while (i < ln.length && (ln.charCodeAt(i) === 32 || ln.charCodeAt(i) === 9)) i++;
+            var rest = ln.substring(i);
+            if (rest.charAt(0) === "*" && rest.charAt(1) === " ") ln = ln.substring(0, i) + "\\u2022 " + rest.substring(2);
+            out.push(ln);
+          }
+          return out.join("<br>");
+        };
+        var SP = String.fromCharCode(32), NL = String.fromCharCode(10), CR = String.fromCharCode(13), LT = String.fromCharCode(60);
+        // Turns a "<marker>: <url>" line into a styled button, so the client sees the
+        // wording and never the raw URL. Used for the execute link and, for clients who
+        // act on advice by replying, the Approve / Reject mailto links.
+        var btnAnchor = function (esc, marker, label, bg) {
+          var out = "", i = 0;
+          while (true) {
+            var pIdx = esc.indexOf(marker, i);
+            if (pIdx < 0) { out += esc.slice(i); break; }
+            out += esc.slice(i, pIdx);
+            var j = pIdx + marker.length, k = j;
+            while (k < esc.length) {
+              var ch = esc.charAt(k);
+              if (ch === SP || ch === NL || ch === CR || ch === LT) break;
+              k++;
+            }
+            var url = esc.slice(j, k).split("&").join("&amp;");
+            out += '<a href="' + url + '" style="display:inline-block;background:' + bg + ';color:#ffffff;'
+              + 'text-decoration:none;padding:9px 16px;border-radius:8px;font-weight:bold;margin:2px 8px 2px 0">' + label + '</a>';
+            i = k;
+          }
+          return out;
+        };
+        var execAnchor = function (esc) {
+          esc = btnAnchor(esc, "Click Here To Execute the Order: ", "Click Here To Execute the Order", "#2E3192");
+          esc = btnAnchor(esc, "Approve the order: ", "Approve the order", "#059669");
+          esc = btnAnchor(esc, "Reject the order: ", "Reject the order", "#e11d48");
+          return esc;
+        };
+        var bodyHtml = function (t) {
+          var h = '<div style="font-family:Arial,Helvetica,sans-serif;color:#0f172a;font-size:14px;line-height:1.5">';
+          // The client sees the wording as a button; the URL itself is never shown.
+          h += '<p>' + execAnchor(htmlOf(t)) + '</p>';
+          if (inlineImages) h += '<img src="cid:greeting" alt="image" style="max-width:100%;height:auto;border-radius:8px"/>';
+          return h + '</div>';
+        };
+
+        // Where a client's plain "Reply" should land (the dealing team, for advice the
+        // client approves by replying). Comma-separated; blank leaves Gmail's default.
+        var replyToAddr = String(body.replyTo || "").trim();
+        var quota = MailApp.getRemainingDailyQuota();
+        var toAddr = "";
+        try { toAddr = Session.getEffectiveUser().getEmail(); } catch (e2) { toAddr = ""; }
+
+        if (personalize) {
+          // One individual email per client. Each recipient may carry its own {body}/{subject}
+          // (used by advice orders, where the rupee amount differs per client); otherwise the
+          // shared subject/body is used, with {name} filled in.
+          var sent = 0, skipped = 0;
+          for (var pi = 0; pi < recips.length; pi++) {
+            if (sent >= quota) { skipped = recips.length - sent; break; }
+            var rc = recips[pi];
+            var rcText = rc.body ? String(rc.body) : textT;
+            var rcSubj = rc.subject ? String(rc.subject) : subjectT;
+            var opts = { name: fromName, htmlBody: bodyHtml(subName(rcText, rc.name)) };
+            if (inlineImages) opts.inlineImages = inlineImages;
+            if (replyToAddr) opts.replyTo = replyToAddr;
+            try { MailApp.sendEmail(rc.email, subName(rcSubj, rc.name), subName(rcText, rc.name), opts); sent++; }
+            catch (eSend) {
+              // Gmail can reject a multi-address Reply-To. Losing the advice mail over a
+              // header is worse than losing the header, so retry once without it.
+              if (replyToAddr) {
+                delete opts.replyTo;
+                try { MailApp.sendEmail(rc.email, subName(rcSubj, rc.name), subName(rcText, rc.name), opts); sent++; }
+                catch (eSend2) { /* skip a bad address, keep going */ }
+              }
+            }
+          }
+          if (sent === 0) gres = "error: Gmail's daily send limit is already used up. Try again tomorrow, or broadcast on WhatsApp.";
+          else gres = "OK \\u2014 personalised email sent to " + sent + " client(s)"
+            + (skipped > 0 ? " (" + skipped + " not sent today \\u2014 Gmail daily limit; send the rest tomorrow)" : "");
+        } else {
+          // One BCC email, identical to everyone.
+          var list = [];
+          for (var bi = 0; bi < recips.length; bi++) list.push(recips[bi].email);
+          var sendList = list, extra = "";
+          if (list.length > quota) { sendList = list.slice(0, quota); extra = " (" + (list.length - quota) + " not sent today \\u2014 Gmail daily limit; send the rest tomorrow or broadcast on WhatsApp)"; }
+          if (!sendList.length) {
+            gres = "error: Gmail's daily send limit is already used up. Try again tomorrow, or broadcast on WhatsApp.";
+          } else {
+            var opts2 = { bcc: sendList.join(","), name: fromName, htmlBody: bodyHtml(textT) };
+            if (inlineImages) opts2.inlineImages = inlineImages;
+            if (!toAddr) toAddr = sendList[0];
+            MailApp.sendEmail(toAddr, subjectT, textT, opts2);
+            gres = "OK \\u2014 emailed to " + sendList.length + " client(s)" + extra;
+          }
+        }
+      }
+    } catch (err) {
+      gres = "error: " + (err && err.message ? err.message : err);
+    }
+    try { PropertiesService.getScriptProperties().setProperty("GK_LAST_GREETING", JSON.stringify({ result: gres, at: Date.now() })); } catch (e3) { /* ignore */ }
+    return ContentService.createTextOutput(gres);
+  }
+
+  // --- Trades writer: body.type === "trades", body.rows = [[Date,Code,Name,Symbol,Action,Qty,Price,Amount], ...]
+  if (body.type === "trades") {
+    var tHeader = ["Date", "Client code", "Client name", "Symbol", "Action", "Quantity", "Price", "Amount"];
+    var TW = tHeader.length;
+    var tRows = Array.isArray(body.rows) ? body.rows : [];
+    var tClean = tRows.map(function (r) { r = Array.isArray(r) ? r.slice(0, TW) : []; while (r.length < TW) r.push(""); return r; });
+    var tss = SpreadsheetApp.getActiveSpreadsheet();
+    var tsheet = tss.getSheetByName("Trades") || tss.insertSheet("Trades");
+    if (body.reset) { tsheet.clearContents(); tsheet.getRange(1, 1, 1, TW).setValues([tHeader]); }
+    if (tsheet.getLastRow() === 0) tsheet.getRange(1, 1, 1, TW).setValues([tHeader]);
+    if (tClean.length) tsheet.getRange(tsheet.getLastRow() + 1, 1, tClean.length, TW).setValues(tClean);
+    SpreadsheetApp.flush();
+    return ContentService.createTextOutput("ok: trades appended " + tClean.length);
+  }
+
+  // --- Holdings backup (default POST): body.rows = full holdings table ---
+  var header = ["Client code","Name","Email","WhatsApp","Risk category","Stock","Quantity",
+    "Purchase price","Current price","Invested","Current value",
+    "P/L amount","P/L %","Invested set","Backed up at"];
+  var W = header.length;
+
+  // Anything reaching here is meant to be a full holdings backup, and it replaces the
+  // tab wholesale. A POST that carried no rows at all is not that - it is an unknown
+  // or mistyped request type, and writing it out would empty Holdings.
+  if (!Array.isArray(body.rows)) {
+    return ContentService.createTextOutput("error: this request carried no rows, so Holdings was left untouched.");
+  }
+
+  // force every row to exactly W columns so setValues can never fail on width
+  var rows = body.rows;
+  var clean = rows.map(function (r) {
+    r = Array.isArray(r) ? r.slice(0, W) : [];
+    while (r.length < W) r.push("");
+    return r;
+  });
+
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sheet = ss.getSheetByName("Holdings") || ss.insertSheet("Holdings");
+  sheet.clearContents();
+
+  var all = [header].concat(clean);
+  sheet.getRange(1, 1, all.length, W).setValues(all);
+  SpreadsheetApp.flush();
+
+  return ContentService.createTextOutput("ok: wrote " + clean.length + " data rows");
+}
+
+/* ==================================================================
+ *  GRIDKEY AUTO-SYNC  (trades + ledger, twice daily)
+ *
+ *  The API token is stored in Script Properties - NOT in the sheet and
+ *  NOT in the browser app. Set it from the console:
+ *      Settings -> GridKey auto-sync -> paste token -> Save.
+ *  Or here:  Project Settings -> Script properties -> GK_TOKEN.
+ *
+ *  To turn on the 6am / 6pm schedule, run setupGridkeyTriggers() ONCE
+ *  from the Apps Script editor (pick it from the function dropdown and
+ *  press Run). Authorise it when Google asks.
+ * ================================================================== */
+
+var GK_TRADES_SHEET = "Trades";
+var GK_LEDGER_SHEET = "Ledger";
+var GK_HOLDINGS_SHEET = "CombinedHoldings";
+
+function gkProps_() { return PropertiesService.getScriptProperties(); }
+
+// Pull a clean URL out of whatever was pasted - a plain URL, or a full cURL command
+// (e.g. "curl 'https://...' -H '...'"). Prevents the common 'pasted the whole cURL' mistake.
+function gkExtractUrl_(v) {
+  var s = String(v || "").trim();
+  if (!s) return s;
+  var m = s.match(/https?:\\/\\/[^\\s'"]+/);
+  return m ? m[0] : s;
+}
+
+function gkFetch_(url) {
+  var props = gkProps_();
+  var token = String(props.getProperty("GK_TOKEN") || "").trim();
+  if (!token) throw new Error("No GridKey token set. Add it in the console (Settings -> GridKey auto-sync).");
+  url = gkExtractUrl_(url);
+  if (!url || url.indexOf("http") !== 0) throw new Error("No valid URL configured for this feed (paste only the https://\\u2026 address, not the whole cURL).");
+  var opts = {
+    method: "get", muteHttpExceptions: true, followRedirects: true,
+    headers: {
+      "accept": "application/json, text/plain, */*",
+      "authorization": "Token " + token,
+      "origin": "https://gridkey.in",
+      "referer": "https://gridkey.in/",
+      "x-gridkey-user-role": "advisor"
+    }
+  };
+  // Retry a couple of times on transient errors (rate-limit / gateway), with a short backoff.
+  var res, code, attempt = 0;
+  while (true) {
+    res = UrlFetchApp.fetch(url, opts);
+    code = res.getResponseCode();
+    if (code === 200) return res.getContentText();
+    if (code === 401 || code === 403) throw new Error("GridKey rejected the token (HTTP " + code + "). Update the token in the console.");
+    var transient = (code === 429 || code === 500 || code === 502 || code === 503 || code === 504);
+    if (!transient || attempt >= 2) throw new Error("GridKey returned HTTP " + code + ": " + String(res.getContentText()).slice(0, 160));
+    attempt++;
+    Utilities.sleep(2000 * attempt);
+  }
+}
+
+// Parse a GridKey CSV payload into padded rows (shared by the merge and replace writers).
+function gkParseCsv_(sheetName, csvText) {
+  var body = String(csvText || "").replace(/^\\uFEFF/, "").trim();
+  if (!body) throw new Error("Empty response from GridKey for " + sheetName + ".");
+  if (body.charAt(0) === "{" || body.charAt(0) === "[") {
+    var j;
+    try { j = JSON.parse(body); } catch (e) { j = null; }
+    if (j) {
+      if (typeof j === "string") body = j;
+      else if (j.data && typeof j.data === "string") body = j.data;
+      else if (j.csv && typeof j.csv === "string") body = j.csv;
+      else if (j.url) { body = gkFetch_(j.url); }
+      else throw new Error("Unexpected JSON from GridKey for " + sheetName + " (no csv/data/url field).");
+    }
+  }
+  var rows = Utilities.parseCsv(body);
+  if (!rows || rows.length < 2) throw new Error("Parsed 0 data rows for " + sheetName + " \\u2014 check the URL/filters.");
+  var W = 0;
+  for (var i = 0; i < rows.length; i++) W = Math.max(W, rows[i].length);
+  for (var r = 0; r < rows.length; r++) { while (rows[r].length < W) rows[r].push(""); }
+  return { rows: rows, W: W };
+}
+
+// Values must be compared in a canonical form, because Sheets silently converts what we write:
+// the text 2026-07-14 comes back as a Date, and 9450 as a number. Comparing the raw values made
+// every row look new, so each sync re-appended the whole export. Written without regular
+// expressions, since this file lives inside a template literal where escapes do not survive.
+function gkNumStr_(n) {
+  if (!isFinite(n)) return "";
+  var s = String(n);
+  if (s.indexOf("e") >= 0 || s.indexOf("E") >= 0) s = n.toFixed(6);
+  return s;
+}
+function gkDatePart_(s) {
+  var sep = "";
+  if (s.indexOf("-") >= 0) sep = "-"; else if (s.indexOf("/") >= 0) sep = "/"; else return "";
+  var head = s.split(" ")[0];
+  var bits = head.split(sep);
+  if (bits.length !== 3) return "";
+  var a = bits[0], b = bits[1], c = bits[2], i, ch;
+  for (i = 0; i < head.length; i++) { ch = head.charAt(i); if (ch !== sep && (ch < "0" || ch > "9")) return ""; }
+  var y, m, d;
+  if (a.length === 4) { y = a; m = b; d = c; }
+  else if (c.length === 4) { y = c; m = b; d = a; }
+  else return "";
+  if (m.length < 2) m = "0" + m;
+  if (d.length < 2) d = "0" + d;
+  return y + "-" + m + "-" + d;
+}
+function gkCanon_(v) {
+  if (v == null) return "";
+  if (Object.prototype.toString.call(v) === "[object Date]") {
+    var tz = Session.getScriptTimeZone();
+    var withTime = v.getHours() || v.getMinutes() || v.getSeconds();
+    return Utilities.formatDate(v, tz, withTime ? "yyyy-MM-dd HH:mm" : "yyyy-MM-dd");
+  }
+  if (typeof v === "number") return gkNumStr_(v);
+  if (typeof v === "boolean") return v ? "true" : "false";
+  var s = String(v);
+  var t = "", k;
+  for (k = 0; k < s.length; k++) { var c0 = s.charAt(k); if (c0 !== " " && c0 !== String.fromCharCode(9)) break; }
+  t = s.slice(k);
+  while (t.length && (t.charAt(t.length - 1) === " " || t.charAt(t.length - 1) === String.fromCharCode(9))) t = t.slice(0, -1);
+  if (!t) return "";
+  // number written as text, possibly with thousands separators or a currency prefix
+  var cleaned = "", digits = 0, dots = 0, okNum = true, i, ch;
+  for (i = 0; i < t.length; i++) {
+    ch = t.charAt(i);
+    if (ch >= "0" && ch <= "9") { digits++; cleaned += ch; }
+    else if (ch === ".") { dots++; cleaned += ch; }
+    else if (ch === "-" && i === 0) { cleaned += ch; }
+    else if (ch === "," || ch === " ") { /* separator */ }
+    else if (i === 0 && (ch === String.fromCharCode(8377) || ch === "$")) { /* currency */ }
+    else { okNum = false; break; }
+  }
+  if (okNum && digits > 0 && dots <= 1) {
+    var n = Number(cleaned);
+    if (!isNaN(n)) return gkNumStr_(n);
+  }
+  var dp = gkDatePart_(t);
+  if (dp) {
+    var rest = t.split(" ")[1];
+    return rest ? dp + " " + rest.slice(0, 5) : dp;
+  }
+  return t.toLowerCase();
+}
+// One comparable signature per row, so a row already in the sheet is never added twice.
+function gkRowSig_(row) {
+  var SEP = String.fromCharCode(1), parts = [], i;
+  for (i = 0; i < row.length; i++) parts.push(gkCanon_(row[i]));
+  while (parts.length && parts[parts.length - 1] === "") parts.pop();   // ignore trailing blanks
+  return parts.join(SEP);
+}
+
+// Remove rows already duplicated by the old comparison. Keeps the FIRST copy of each row.
+function gkDedupeSheet_(name) {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sh = ss.getSheetByName(name);
+  if (!sh || sh.getLastRow() < 3) return { sheet: name, before: sh ? Math.max(0, sh.getLastRow() - 1) : 0, after: sh ? Math.max(0, sh.getLastRow() - 1) : 0, removed: 0 };
+  var w = sh.getLastColumn();
+  var vals = sh.getRange(1, 1, sh.getLastRow(), w).getValues();
+  var header = vals[0], seen = {}, kept = [], i, sig;
+  for (i = 1; i < vals.length; i++) {
+    sig = gkRowSig_(vals[i]);
+    if (!sig) continue;                 // drop fully blank rows
+    if (seen[sig]) continue;
+    seen[sig] = true;
+    kept.push(vals[i]);
+  }
+  var before = vals.length - 1, removed = before - kept.length;
+  if (removed > 0) {
+    sh.clearContents();
+    sh.getRange(1, 1, 1, w).setValues([header]);
+    var CH = 5000;
+    for (var st = 0; st < kept.length; st += CH) {
+      var block = kept.slice(st, st + CH);
+      sh.getRange(2 + st, 1, block.length, w).setValues(block);
+    }
+    SpreadsheetApp.flush();
+  }
+  return { sheet: name, before: before, after: kept.length, removed: removed };
+}
+
+// APPEND-ONLY writer. Compares by COUNT, not by presence: if the export lists a row three
+// times (a broker reporting one order as three identical fills) the tab must end up with three.
+// We append only the shortfall, so re-running the same export adds nothing while genuine repeat
+// trades are never swallowed.
+function gkMergeCsv_(sheetName, csvText) {
+  var parsed = gkParseCsv_(sheetName, csvText);
+  var rows = parsed.rows, W = parsed.W;
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sh = ss.getSheetByName(sheetName) || ss.insertSheet(sheetName);
+  if (sh.getLastRow() === 0) sh.getRange(1, 1, 1, W).setValues([rows[0]]);
+
+  var exW = Math.max(sh.getLastColumn(), W);
+  var have = {}, i, sig;
+  if (sh.getLastRow() > 1) {
+    var ev = sh.getRange(2, 1, sh.getLastRow() - 1, sh.getLastColumn()).getValues();
+    for (i = 0; i < ev.length; i++) {
+      sig = gkRowSig_(ev[i]);
+      have[sig] = (have[sig] || 0) + 1;
+    }
+  }
+  var want = {}, order = [];
+  for (i = 1; i < rows.length; i++) {
+    sig = gkRowSig_(rows[i]);
+    if (!sig) continue;
+    want[sig] = (want[sig] || 0) + 1;
+    order.push({ sig: sig, row: rows[i] });
+  }
+  var used = {}, fresh = [];
+  for (i = 0; i < order.length; i++) {
+    var sg = order[i].sig;
+    used[sg] = (used[sg] || 0) + 1;
+    if (used[sg] <= (have[sg] || 0)) continue;      // this copy is already in the sheet
+    var row = order[i].row.slice();
+    while (row.length < exW) row.push("");
+    fresh.push(row.slice(0, exW));
+  }
+  if (fresh.length) {
+    var CH = 5000;
+    for (var st = 0; st < fresh.length; st += CH) {
+      var block = fresh.slice(st, st + CH);
+      sh.getRange(sh.getLastRow() + 1, 1, block.length, exW).setValues(block);
+    }
+  }
+  SpreadsheetApp.flush();
+  return fresh.length;   // NEW rows appended this run
+}
+
+// Write a CSV payload to a tab, replacing whatever was there.
+function gkWriteCsv_(sheetName, csvText) {
+  var body = String(csvText || "").replace(/^\\uFEFF/, "").trim();
+  if (!body) throw new Error("Empty response from GridKey for " + sheetName + ".");
+  // Some endpoints wrap the CSV in JSON, e.g. {"data":"a,b\\n1,2"} or {"url":"https://..."}
+  if (body.charAt(0) === "{" || body.charAt(0) === "[") {
+    var j;
+    try { j = JSON.parse(body); } catch (e) { j = null; }
+    if (j) {
+      if (typeof j === "string") body = j;
+      else if (j.data && typeof j.data === "string") body = j.data;
+      else if (j.csv && typeof j.csv === "string") body = j.csv;
+      else if (j.url) { body = gkFetch_(j.url); }
+      else throw new Error("Unexpected JSON from GridKey for " + sheetName + " (no csv/data/url field).");
+    }
+  }
+  var rows = Utilities.parseCsv(body);
+  if (!rows || rows.length < 2) throw new Error("Parsed 0 data rows for " + sheetName + " \\u2014 check the URL/filters.");
+
+  // Pad every row to the header width so setValues never fails on ragged rows.
+  var W = 0;
+  for (var i = 0; i < rows.length; i++) W = Math.max(W, rows[i].length);
+  for (var r = 0; r < rows.length; r++) { while (rows[r].length < W) rows[r].push(""); }
+
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sh = ss.getSheetByName(sheetName) || ss.insertSheet(sheetName);
+  // Holdings is a snapshot of current positions, so it is replaced rather than appended - but
+  // never with a suspiciously small export, which would silently wipe most of the book.
+  var hadRows = Math.max(0, sh.getLastRow() - 1);
+  if (hadRows >= 20 && (rows.length - 1) < hadRows * 0.5) {
+    throw new Error("Refusing to replace " + hadRows + " rows in " + sheetName + " with only " + (rows.length - 1) + " \\u2014 the export looks truncated. Nothing was changed.");
+  }
+  sh.clearContents(); // snapshot tab: replaced, guarded above
+  // Write in chunks so very large exports don't blow the execution limit in one call.
+  var CH = 5000;
+  for (var s = 0; s < rows.length; s += CH) {
+    var block = rows.slice(s, s + CH);
+    sh.getRange(s + 1, 1, block.length, W).setValues(block);
+  }
+  SpreadsheetApp.flush();
+  return rows.length - 1; // data rows, excluding header
+}
+
+function syncGridkeyTrades() {
+  var url = String(gkProps_().getProperty("GK_TRADES_URL") || "").trim();
+  return gkMergeCsv_(GK_TRADES_SHEET, gkFetch_(url));   // append-only: history is never lost
+}
+
+function syncGridkeyLedger() {
+  var url = String(gkProps_().getProperty("GK_LEDGER_URL") || "").trim();
+  if (!url) return -1; // not configured yet - skip quietly
+  return gkMergeCsv_(GK_LEDGER_SHEET, gkFetch_(url));  // append-only
+}
+
+// The function the 6am / 6pm triggers call.
+function runGridkeySync(force) {
+  var props = gkProps_();
+  var tz = Session.getScriptTimeZone();
+  var now = new Date();
+  var stamp = Utilities.formatDate(now, tz, "yyyy-MM-dd HH:mm");
+  var hr = Number(Utilities.formatDate(now, tz, "H"));
+
+  var msgs = [], ok = true;
+  // The transaction export is large (~24MB) and only feeds the Performance/XIRR tab, so the
+  // scheduled morning run skips it and the 6pm run does it. A manual "Fetch now" (force) always
+  // does the full sync. Positions/prices come from combined holdings and cash from the ledger,
+  // which run every time.
+  var heavyRun = force || (hr < 9 || hr > 16);
+  if (heavyRun) {
+    try {
+      var t = syncGridkeyTrades();
+      msgs.push("trades: " + t + " rows");
+      props.setProperty("GK_TRADES_ROWS", String(t));
+    } catch (e) {
+      ok = false;
+      var em = String(e && e.message ? e.message : e);
+      if (em.indexOf("script.external_request") >= 0 || em.indexOf("permission to call UrlFetchApp") >= 0) {
+        em = "NOT AUTHORISED YET \\u2014 in the Apps Script editor, pick 'authorizeGridkey' from the function dropdown and press Run, click Allow, then Deploy a New version and re-run setupGridkeyTriggers.";
+      }
+      msgs.push("trades FAILED: " + em);
+    }
+  } else {
+    msgs.push("trades: skipped (intraday)");
+  }
+  try {
+    var l = syncGridkeyLedger();
+    if (l < 0) msgs.push("ledger: not configured");
+    else { msgs.push("ledger: " + l + " rows"); props.setProperty("GK_LEDGER_ROWS", String(l)); }
+  } catch (e) { ok = false; msgs.push("ledger FAILED: " + e.message); }
+
+  // Fetch the combined-holdings export (per-portfolio, corporate-action adjusted, with CMP).
+  var haveCombined = false;
+  try {
+    var cw = syncGridkeyHoldings();
+    if (cw < 0) msgs.push("combined holdings: not configured");
+    else { msgs.push("combined holdings: " + cw + " rows"); haveCombined = true; }
+  } catch (e) { ok = false; msgs.push("combined holdings FAILED: " + e.message); }
+
+  // Rebuild the Holdings tab ONLY from the combined-holdings export (corporate-action correct).
+  // We deliberately NO LONGER rebuild from the raw transaction feed - that feed is pre-split and
+  // was overwriting good data. If the combined export isn't configured, Holdings is left exactly
+  // as-is (so a manual "Combined holdings" upload from the console persists). Set
+  // GK_REBUILD_HOLDINGS="0" to switch even the combined rebuild off.
+  if (String(props.getProperty("GK_REBUILD_HOLDINGS") || "1") !== "0") {
+    if (haveCombined) {
+      try {
+        var h = rebuildHoldingsFromCombined();
+        msgs.push("holdings (from combined): " + h.positions + " positions / " + h.clients + " clients");
+      } catch (e) { ok = false; msgs.push("holdings FAILED: " + e.message); }
+    } else {
+      msgs.push("holdings: left untouched (no combined-holdings URL set)");
+    }
+  }
+
+  var result = (ok ? "OK" : "ERROR") + " \\u2014 " + msgs.join(" \\u00B7 ");
+  props.setProperty("GK_LAST_SYNC", stamp);
+  props.setProperty("GK_LAST_RESULT", result);
+
+  // Keep a visible log in the sheet so you can see the history without opening Apps Script.
+  try {
+    var ss = SpreadsheetApp.getActiveSpreadsheet();
+    var log = ss.getSheetByName("Sync log") || ss.insertSheet("Sync log");
+    if (log.getLastRow() === 0) log.getRange(1, 1, 1, 3).setValues([["When", "Status", "Detail"]]);
+    log.insertRowAfter(1);
+    log.getRange(2, 1, 1, 3).setValues([[stamp, ok ? "OK" : "ERROR", msgs.join(" \\u00B7 ")]]);
+    // trim to the last 200 entries
+    if (log.getLastRow() > 201) log.deleteRows(202, log.getLastRow() - 201);
+  } catch (e) { /* logging must never break the sync */ }
+  return result;
+}
+
+// Run ONCE from the Apps Script editor to install the schedule:
+//   - 9:30 am : fresh positions, cash and prices (combined holdings + ledger)
+//   - 6:00 pm : full run, including the heavy trade export for the Performance tab
+function setupGridkeyTriggers() {
+  removeGridkeyTriggers();
+  ScriptApp.newTrigger("runGridkeySync").timeBased().atHour(9).nearMinute(30).everyDays(1).create();
+  ScriptApp.newTrigger("runGridkeySync").timeBased().atHour(18).nearMinute(0).everyDays(1).create();
+  var n = gkTriggerCount_();
+  return "Triggers installed: 9:30 am and 6:00 pm daily. Total " + n + " triggers (" + Session.getScriptTimeZone() + ").";
+}
+
+function removeGridkeyTriggers() {
+  var ts = ScriptApp.getProjectTriggers();
+  for (var i = 0; i < ts.length; i++) {
+    if (ts[i].getHandlerFunction() === "runGridkeySync") ScriptApp.deleteTrigger(ts[i]);
+  }
+  return "Triggers removed.";
+}
+
+function gkTriggerCount_() {
+  var n = 0, ts = ScriptApp.getProjectTriggers();
+  for (var i = 0; i < ts.length; i++) if (ts[i].getHandlerFunction() === "runGridkeySync") n++;
+  return n;
+}
+
+/* ==================================================================
+ *  POSITIONS FROM THE TRADE BOOK  ->  HOLDINGS TAB
+ *
+ *  Runs right after each GridKey sync, so the Holdings tab always
+ *  reflects the latest dealing without anyone re-uploading anything.
+ *
+ *  Client master data (Name / Email / WhatsApp / Risk category) is NOT
+ *  invented here - it is carried over from whatever is already in the
+ *  Holdings tab, keyed on client code. Clients you have in Holdings but
+ *  who have no trades (e.g. cash-only) are left untouched.
+ * ================================================================== */
+
+// Read the Trades tab and return compact rows:
+// [Date, Client code, Client name, Symbol, Action, Quantity, Price, Amount]
+// Works with a raw GridKey export (29 cols) OR the app's own 8-col backup.
+// NOTE: for a broker export the key is PORTFOLIO code (e.g. MAY39939), not the
+// client code (C000009) - one client can run several portfolios and the console
+// treats each as its own account. Keep this order.
+function gkNormalizedTrades_() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sh = ss.getSheetByName("Trades");
+  var res = [];
+  if (!sh) return res;
+  var tv = sh.getDataRange().getValues();
+  if (tv.length < 2) return res;
+  var tz = Session.getScriptTimeZone();
+
+  var thead = tv[0].map(function (x) { return String(x).toLowerCase().replace(/[^a-z0-9]/g, ""); });
+  function tcol() {
+    for (var a = 0; a < arguments.length; a++) {
+      var idx = thead.indexOf(arguments[a]);
+      if (idx >= 0) return idx;
+    }
+    return -1;
+  }
+  var iDate = tcol("date", "tradedate", "tradeddate");
+  var iCode = tcol("portfoliocode", "clientcode", "ucc", "code");
+  var iName = tcol("clientname", "name", "portfolioname");
+  var iSym = tcol("symbol", "nsecode", "nse", "scrip");
+  var iAct = tcol("action", "transactiontype", "transtype", "type", "side");
+  var iQty = tcol("quantity", "qty");
+  var iPrice = tcol("price", "rate", "netrateperunit");
+  var iAmt = tcol("amount", "billamount", "amountwithbrokerage", "totalamount", "netamount");
+  var iCompany = tcol("companyname", "company");
+  var iBse = tcol("bsecode");
+  var iIsin = tcol("isincode", "isin");
+  var isinSym = {};
+
+  function tstr(v) { return String(v == null ? "" : v).trim(); }
+  function tnum(v) {
+    var n = parseFloat(tstr(v).replace(/[^0-9.\\-]/g, ""));
+    return isNaN(n) ? 0 : n;
+  }
+  function tdate(v) {
+    if (Object.prototype.toString.call(v) === "[object Date]") return Utilities.formatDate(v, tz, "yyyy-MM-dd");
+    var s = tstr(v);
+    var m = s.match(/^(\\d{4})-(\\d{2})-(\\d{2})/);
+    if (m) return m[1] + "-" + m[2] + "-" + m[3];
+    m = s.match(/^(\\d{1,2})[\\/\\-](\\d{1,2})[\\/\\-](\\d{4})/);
+    if (m) return m[3] + "-" + ("0" + m[2]).slice(-2) + "-" + ("0" + m[1]).slice(-2);
+    return s;
+  }
+
+  for (var ti = 1; ti < tv.length; ti++) {
+    var trow = tv[ti], blank = true;
+    for (var tc = 0; tc < trow.length; tc++) { if (tstr(trow[tc]) !== "") { blank = false; break; } }
+    if (blank) continue;
+
+    var code = iCode >= 0 ? tstr(trow[iCode]) : "";
+    var nse = iSym >= 0 ? tstr(trow[iSym]) : "";
+    var isin = iIsin >= 0 ? tstr(trow[iIsin]).toUpperCase() : "";
+    var sym = nse;
+    if (!sym && iCompany >= 0) sym = tstr(trow[iCompany]);
+    if (!sym && iBse >= 0) sym = tstr(trow[iBse]);
+    if (!sym) sym = isin;
+    sym = sym.toUpperCase();
+    if (!nse && isin) { if (isinSym[isin]) sym = isinSym[isin]; else isinSym[isin] = sym; }
+
+    var act = iAct >= 0 ? tstr(trow[iAct]).toUpperCase() : "BUY";
+    act = (act === "SELL" || act === "S" || act === "SALE") ? "SELL" : "BUY";
+    var qty = iQty >= 0 ? tnum(trow[iQty]) : 0;
+    var price = iPrice >= 0 ? tnum(trow[iPrice]) : 0;
+    var amt = iAmt >= 0 ? tnum(trow[iAmt]) : 0;
+    if (!amt) amt = Math.abs(qty * price);
+    var dt = iDate >= 0 ? tdate(trow[iDate]) : "";
+    var nm = iName >= 0 ? tstr(trow[iName]) : "";
+
+    if (!code || !sym || !dt || !qty) continue;
+    res.push([dt, code, nm, sym, act, qty, price, amt]);
+  }
+
+  // Manually entered trades live in their own tab (the GridKey sync never touches it) and are
+  // merged in here so performance, XIRR and holdings see the complete picture.
+  var msh = ss.getSheetByName("ManualTrades");
+  if (msh && msh.getLastRow() > 1) {
+    var mv = msh.getRange(2, 1, msh.getLastRow() - 1, 9).getValues();
+    for (var mi = 0; mi < mv.length; mi++) {
+      var mr = mv[mi];
+      var mdt = tdate(mr[1]), mcode = tstr(mr[2]), msym = tstr(mr[4]).toUpperCase();
+      var mact = tstr(mr[5]).toUpperCase().indexOf("S") === 0 ? "SELL" : "BUY";
+      var mqty = Math.abs(Number(mr[6]) || 0), mprice = Number(mr[7]) || 0;
+      var mamt = Number(mr[8]) || Math.abs(mqty * mprice);
+      if (!mcode || !msym || !mdt || !mqty) continue;
+      res.push([mdt, mcode, tstr(mr[3]), msym, mact, mqty, mprice, mamt]);
+    }
+  }
+  return res;
+}
+
+// Live prices from Sheet1, as { SYMBOL: price }
+function gkPricesMap_() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sh = ss.getSheetByName("Sheet1") || ss.getSheets()[0];
+  var map = {};
+  if (!sh) return map;
+  var v = sh.getDataRange().getValues();
+  for (var i = 1; i < v.length; i++) {
+    var sym = String(v[i][0] || "").trim().toUpperCase();
+    var px = parseFloat(String(v[i][1]).replace(/[^0-9.\\-]/g, ""));
+    if (sym && !isNaN(px)) map[sym] = px;
+  }
+  return map;
+}
+
+// Net position per client+stock, using average-cost accounting over the full trade history.
+function gkPositions_() {
+  var trades = gkNormalizedTrades_();
+  trades.sort(function (a, b) { return String(a[0]) < String(b[0]) ? -1 : String(a[0]) > String(b[0]) ? 1 : 0; });
+  var pos = {}, names = {};
+  for (var i = 0; i < trades.length; i++) {
+    var t = trades[i];
+    var code = t[1], name = t[2], sym = t[3], act = t[4], qty = t[5], amt = t[7];
+    if (name && !names[code]) names[code] = name;
+    var k = code + "|" + sym;
+    if (!pos[k]) pos[k] = { code: code, stock: sym, qty: 0, cost: 0 };
+    var p = pos[k];
+    if (act === "BUY") {
+      p.qty += qty;
+      p.cost += amt;
+    } else { // SELL - relieve cost at the running average, so 'cost' stays the book value of what's left
+      var avg = p.qty > 0 ? p.cost / p.qty : 0;
+      var sell = Math.min(qty, p.qty);
+      p.qty -= sell;
+      p.cost -= avg * sell;
+      if (p.qty <= 0.000001) { p.qty = 0; p.cost = 0; }
+    }
+  }
+  return { pos: pos, names: names, tradeCount: trades.length };
+}
+
+// Rebuild the Holdings tab from the trade book, preserving client master data.
+function rebuildHoldingsFromTrades() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var header = ["Client code", "Name", "Email", "WhatsApp", "Risk category", "Stock", "Quantity",
+    "Purchase price", "Current price", "Invested", "Current value",
+    "P/L amount", "P/L %", "Invested set", "Backed up at"];
+  var W = header.length;
+
+  // --- what's in Holdings today: master data + any manual overrides + clients with no trades
+  var hs = ss.getSheetByName("Holdings");
+  var master = {}, manual = {}, existingCodes = {}, prevRows = 0, prevPositions = 0, cashOnly = {};
+  if (hs) {
+    var hv = hs.getDataRange().getValues();
+    prevRows = Math.max(0, hv.length - 1);
+    for (var i = 1; i < hv.length; i++) {
+      var r = hv[i];
+      var code = String(r[0] || "").trim();
+      if (!code) continue;
+      existingCodes[code] = true;
+      if (!master[code]) {
+        master[code] = { name: r[1] || "", email: r[2] || "", whatsapp: r[3] || "", risk: r[4] || "" };
+      }
+      var stock = String(r[5] || "").trim().toUpperCase();
+      if (!stock) { cashOnly[code] = true; continue; } // cash-only / master-only row
+      if (Number(r[6]) > 0) prevPositions++;           // a real holding row
+      if (String(r[13] || "").trim().toLowerCase() === "manual") {
+        manual[code + "|" + stock] = { qty: Number(r[6]) || 0, invested: Number(r[9]) || 0, purchase: Number(r[7]) || 0 };
+      }
+    }
+  }
+
+  var P = gkPositions_();
+  var prices = gkPricesMap_();
+  var stamp = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), "dd/MM/yyyy HH:mm");
+
+  var rows = [], liveCodes = {}, open = 0;
+  for (var k in P.pos) {
+    var p = P.pos[k];
+    if (p.qty <= 0) continue; // fully exited - drop from Holdings
+    open++;
+    liveCodes[p.code] = true;
+    var m = master[p.code] || {};
+    var qty = p.qty, invested = p.cost;
+    var setBy = "Sheet";
+    // Respect a manual invested override, but only while the quantity still matches;
+    // once the position changes, the manual figure is stale so we recompute.
+    var mo = manual[p.code + "|" + p.stock];
+    if (mo && Math.abs(mo.qty - qty) < 0.000001 && mo.invested > 0) { invested = mo.invested; setBy = "Manual"; }
+    var buyPx = qty > 0 ? invested / qty : 0;
+    var ltp = prices[p.stock] != null ? prices[p.stock] : 0;
+    var curVal = ltp > 0 ? qty * ltp : 0;
+    var pnl = curVal > 0 ? curVal - invested : 0;
+    var pnlPct = (curVal > 0 && invested > 0) ? (pnl / invested) * 100 : 0;
+    rows.push([p.code, m.name || P.names[p.code] || "", m.email || "", m.whatsapp || "", m.risk || "",
+      p.stock, qty, buyPx.toFixed(2), Number(ltp).toFixed(2), Math.round(invested * 100) / 100,
+      Math.round(curVal * 100) / 100, pnl.toFixed(2), pnlPct.toFixed(2), setBy, stamp]);
+  }
+
+  // Keep clients who exist in Holdings but have no open position from trades
+  // (cash-only accounts, or clients added by hand) so they never silently vanish.
+  for (var c in existingCodes) {
+    if (liveCodes[c]) continue;
+    var mm = master[c] || {};
+    rows.push([c, mm.name || "", mm.email || "", mm.whatsapp || "", mm.risk || "",
+      "", 0, "0.00", "0.00", 0, 0, "0.00", "0.00", "Sheet", stamp]);
+  }
+
+  // ---- safety valve: never wipe a healthy Holdings tab on a bad or truncated feed ----
+  // Compare POSITION rows (a real holding) rather than total rows: master rows for clients
+  // with no trades are re-added either way, so a total-row count would hide a truncated feed.
+  if (P.tradeCount === 0) throw new Error("Refusing to rebuild Holdings: the Trades tab produced 0 usable rows.");
+  if (open === 0) throw new Error("Refusing to rebuild Holdings: 0 open positions computed from " + P.tradeCount + " trades.");
+  if (prevPositions > 20 && open < prevPositions * 0.5) {
+    throw new Error("Refusing to rebuild Holdings: open positions would fall from " + prevPositions + " to " + open
+      + ". That usually means the Trades tab is incomplete. Holdings left untouched.");
+  }
+
+  var sh2 = hs || ss.insertSheet("Holdings");
+  sh2.clearContents();
+  var all = [header].concat(rows);
+  var CH = 5000;
+  for (var s = 0; s < all.length; s += CH) {
+    var block = all.slice(s, s + CH);
+    sh2.getRange(s + 1, 1, block.length, W).setValues(block);
+  }
+  SpreadsheetApp.flush();
+  PropertiesService.getScriptProperties().setProperty("GK_HOLDINGS_ROWS", String(rows.length));
+  return { rows: rows.length, positions: open, clients: Object.keys(liveCodes).length, trades: P.tradeCount };
+}
+
+/* ==================================================================
+ *  HOLDINGS FROM GRIDKEY'S COMBINED HOLDINGS EXPORT  (preferred source)
+ *
+ *  GridKey's "combined holdings" export is per-portfolio-per-stock, already
+ *  corporate-action adjusted (splits/bonuses), and carries the live CMP. It
+ *  only lists what is actually held. This is strictly better than rebuilding
+ *  from the raw transaction feed (which is pre-split and can have orphaned
+ *  buys), so when a combined-holdings URL is set we use THIS, not the trades.
+ *
+ *  Columns handled (case/space-insensitive):
+ *    Portfolio code | Asset name | Isin | Nse | Bse | Quantity |
+ *    Avg buy price | Invested amount | Cmp | Current amount
+ * ================================================================== */
+function syncGridkeyHoldings() {
+  var url = String(gkProps_().getProperty("GK_HOLDINGS_URL") || "").trim();
+  if (!url) return -1; // not configured - skip quietly
+  var n = gkWriteCsv_(GK_HOLDINGS_SHEET, gkFetch_(url));
+  return n;
+}
+
+function rebuildHoldingsFromCombined() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var src = ss.getSheetByName(GK_HOLDINGS_SHEET);
+  if (!src) throw new Error("No CombinedHoldings tab \\u2014 set the combined-holdings URL and sync first.");
+  var v = src.getDataRange().getValues();
+  if (v.length < 2) throw new Error("CombinedHoldings tab is empty.");
+
+  var hh = v[0].map(function (x) { return String(x).toLowerCase().replace(/[^a-z0-9]/g, ""); });
+  function hc() { for (var a = 0; a < arguments.length; a++) { var i = hh.indexOf(arguments[a]); if (i >= 0) return i; } return -1; }
+  var iPC = hc("portfoliocode", "clientcode", "code");
+  var iAsset = hc("assetname", "companyname", "company", "name");
+  var iIsin = hc("isin", "isincode");
+  var iNse = hc("nse", "nsecode", "symbol");
+  var iQty = hc("quantity", "qty");
+  var iAvg = hc("avgbuyprice", "averagebuyprice", "avgprice", "buyprice");
+  var iInv = hc("investedamount", "invested");
+  var iCmp = hc("cmp", "currentprice", "ltp", "marketprice");
+  var iCur = hc("currentamount", "currentvalue", "marketvalue");
+  if (iPC < 0 || iQty < 0) throw new Error("CombinedHoldings is missing Portfolio code / Quantity columns.");
+
+  function nstr(x) { return String(x == null ? "" : x).trim(); }
+  function nnum(x) { var n = parseFloat(nstr(x).replace(/[^0-9.\\-]/g, "")); return isNaN(n) ? 0 : n; }
+
+  var header = ["Client code", "Name", "Email", "WhatsApp", "Risk category", "Stock", "Quantity",
+    "Purchase price", "Current price", "Invested", "Current value", "P/L amount", "P/L %", "Invested set", "Backed up at"];
+  var W = header.length;
+
+  // Preserve client master data (Name/Email/WhatsApp/Risk) from the existing Holdings tab.
+  var hs = ss.getSheetByName("Holdings");
+  var master = {}, existingCodes = {}, prevPositions = 0;
+  if (hs) {
+    var hv = hs.getDataRange().getValues();
+    for (var i = 1; i < hv.length; i++) {
+      var code0 = String(hv[i][0] || "").trim();
+      if (!code0) continue;
+      existingCodes[code0] = true;
+      if (!master[code0]) master[code0] = { name: hv[i][1] || "", email: hv[i][2] || "", whatsapp: hv[i][3] || "", risk: hv[i][4] || "" };
+      if (Number(hv[i][6]) > 0) prevPositions++;
+    }
+  }
+
+  var stamp = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), "dd/MM/yyyy HH:mm");
+  var rows = [], liveCodes = {}, open = 0, isinSym = {};
+  for (var r = 1; r < v.length; r++) {
+    var row = v[r];
+    var qty = nnum(row[iQty]);
+    if (qty <= 0) continue; // only actual holdings
+    var code = nstr(row[iPC]); if (!code) continue;
+    var isin = iIsin >= 0 ? nstr(row[iIsin]).toUpperCase() : "";
+    var sym = iNse >= 0 ? nstr(row[iNse]).toUpperCase() : "";
+    if (!sym && iAsset >= 0) sym = nstr(row[iAsset]).toUpperCase();
+    if (!sym) sym = isin;
+    if (!sym) continue;
+    if (isin) { if (isinSym[isin]) sym = isinSym[isin]; else isinSym[isin] = sym; }
+
+    var avg = iAvg >= 0 ? nnum(row[iAvg]) : 0;
+    var inv = iInv >= 0 ? nnum(row[iInv]) : avg * qty;
+    var cmp = iCmp >= 0 ? nnum(row[iCmp]) : 0;
+    var cur = iCur >= 0 ? nnum(row[iCur]) : (cmp > 0 ? cmp * qty : 0);
+    if ((!avg || avg <= 0) && inv > 0) avg = inv / qty;
+    var pnl = cur > 0 ? cur - inv : 0;
+    var pnlPct = (cur > 0 && inv > 0) ? (pnl / inv) * 100 : 0;
+    var m = master[code] || {};
+    liveCodes[code] = true; open++;
+    rows.push([code, m.name || "", m.email || "", m.whatsapp || "", m.risk || "",
+      sym, qty, avg.toFixed(2), cmp.toFixed(2), Math.round(inv * 100) / 100,
+      Math.round(cur * 100) / 100, pnl.toFixed(2), pnlPct.toFixed(2), "Sheet", stamp]);
+  }
+
+  // Keep clients who exist in Holdings but have no current position (cash-only / manual).
+  for (var c in existingCodes) {
+    if (liveCodes[c]) continue;
+    var mm = master[c] || {};
+    rows.push([c, mm.name || "", mm.email || "", mm.whatsapp || "", mm.risk || "",
+      "", 0, "0.00", "0.00", 0, 0, "0.00", "0.00", "Sheet", stamp]);
+  }
+
+  // Safety valve - never wipe a healthy Holdings tab on a bad/short feed.
+  if (open === 0) throw new Error("Refusing to rebuild Holdings: 0 holdings parsed from CombinedHoldings.");
+  if (prevPositions > 20 && open < prevPositions * 0.5)
+    throw new Error("Refusing to rebuild Holdings: positions would fall from " + prevPositions + " to " + open + ". Check the CombinedHoldings tab.");
+
+  var out = hs || ss.insertSheet("Holdings");
+  out.clearContents();
+  var all = [header].concat(rows);
+  for (var s = 0; s < all.length; s += 5000) { var b = all.slice(s, s + 5000); out.getRange(s + 1, 1, b.length, W).setValues(b); }
+  SpreadsheetApp.flush();
+  PropertiesService.getScriptProperties().setProperty("GK_HOLDINGS_ROWS", String(rows.length));
+  return { rows: rows.length, positions: open, clients: Object.keys(liveCodes).length };
+}
+
+// CMP per symbol from the CombinedHoldings tab - used to enrich the price feed so held
+// stocks always have a live price (no more Rs.0 / -100%).
+function gkCombinedPrices_() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var src = ss.getSheetByName(GK_HOLDINGS_SHEET);
+  var map = {};
+  if (!src) return map;
+  var v = src.getDataRange().getValues();
+  if (v.length < 2) return map;
+  var hh = v[0].map(function (x) { return String(x).toLowerCase().replace(/[^a-z0-9]/g, ""); });
+  function hc() { for (var a = 0; a < arguments.length; a++) { var i = hh.indexOf(arguments[a]); if (i >= 0) return i; } return -1; }
+  var iNse = hc("nse", "nsecode", "symbol"), iAsset = hc("assetname", "companyname"), iCmp = hc("cmp", "currentprice", "ltp");
+  if (iCmp < 0) return map;
+  for (var r = 1; r < v.length; r++) {
+    var sym = iNse >= 0 ? String(v[r][iNse] || "").trim().toUpperCase() : "";
+    if (!sym && iAsset >= 0) sym = String(v[r][iAsset] || "").trim().toUpperCase();
+    var px = parseFloat(String(v[r][iCmp]).replace(/[^0-9.\\-]/g, ""));
+    if (sym && !isNaN(px) && px > 0) map[sym] = px;
+  }
+  return map;
+}
+
+/* ------------------------------------------------------------------
+ *  STEP 1 OF AUTHORISATION - RUN THIS FIRST, FROM THE EDITOR.
+ *
+ *  This asks Google for every permission the script needs, and it does
+ *  NOT depend on the token or the URLs being saved yet. Pick
+ *  'grantPermissions' in the dropdown above and press Run, then Allow.
+ *  (If Google warns the app isn't verified: Advanced -> Go to ... ->
+ *  Allow. It is your own script.)
+ * ------------------------------------------------------------------ */
+function grantPermissions() {
+  // Touch each service that needs a permission, so one consent screen covers them all.
+  var r = UrlFetchApp.fetch("https://www.google.com", { muteHttpExceptions: true }); // external requests
+  PropertiesService.getScriptProperties().getProperty("GK_TOKEN");                    // script properties
+  ScriptApp.getProjectTriggers();                                                     // triggers
+  SpreadsheetApp.getActiveSpreadsheet().getName();                                    // the sheet
+  var msg = "Permissions granted (test request returned HTTP " + r.getResponseCode() + "). "
+    + "Next: Deploy -> Manage deployments -> New version -> Deploy. "
+    + "Then save the GridKey token, then run setupGridkeyTriggers.";
+  Logger.log(msg);
+  return msg;
+}
+
+/* ------------------------------------------------------------------
+ *  Set the GridKey token WITHOUT the app (useful before the new web-app
+ *  version is deployed). Paste your values between the quotes, press Run,
+ *  then BLANK THEM OUT AGAIN and Save so the token isn't left in the code.
+ *  (Or use Project Settings -> Script properties, which is tidier.)
+ * ------------------------------------------------------------------ */
+function setGridkeyTokenManually() {
+  var TOKEN = "";      // <-- paste the GridKey token here
+  var TRADES_URL = "https://django-backend-prod.gridkey.in/transaction/export_csv/?show_zero_holding=false&filter=%7B%7D";
+  var LEDGER_URL = ""; // <-- paste the ledger export URL here when you have it
+
+  var p = PropertiesService.getScriptProperties();
+  if (TOKEN) p.setProperty("GK_TOKEN", TOKEN.trim());
+  if (TRADES_URL) p.setProperty("GK_TRADES_URL", TRADES_URL.trim());
+  if (LEDGER_URL) p.setProperty("GK_LEDGER_URL", LEDGER_URL.trim());
+  var msg = "Saved. token=" + (p.getProperty("GK_TOKEN") ? "set" : "MISSING")
+    + ", tradesUrl=" + (p.getProperty("GK_TRADES_URL") ? "set" : "MISSING")
+    + ", ledgerUrl=" + (p.getProperty("GK_LEDGER_URL") ? "set" : "not set");
+  Logger.log(msg);
+  return msg;
+}
+
+/* ------------------------------------------------------------------
+ *  STEP 2 - a real test fetch against GridKey, once the token is saved.
+ * ------------------------------------------------------------------ */
+function authorizeGridkey() {
+  var props = gkProps_();
+  var token = String(props.getProperty("GK_TOKEN") || "").trim();
+  var url = String(props.getProperty("GK_TRADES_URL") || "").trim();
+  if (!token) throw new Error("No token saved yet. In the console: Settings -> GridKey auto-sync -> paste the token -> Save to server. Then run this again.");
+  if (!url) throw new Error("No trades URL saved yet. Save it from the console first, then run this again.");
+
+  // This line is what needs the permission - running it by hand triggers the consent screen.
+  var res = UrlFetchApp.fetch(url, {
+    method: "get",
+    muteHttpExceptions: true,
+    followRedirects: true,
+    headers: {
+      "accept": "application/json, text/plain, */*",
+      "authorization": "Token " + token,
+      "origin": "https://gridkey.in",
+      "referer": "https://gridkey.in/",
+      "x-gridkey-user-role": "advisor"
+    }
+  });
+  var code = res.getResponseCode();
+  var text = String(res.getContentText() || "");
+  var msg;
+  if (code === 200) {
+    var lines = text.split(/\\r?\\n/).length;
+    msg = "SUCCESS \\u2014 permission granted and GridKey answered (HTTP 200, about " + lines + " lines). Now: Deploy -> Manage deployments -> New version -> Deploy, then run setupGridkeyTriggers.";
+  } else if (code === 401 || code === 403) {
+    msg = "Permission is now granted, BUT GridKey rejected the token (HTTP " + code + "). Update the token in the console and try again.";
+  } else {
+    msg = "Permission is now granted, but GridKey returned HTTP " + code + ": " + text.slice(0, 200);
+  }
+  Logger.log(msg);
+  return msg;
+}
+
+`;
+const SHEET_HEADER = [
+  "Client code",
+  "Name",
+  "Email",
+  "WhatsApp",
+  "Risk category",
+  "Stock",
+  "Quantity",
+  "Purchase price",
+  "Current price",
+  "Invested",
+  "Current value",
+  "P/L amount",
+  "P/L %",
+  "Invested set",
+  "Backed up at"
+];
+function holdingsRowsToObjects(list) {
+  return (list || []).map((a) => {
+    if (!Array.isArray(a)) return a;
+    const o = {};
+    SHEET_HEADER.forEach((h, i) => {
+      o[h] = a[i];
+    });
+    return o;
+  });
+}
+function scanDuplicates(rows) {
+  const seen = /* @__PURE__ */ new Map();
+  const byName = /* @__PURE__ */ new Map();
+  for (const r of rows || []) {
+    const g = {};
+    for (const k in r) g[normKey(k)] = r[k];
+    const code = String(g.clientcode ?? g.code ?? "").trim();
+    const stock = String(g.stock ?? g.symbol ?? "").trim().toUpperCase();
+    const name = String(g.name ?? g.clientname ?? "").trim().replace(/\s+/g, " ").toUpperCase();
+    if (code && stock) {
+      const key = code + "|" + stock;
+      seen.set(key, (seen.get(key) || 0) + 1);
+    }
+    if (code && name) {
+      if (!byName.has(name)) byName.set(name, /* @__PURE__ */ new Set());
+      byName.get(name).add(code);
+    }
+  }
+  const dupRows = [];
+  for (const [k, n] of seen) if (n > 1) {
+    const i = k.indexOf("|");
+    dupRows.push({ code: k.slice(0, i), stock: k.slice(i + 1), count: n });
+  }
+  const sameName = [...byName.entries()].filter(([, s]) => s.size > 1).map(([name, s]) => ({ name, codes: [...s].sort() }));
+  return { dupRows, sameName, clean: !dupRows.length && !sameName.length };
+}
+async function pullHoldingsFromSheet(url) {
+  const res = await fetch(withToken(url) + "&holdings=1");
+  const data = await res.json();
+  const list = Array.isArray(data.holdings) ? data.holdings : [];
+  const rows = holdingsRowsToObjects(list);
+  return { rows, built: clientsFromBackup(rows), dups: scanDuplicates(rows), rowCount: list.length, staff: Array.isArray(data.staff) ? data.staff : null };
+}
+// One person types a staff name into Settings, another types it into the sign-in
+// box on a different device, and a spreadsheet round-trip can leave a stray space
+// behind. Compare names forgivingly so none of that locks anyone out.
+const nameKey = (v) => String(v == null ? "" : v).replace(/\s+/g, " ").trim().toLowerCase();
+const tidyName = (v) => String(v == null ? "" : v).replace(/\s+/g, " ").trim();
+// The Principal Officer's list is the authority on who may sign in, so remote rows
+// overwrite local ones - that is what makes enabling and disabling take effect on
+// everyone else's device. Rows with no name are dropped rather than trusted.
+async function pushStaffToSheet(db) {
+  const url = (db.sheetUrl || "").trim();
+  if (!url) return;
+  try {
+    await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ token: db.sheetToken || "", type: "staff", staff: Array.isArray(db.staff) ? db.staff : [] })
+    });
+  } catch (e) {
+  }
+}
+async function pingEndpoint(url) {
+  const res = await fetch(withToken(url) + "&ping=1");
+  return res.json();
+}
+async function pullDbHealth(url, deep) {
+  const res = await fetch(withToken(url) + "&dbhealth=1" + (deep ? "&deep=1" : ""));
+  const data = await res.json();
+  if (!data || data.ok !== true) throw new Error((data && data.error) || "The sheet could not run the check.");
+  return data;
+}
+async function pullExecModes(url) {
+  const res = await fetch(withToken(url) + "&exec_modes=1");
+  const data = await res.json();
+  const rows = Array.isArray(data.rows) ? data.rows : [];
+  if (rows.length < 2) return {};
+  const out = {};
+  for (const r of rows.slice(1)) {
+    const code = String(r[0] || "").trim();
+    if (!code) continue;
+    out[code] = { method: String(r[2] || "").trim().toLowerCase() === "gateway" ? "gateway" : "email", updatedAt: num(r[3]) };
+  }
+  return out;
+}
+async function pushExecModes(db, rows) {
+  if (!(db.sheetUrl || "").trim() || !(rows || []).length) return false;
+  try {
+    await fetch(db.sheetUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ token: db.sheetToken || "", type: "exec_modes", rows })
+    });
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+function DataHealthCard({ db, showToast }) {
+  const [state, setState] = useState("idle");
+  const [err, setErr] = useState("");
+  const [d, setD] = useState(null);
+  const [deep, setDeep] = useState(false);
+  const url = (db.sheetUrl || "").trim();
+  const run = async (withFifo) => {
+    if (!url) { setErr("Connect the office Google Sheet in Settings first."); setState("error"); return; }
+    setState("loading"); setErr("");
+    try { setD(await pullDbHealth(url, withFifo)); setDeep(!!withFifo); setState("ready"); }
+    catch (e) { setErr(String(e && e.message || e)); setState("error"); }
+  };
+  const secs = (ms) => num(ms) >= 1000 ? (num(ms) / 1000).toFixed(1) + "s" : Math.round(num(ms)) + "ms";
+  const mil = (n) => (num(n) / 1e6).toFixed(2) + "M";
+  const TONE = { fine: ["bg-emerald-50 border-emerald-200 text-emerald-900", "Healthy"],
+                 watch: ["bg-amber-50 border-amber-200 text-amber-900", "Worth watching"],
+                 move: ["bg-rose-50 border-rose-200 text-rose-900", "Time to move the trade book"] };
+  const v = ((d || {}).verdict || {});
+  const tone = TONE[v.level] || TONE.fine;
+  const bar = (pct, danger) => /* @__PURE__ */ React.createElement("div", { className: "h-2 rounded-full bg-slate-100 overflow-hidden" },
+    /* @__PURE__ */ React.createElement("div", { className: `h-full ${danger ? "bg-rose-500" : pct >= 40 ? "bg-amber-500" : "bg-emerald-500"}`, style: { width: Math.min(100, Math.max(1, pct)) + "%" } }));
+
+  return /* @__PURE__ */ React.createElement(Card, { title: "Data health — is the spreadsheet still big enough?", icon: AlertTriangle },
+    /* @__PURE__ */ React.createElement("p", { className: "text-[12px] text-slate-500 mb-3" },
+      "A Google Sheet holds 10 million cells and Apps Script gets 6 minutes for one run. Everything that reads the trade book — capital gains, missing purchases, the first-trade lookup — spends both. This measures how much is left before the data would be better off in a proper database."),
+    /* @__PURE__ */ React.createElement("div", { className: "flex gap-2 flex-wrap items-center mb-3" },
+      /* @__PURE__ */ React.createElement("button", { onClick: () => run(false), disabled: state === "loading", className: "text-sm px-3 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-700 text-white flex items-center gap-1.5 disabled:opacity-50" },
+        /* @__PURE__ */ React.createElement(RefreshCw, { size: 15 }), " ", state === "loading" ? "Measuring…" : "Run the check"),
+      /* @__PURE__ */ React.createElement("button", { onClick: () => run(true), disabled: state === "loading", className: "text-sm px-3 py-2 rounded-lg border border-slate-200 text-slate-600 hover:bg-slate-50 disabled:opacity-50" }, "Also time the gains match"),
+      d && /* @__PURE__ */ React.createElement("span", { className: "text-[11px] text-slate-400" }, "measured ", d.at, " ", d.tz)),
+
+    state === "error" && /* @__PURE__ */ React.createElement("div", { className: "text-[12px] text-rose-800 bg-rose-50 border border-rose-200 rounded-lg px-3 py-2" }, err),
+    state === "loading" && /* @__PURE__ */ React.createElement("div", { className: "text-[12px] text-slate-500 bg-slate-50 border border-slate-200 rounded-lg px-3 py-2" }, "Reading every tab and timing the trade book… this is deliberately the slow path, so give it a moment."),
+
+    state === "ready" && /* @__PURE__ */ React.createElement(React.Fragment, null,
+      /* @__PURE__ */ React.createElement("div", { className: `border rounded-xl px-4 py-3 mb-3 ${tone[0]}` },
+        /* @__PURE__ */ React.createElement("div", { className: "text-sm font-semibold mb-1" }, tone[1]),
+        ((v.reasons) || []).map((r, i) => /* @__PURE__ */ React.createElement("div", { key: i, className: "text-[12px]" }, "• ", r))),
+
+      /* @__PURE__ */ React.createElement("div", { className: "grid sm:grid-cols-2 gap-4 mb-3" },
+        /* @__PURE__ */ React.createElement("div", { className: "border border-slate-200 rounded-xl p-3" },
+          /* @__PURE__ */ React.createElement("div", { className: "flex justify-between text-[12px] mb-1" },
+            /* @__PURE__ */ React.createElement("span", { className: "text-slate-500" }, "Cells used of the 10 million ceiling"),
+            /* @__PURE__ */ React.createElement("b", { className: "text-slate-800" }, d.pctOfCells, "%")),
+          bar(d.pctOfCells, d.pctOfCells >= 70),
+          /* @__PURE__ */ React.createElement("div", { className: "text-[11px] text-slate-400 mt-1.5" },
+            mil(d.gridCells), " allocated across ", d.tabCount, " tabs · ", mil(d.usedCells), " actually filled",
+            num(d.wastedCells) > 1e6 ? ` · ${mil(d.wastedCells)} allocated but empty` : "")),
+        /* @__PURE__ */ React.createElement("div", { className: "border border-slate-200 rounded-xl p-3" },
+          /* @__PURE__ */ React.createElement("div", { className: "flex justify-between text-[12px] mb-1" },
+            /* @__PURE__ */ React.createElement("span", { className: "text-slate-500" }, "One trade-book read, of the 6 minutes a run gets"),
+            /* @__PURE__ */ React.createElement("b", { className: "text-slate-800" }, secs(d.timings.totalMs))),
+          bar(Math.max(1, d.timings.pctOfRun), d.timings.pctOfRun >= 33),
+          /* @__PURE__ */ React.createElement("div", { className: "text-[11px] text-slate-400 mt-1.5" },
+            d.timings.pctOfRun, "% of the budget · raw read ", secs(d.timings.rawReadMs), ", normalise ", secs(d.timings.normaliseMs),
+            deep ? `, gains match ${secs(d.timings.fifoMs)}` : ""))),
+
+      /* @__PURE__ */ React.createElement("div", { className: "grid sm:grid-cols-3 gap-3 mb-3 text-[12px]" },
+        [["Trades on the book", Number(d.trades.normalisedRows).toLocaleString("en-IN")],
+         ["New trades a month", d.growth.perMonth ? Number(d.growth.perMonth).toLocaleString("en-IN") : "—"],
+         ["Headroom at that rate", d.growth.monthsToCap < 0 ? "—" : d.growth.monthsToCap > 120 ? "10 years or more" : `${d.growth.monthsToCap} month(s)`]]
+          .map(([k, val]) => /* @__PURE__ */ React.createElement("div", { key: k, className: "border border-slate-200 rounded-lg px-3 py-2" },
+            /* @__PURE__ */ React.createElement("div", { className: "text-[10px] uppercase text-slate-400" }, k),
+            /* @__PURE__ */ React.createElement("div", { className: "text-sm font-semibold text-slate-800 tabular-nums" }, val)))),
+
+      /* @__PURE__ */ React.createElement("div", { className: "border border-slate-200 rounded-xl overflow-hidden" },
+        /* @__PURE__ */ React.createElement("div", { style: { maxHeight: "34vh", overflowY: "auto" } },
+          /* @__PURE__ */ React.createElement("table", { className: "w-full text-sm" },
+            /* @__PURE__ */ React.createElement("thead", { className: "bg-slate-50 text-slate-500 text-[11px] uppercase sticky top-0" },
+              /* @__PURE__ */ React.createElement("tr", null,
+                /* @__PURE__ */ React.createElement("th", { className: "text-left font-medium px-3 py-2" }, "Tab"),
+                /* @__PURE__ */ React.createElement("th", { className: "text-right font-medium px-3 py-2" }, "Rows"),
+                /* @__PURE__ */ React.createElement("th", { className: "text-right font-medium px-3 py-2" }, "Cells"),
+                /* @__PURE__ */ React.createElement("th", { className: "text-right font-medium px-3 py-2" }, "Empty but allocated"),
+                /* @__PURE__ */ React.createElement("th", { className: "text-right font-medium px-3 py-2" }, "Share"))),
+            /* @__PURE__ */ React.createElement("tbody", { className: "divide-y divide-slate-100" },
+              (d.tabs || []).map((t) => /* @__PURE__ */ React.createElement("tr", { key: t.name },
+                /* @__PURE__ */ React.createElement("td", { className: "px-3 py-1.5 text-slate-800" }, t.name),
+                /* @__PURE__ */ React.createElement("td", { className: "px-3 py-1.5 text-right tabular-nums text-slate-600" }, Number(t.rows).toLocaleString("en-IN")),
+                /* @__PURE__ */ React.createElement("td", { className: "px-3 py-1.5 text-right tabular-nums text-slate-600" }, Number(t.gridCells).toLocaleString("en-IN")),
+                /* @__PURE__ */ React.createElement("td", { className: `px-3 py-1.5 text-right tabular-nums ${t.wasted > 5e5 ? "text-amber-600" : "text-slate-400"}` }, Number(t.wasted).toLocaleString("en-IN")),
+                /* @__PURE__ */ React.createElement("td", { className: "px-3 py-1.5 text-right tabular-nums text-slate-500" }, (t.gridCells / num(d.cellCap) * 100).toFixed(1), "%")))))))
+    ),
+    /* @__PURE__ */ React.createElement("p", { className: "text-[11px] text-slate-400 mt-2" },
+      "Rule of thumb: under 40% of cells and under 45 seconds a read, the spreadsheet is fine and easier to live with than a database, because you can open it and fix a typo. Past 70% of cells, or over two minutes a read, the trade book should move to a real database and the small human-edited tabs should stay where they are.")
+  );
+}
+function SettingsTab({ db, commit, showToast, user }) {
+  const [newStaff, setNewStaff] = useState("");
+  const [tpl, setTpl] = useState(db.template);
+  const [line, setLine] = useState(db.lineTemplate);
+  const [advTpl, setAdvTpl] = useState(db.adviceTemplate);
+  const [repTpl, setRepTpl] = useState(db.reportTemplate);
+  const [adv, setAdv] = useState(db.advisorName);
+  const [sebi, setSebi] = useState(db.sebiRegNo);
+  const [sUrl, setSUrl] = useState(db.sheetUrl || "");
+  const [sTok, setSTok] = useState(db.sheetToken || "");
+  const [gwProxyUrl, setGwProxyUrl] = useState(db.gwProxyUrl || "http://localhost:8787");
+  const [apTo, setApTo] = useState(db.approveTo != null ? db.approveTo : DEFAULT_APPROVE_TO);
+  const [rjTo, setRjTo] = useState(db.rejectTo != null ? db.rejectTo : DEFAULT_REJECT_TO);
+  const [apText, setApText] = useState(db.approveText != null ? db.approveText : DEFAULT_APPROVE_TEXT);
+  const [emQuery, setEmQuery] = useState("");
+  const [waMode, setWaMode] = useState(db.waOpenMode || "auto");
+  // Staff logins (the real users collection - see pocketbase/pb_migrations
+  // and pb_hooks/backend.pb.js), replacing the old name+PIN sign-in.
+  const [users, setUsers] = useState([]);
+  const [usersBusy, setUsersBusy] = useState(false);
+  const [newUser, setNewUser] = useState({ email: "", name: "", role: "staff", password: "" });
+  const loadUsers = useCallback(async () => {
+    const url = (db.sheetUrl || "").trim();
+    if (!url) return;
+    setUsersBusy(true);
+    try {
+      const res = await fetch(withToken(url) + "&users=1");
+      const data = await res.json();
+      if (data && data.ok) setUsers(data.rows || []);
+    } catch (e) {
+    } finally {
+      setUsersBusy(false);
+    }
+  }, [db.sheetUrl]);
+  useEffect(() => {
+    loadUsers();
+  }, [loadUsers]);
+  const postUsers = async (payload) => {
+    const url = (db.sheetUrl || "").trim();
+    if (!url) return { ok: false, error: "Set the server URL first." };
+    try {
+      const res = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ token: db.sheetToken || "", type: "users", ...payload })
+      });
+      return await res.json();
+    } catch (e) {
+      return { ok: false, error: "Could not reach the server." };
+    }
+  };
+  const addUser = async () => {
+    if (!newUser.email.trim() || newUser.password.length < 8) {
+      showToast("An email and a password of at least 8 characters are needed.", "err");
+      return;
+    }
+    const r = await postUsers({ email: newUser.email.trim(), name: newUser.name.trim(), role: newUser.role, newPassword: newUser.password });
+    if (r.ok) {
+      showToast(`${newUser.email.trim()} can now sign in.`);
+      setNewUser({ email: "", name: "", role: "staff", password: "" });
+      loadUsers();
+    } else showToast(r.error || "Could not create that account.", "err");
+  };
+  const setUserActive = async (u, active) => {
+    const r = await postUsers({ id: u.id, role: u.role, active });
+    if (r.ok) loadUsers();
+    else showToast(r.error || "Could not update that account.", "err");
+  };
+  const setUserRole = async (u, role) => {
+    const r = await postUsers({ id: u.id, role, active: u.active });
+    if (r.ok) loadUsers();
+    else showToast(r.error || "Could not update that account.", "err");
+  };
+  const removeUser = async (u) => {
+    if (!window.confirm(`Delete the login for ${u.email}? This cannot be undone.`)) return;
+    const r = await postUsers({ id: u.id, action: "delete" });
+    if (r.ok) loadUsers();
+    else showToast(r.error || "Could not delete that account.", "err");
+  };
+  const saveWaMode = async (v) => {
+    setWaMode(v);
+    await commit((d) => {
+      d.waOpenMode = v;
+    }, "set WhatsApp open mode");
+  };
+  const saveApproval = async () => {
+    await commit((d) => {
+      d.approveTo = apTo.trim();
+      d.rejectTo = rjTo.trim();
+      d.approveText = apText.trim();
+    }, "edit approval email settings");
+    showToast("Approval email settings saved.");
+  };
+  const execClients = useMemo(() => Object.values(db.clients || {}).map((c) => ({ code: c.code, name: c.name || c.code })).sort((a, b) => String(a.name).localeCompare(String(b.name))), [db.clients]);
+  const execShown = useMemo(() => {
+    const q = emQuery.trim().toLowerCase();
+    return q ? execClients.filter((c) => c.name.toLowerCase().includes(q) || String(c.code).toLowerCase().includes(q)) : execClients;
+  }, [execClients, emQuery]);
+  const [execBusy, setExecBusy] = useState(false);
+  const setExecOne = async (code, mode) => {
+    await commit((d) => {
+      d.execMode = { ...d.execMode || {}, [code]: mode };
+      d.execModeAt = { ...d.execModeAt || {}, [code]: Date.now() };
+    }, "set client order method");
+    pushExecModes(db, [{ code, name: (db.clients || {})[code]?.name || "", method: mode }]);
+  };
+  const setExecShown = async (mode) => {
+    const list = execShown;
+    if (!list.length) return;
+    await commit((d) => {
+      const m = { ...d.execMode || {} }, at = { ...d.execModeAt || {} }, now = Date.now();
+      for (const c of list) {
+        m[c.code] = mode;
+        at[c.code] = now;
+      }
+      d.execMode = m;
+      d.execModeAt = at;
+    }, "set client order method");
+    const ok = await pushExecModes(db, list.map((c) => ({ code: c.code, name: c.name, method: mode })));
+    showToast(`${list.length} client(s) set to ${EXEC_MODE_LABEL[mode]}${ok ? ", saved to the sheet" : ""}.`);
+  };
+  const saveExecAll = async () => {
+    if (!(db.sheetUrl || "").trim()) {
+      showToast("Connect your Google Sheet in Settings first.", "err");
+      return;
+    }
+    setExecBusy(true);
+    const ok = await pushExecModes(db, execClients.map((c) => ({ code: c.code, name: c.name, method: execModeOf(db, c.code) })));
+    setExecBusy(false);
+    showToast(ok ? `Saved ${execClients.length} client(s) to the sheet's OrderMethod tab.` : "Couldn't reach the sheet endpoint.", ok ? "ok" : "err");
+  };
+  const loadExecAll = async () => {
+    if (!(db.sheetUrl || "").trim()) {
+      showToast("Connect your Google Sheet in Settings first.", "err");
+      return;
+    }
+    setExecBusy(true);
+    try {
+      const remote = await pullExecModes(db.sheetUrl);
+      const n = Object.keys(remote).length;
+      if (!n) {
+        showToast("The sheet has no saved order methods yet.", "err");
+      } else {
+        await commit((d) => {
+          const m = { ...d.execMode || {} }, at = { ...d.execModeAt || {} };
+          for (const [code, v] of Object.entries(remote)) {
+            m[code] = v.method;
+            at[code] = num(v.updatedAt);
+          }
+          d.execMode = m;
+          d.execModeAt = at;
+        }, "load client order methods");
+        showToast(`Loaded ${n} client(s) from the sheet.`);
+      }
+    } catch (e) {
+      showToast("Couldn't read the sheet endpoint.", "err");
+    } finally {
+      setExecBusy(false);
+    }
+  };
+  const saveGateway = async () => {
+    await commit((d) => {
+      d.gwProxyUrl = gwProxyUrl.trim();
+    }, "edit order-link gateway settings");
+    showToast("Order-link gateway settings saved.");
+  };
+  const [autoBk, setAutoBk] = useState(!!db.autoBackup);
+  const [teamSync, setTeamSync] = useState(!!db.teamSync);
+  const [gk, setGk] = useState(null);
+  const [gkTok, setGkTok] = useState("");
+  const [gkTrUrl, setGkTrUrl] = useState("");
+  const [gkLdUrl, setGkLdUrl] = useState("");
+  const [gkHdUrl, setGkHdUrl] = useState("");
+  const [gkBusy, setGkBusy] = useState(false);
+  const loadGk = useCallback(async () => {
+    const url = (db.sheetUrl || "").trim();
+    if (!url) return;
+    try {
+      const res = await fetch(withToken(url) + "&gridkey=1");
+      const d = await res.json();
+      setGk(d);
+      setGkTrUrl((v) => v || d.tradesUrl || "");
+      setGkLdUrl((v) => v || d.ledgerUrl || "");
+      setGkHdUrl((v) => v || d.holdingsUrl || "");
+    } catch (e) {
+    }
+  }, [db.sheetUrl]);
+  useEffect(() => {
+    loadGk();
+  }, [loadGk]);
+  const saveGk = async () => {
+    const url = (db.sheetUrl || "").trim();
+    if (!url) {
+      showToast("Set the Google Sheet web-app URL first.", "err");
+      return;
+    }
+    setGkBusy(true);
+    try {
+      await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          token: db.sheetToken || "",
+          type: "gridkey_config",
+          gkToken: gkTok.trim(),
+          gkTradesUrl: gkTrUrl.trim(),
+          gkLedgerUrl: gkLdUrl.trim(),
+          gkHoldingsUrl: gkHdUrl.trim()
+        })
+      });
+      setGkTok("");
+      showToast("Saved to the server. The token is stored in Google's Script Properties, not in this browser.");
+      setTimeout(loadGk, 1200);
+    } catch (e) {
+      showToast("Couldn't reach the sheet endpoint.", "err");
+    } finally {
+      setGkBusy(false);
+    }
+  };
+  const runGk = async () => {
+    const url = (db.sheetUrl || "").trim();
+    if (!url) {
+      showToast("Set the Google Sheet web-app URL first.", "err");
+      return;
+    }
+    setGkBusy(true);
+    showToast("Fetching from GridKey \u2014 a large export can take a minute.");
+    try {
+      await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ token: db.sheetToken || "", type: "gridkey_run" })
+      });
+      setTimeout(async () => {
+        await loadGk();
+        setGkBusy(false);
+      }, 8e3);
+      return;
+    } catch (e) {
+      showToast("Couldn't reach the sheet endpoint.", "err");
+      setGkBusy(false);
+    }
+  };
+  const [cl, setCl] = useState(() => ({ default: 10, ...db.concLimits || {} }));
+  const saveLimits = async () => {
+    const clean = {};
+    for (const k of Object.keys(cl)) {
+      const v = num(cl[k]);
+      if (k === "default") {
+        clean.default = v > 0 ? v : 10;
+      } else if (String(cl[k] ?? "").trim() !== "" && v > 0) {
+        clean[k] = v;
+      }
+    }
+    await commit((d) => {
+      d.concLimits = clean;
+    }, "edit concentration limits");
+    showToast(`Concentration limits saved. Default ${fmtNum(clean.default)}%${Object.keys(clean).length > 1 ? `, with ${Object.keys(clean).length - 1} category override(s)` : ""}.`);
+  };
+  const [pullRes, setPullRes] = useState(null);
+  const [pullBusy, setPullBusy] = useState(false);
+  const [pushBlock, setPushBlock] = useState(null);
+  const [forceConfirmText, setForceConfirmText] = useState("");
+  const [restore, setRestore] = useState(null);
+  const [restoreBusy, setRestoreBusy] = useState(false);
+  const [confirmRestore, setConfirmRestore] = useState(false);
+  const restoreRef = useRef();
+  useEffect(() => {
+    setTpl(db.template);
+    setLine(db.lineTemplate);
+    setAdvTpl(db.adviceTemplate);
+    setRepTpl(db.reportTemplate);
+    setAdv(db.advisorName);
+    setSebi(db.sebiRegNo);
+    setSUrl(db.sheetUrl || "");
+    setSTok(db.sheetToken || "");
+    setGwProxyUrl(db.gwProxyUrl || "http://localhost:8787");
+    setApTo(db.approveTo != null ? db.approveTo : DEFAULT_APPROVE_TO);
+    setRjTo(db.rejectTo != null ? db.rejectTo : DEFAULT_REJECT_TO);
+    setApText(db.approveText != null ? db.approveText : DEFAULT_APPROVE_TEXT);
+    setWaMode(db.waOpenMode || "auto");
+    setAutoBk(!!db.autoBackup);
+    setTeamSync(!!db.teamSync);
+    setCl({ default: 10, ...db.concLimits || {} });
+  }, [db.version]);
+  // Every change to who may sign in is published to the office sheet straight away.
+  // It used to ride along with the next full backup, so a new joiner could not sign in
+  // from their own device until one happened - and a name you had just turned off could.
+  const publishStaff = async (next) => {
+    await pushStaffToSheet(next);
+    return next;
+  };
+  const addStaff = async () => {
+    const n = tidyName(newStaff);
+    if (!n) return;
+    if ((db.staff || []).some((s) => s && nameKey(s.name) === nameKey(n))) {
+      showToast("That name already exists.", "err");
+      return;
+    }
+    const next = await commit((d) => {
+      d.staff = [...d.staff || [], { name: n, enabled: true }];
+    }, "add staff");
+    await publishStaff(next);
+    setNewStaff("");
+    showToast(`${n} added and enabled.`);
+  };
+  const toggleStaff = (name) => commit((d) => {
+    d.staff = (d.staff || []).map((s) => s && nameKey(s.name) === nameKey(name) ? { ...s, enabled: !s.enabled } : s);
+  }, "toggle staff").then(publishStaff);
+  const removeStaff = (name) => commit((d) => {
+    d.staff = (d.staff || []).filter((s) => s && nameKey(s.name) !== nameKey(name));
+  }, "remove staff").then(publishStaff).then(() => showToast("Staff removed."));
+  const saveTemplate = async () => {
+    await commit((d) => {
+      d.template = tpl;
+      d.lineTemplate = line;
+      d.advisorName = adv;
+      d.sebiRegNo = sebi;
+    }, "edit template");
+    showToast("Message template saved.");
+  };
+  const saveAdvice = async () => {
+    await commit((d) => {
+      d.adviceTemplate = advTpl;
+      d.reportTemplate = repTpl;
+    }, "edit advice templates");
+    showToast("Advice & report templates saved.");
+  };
+  const saveSheet = async () => {
+    await commit((d) => {
+      d.sheetUrl = sUrl.trim();
+      d.sheetToken = sTok.trim();
+      d.autoBackup = autoBk;
+      d.teamSync = teamSync;
+    }, "edit sheet backup");
+    showToast(teamSync ? "Saved. Team sync is ON \u2014 this device now pulls at sign-in and pushes every change." : "Google Sheet backup settings saved.");
+  };
+  const [dedupeBusy, setDedupeBusy] = useState(false);
+  const [dedupeMsg, setDedupeMsg] = useState("");
+  const runDedupe = async () => {
+    const url = (db.sheetUrl || "").trim();
+    if (!url) {
+      showToast("Connect your Google Sheet first.", "err");
+      return;
+    }
+    if (!window.confirm("Remove duplicate rows from the Trades and Ledger tabs? The first copy of every row is kept. Take a copy of the sheet first if you want a safety net.")) return;
+    setDedupeBusy(true);
+    setDedupeMsg("Cleaning\u2026 this can take a minute on a large sheet.");
+    try {
+      const res = await fetch(withToken(url) + "&dedupe=Trades,Ledger");
+      const d = await res.json();
+      if (!d.ok) setDedupeMsg("Couldn't clean: " + (d.error || "unknown error"));
+      else setDedupeMsg((d.results || []).map((r) => r.error ? `${r.sheet}: ${r.error}` : `${r.sheet}: ${fmtNum(r.before)} rows \u2192 ${fmtNum(r.after)} (removed ${fmtNum(r.removed)})`).join(" \xB7 "));
+    } catch (e) {
+      setDedupeMsg("Couldn't reach the endpoint. Make sure the script is re-deployed as a new version.");
+    } finally {
+      setDedupeBusy(false);
+    }
+  };
+  const [loadBusy, setLoadBusy] = useState(false);
+  const [loadMsg, setLoadMsg] = useState("");
+  const loadHoldingsNow = async () => {
+    const url = (db.sheetUrl || "").trim();
+    if (!url) {
+      showToast("Connect your Google Sheet first.", "err");
+      return;
+    }
+    setLoadBusy(true);
+    setLoadMsg("Reading the sheet\u2026");
+    try {
+      const r = await pullHoldingsFromSheet(url);
+      if (!r || !r.built || !r.built.clientCount) {
+        setLoadMsg("The sheet's Holdings tab came back empty \u2014 run Fetch now first.");
+        return;
+      }
+      await commit((d) => {
+        d.clients = r.built.clients;
+      }, "pull from sheet");
+      const want = probeSym.trim().toUpperCase();
+      let found = 0;
+      if (want) {
+        for (const c of Object.values(r.built.clients)) if (Object.values(c.holdings || {}).some((h) => String(h.stock).toUpperCase() === want && num(h.quantity) > 0)) found++;
+      }
+      setLoadMsg(`Loaded ${fmtNum(r.built.clientCount)} clients and ${fmtNum(r.built.holdingCount)} holdings onto this device.` + (want ? found ? ` ${want} now shows in ${fmtNum(found)} client portfolio(s).` : ` ${want} still isn't in what the sheet returned \u2014 press Fetch now, then try again.` : ""));
+    } catch (e) {
+      setLoadMsg("Couldn't read the sheet. Check the /exec URL and that the script is deployed as a NEW version.");
+    } finally {
+      setLoadBusy(false);
+    }
+  };
+  const [probeOn, setProbeOn] = useState((/* @__PURE__ */ new Date()).toISOString().slice(0, 10));
+  const [probeSym, setProbeSym] = useState("");
+  const [probeBusy, setProbeBusy] = useState(false);
+  const [probe, setProbe] = useState(null);
+  const runProbe = async () => {
+    const url = (db.sheetUrl || "").trim();
+    if (!url) {
+      showToast("Connect your Google Sheet first.", "err");
+      return;
+    }
+    setProbeBusy(true);
+    setProbe(null);
+    try {
+      const res = await fetch(withToken(url) + "&gk_probe=trades&on=" + encodeURIComponent(probeOn) + (probeSym.trim() ? "&sym=" + encodeURIComponent(probeSym.trim()) : ""));
+      setProbe(await res.json());
+    } catch (e) {
+      setProbe({ ok: false, error: "Couldn't reach the endpoint \u2014 redeploy the script as a new version." });
+    } finally {
+      setProbeBusy(false);
+    }
+  };
+  const [shortProv, setShortProv] = useState("isgd");
+  const [shortTok, setShortTok] = useState("");
+  const [shortBase, setShortBase] = useState("");
+  const [shortBusy, setShortBusy] = useState(false);
+  const saveShortener = async () => {
+    const url = (db.sheetUrl || "").trim();
+    if (!url) {
+      showToast("Connect your Google Sheet first.", "err");
+      return;
+    }
+    setShortBusy(true);
+    try {
+      await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          token: db.sheetToken || "",
+          type: "shortener_config",
+          provider: shortProv,
+          shortToken: shortTok.trim(),
+          base: shortBase.trim()
+        })
+      });
+      showToast(shortProv === "off" ? "Short links switched off \u2014 the full link will be sent." : `Short links set to ${shortProv}.`);
+    } catch (e) {
+      showToast("Couldn't reach the endpoint.", "err");
+    } finally {
+      setShortBusy(false);
+    }
+  };
+  const [diag, setDiag] = useState(null);
+  const [diagBusy, setDiagBusy] = useState(false);
+  const [testTo, setTestTo] = useState(db.advisorEmail || "");
+  const [testMsg, setTestMsg] = useState("");
+  const runDiag = async () => {
+    const url = (db.sheetUrl || "").trim();
+    if (!url) {
+      showToast("Connect your Google Sheet first (see Google Sheet backup below).", "err");
+      return;
+    }
+    setDiagBusy(true);
+    setDiag(null);
+    try {
+      const d = await pingEndpoint(url);
+      setDiag(d);
+    } catch (e) {
+      setDiag({ error: "unreachable" });
+    } finally {
+      setDiagBusy(false);
+    }
+  };
+  const sendTest = async () => {
+    const url = (db.sheetUrl || "").trim();
+    if (!url) {
+      showToast("Connect your Google Sheet first (see Google Sheet backup below).", "err");
+      return;
+    }
+    const to = (testTo || "").trim();
+    if (!to.includes("@")) {
+      showToast("Enter an email address to send the test to.", "err");
+      return;
+    }
+    setDiagBusy(true);
+    setTestMsg("Sending test email\u2026");
+    try {
+      const startedAt = Date.now();
+      await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          token: db.sheetToken || "",
+          type: "greeting_email",
+          image: "",
+          subject: "Vasupradah test email",
+          bodyText: "This is a test email from the Vasupradah Client Console. If you received this, email sending is working.",
+          recipients: [{ email: to, name: "" }],
+          personalize: false,
+          fromName: db.advisorName || "Vasupradah Investment Advisory"
+        })
+      });
+      let result = null;
+      for (let i = 0; i < 8; i++) {
+        await new Promise((r) => setTimeout(r, 1800));
+        try {
+          const rs = await fetch(withToken(url) + "&greeting_status=1");
+          const dd = await rs.json();
+          if (dd && dd.result && dd.at && dd.at >= startedAt) {
+            result = dd.result;
+            break;
+          }
+        } catch (e) {
+        }
+      }
+      setTestMsg(result || "No status came back within ~15s. If the endpoint isn't re-deployed as a NEW version, the request is hitting old code \u2014 redeploy and try again.");
+    } catch (e) {
+      setTestMsg("Couldn't reach the endpoint. Check the /exec URL is correct and the script is deployed to 'Anyone'.");
+    } finally {
+      setDiagBusy(false);
+    }
+  };
+  const doPull = async () => {
+    const url = sUrl.trim();
+    if (!url) {
+      showToast("Enter the Web app URL first.", "err");
+      return;
+    }
+    setPullBusy(true);
+    setPullRes(null);
+    try {
+      const r = await pullHoldingsFromSheet(url);
+      if (!r.rowCount) {
+        showToast("The sheet's Holdings tab is empty \u2014 push once with \u201CBack up now\u201D, then pull.", "err");
+        return;
+      }
+      setPullRes(r);
+    } catch (e) {
+      showToast("Couldn't read the sheet. Check the /exec URL and that the script is re-deployed as a NEW version.", "err");
+    } finally {
+      setPullBusy(false);
+    }
+  };
+  const applyPull = async () => {
+    if (!pullRes) return;
+    await commit((d) => {
+      d.clients = pullRes.built.clients;
+    }, "pull from sheet");
+    showToast(`Loaded ${pullRes.built.clientCount} clients and ${pullRes.built.holdingCount} holdings from the sheet.`);
+    setPullRes(null);
+  };
+  const runBackup = async () => {
+    if (!sUrl.trim()) {
+      showToast("Add the web-app URL first.", "err");
+      return;
+    }
+    setPushBlock(null);
+    const r = await backupToSheet({ ...db, sheetUrl: sUrl.trim(), sheetToken: sTok.trim() });
+    if (r.needsConfirm) {
+      setPushBlock(r);
+      return;
+    }
+    showToast(r.msg, r.ok ? "ok" : "err");
+  };
+  const forceBackup = async () => {
+    if (forceConfirmText.trim().toUpperCase() !== "CONFIRM") {
+      showToast("Type CONFIRM (in caps) to proceed.", "err");
+      return;
+    }
+    const r = await backupToSheet({ ...db, sheetUrl: sUrl.trim(), sheetToken: sTok.trim() }, { force: true });
+    showToast(r.msg, r.ok ? "ok" : "err");
+    setPushBlock(null);
+    setForceConfirmText("");
+  };
+  const copyForSheet = async () => {
+    const rows = clientRows(db);
+    const tsv = [SHEET_HEADER, ...rows].map((r) => r.join("	")).join("\n");
+    const ok = await copyText(tsv);
+    if (ok) showToast(`Copied ${rows.length} rows \u2014 paste into cell A1.`);
+    else showToast("Copy blocked \u2014 use the CSV export instead.", "err");
+  };
+  const exportCsv = () => {
+    const rows = [];
+    for (const c of Object.values(db.clients)) for (const h of Object.values(c.holdings || {})) {
+      if (num(h.quantity) <= 0) continue;
+      const e = effOf(h, db.prices);
+      rows.push({
+        "Client code": c.code,
+        Name: c.name || "",
+        Email: c.email || "",
+        WhatsApp: waDisplay(c.whatsapp),
+        "Risk category": c.risk || "",
+        Stock: h.stock,
+        Quantity: h.quantity,
+        "Purchase price": Number(h.purchasePrice || 0).toFixed(2),
+        "Current price": Number(e.currentPrice || 0).toFixed(2),
+        Invested: e.invested,
+        Current: e.current,
+        "P/L amount": e.pnl.toFixed(2),
+        "P/L %": e.pnlPct.toFixed(2),
+        "Invested set": h.investedManual ? "Manual" : "Sheet"
+      });
+    }
+    const blob = new Blob([Papa.unparse(rows)], { type: "text/csv" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = `vasupradah_holdings_${(/* @__PURE__ */ new Date()).toISOString().slice(0, 10)}.csv`;
+    a.click();
+  };
+  const portfolioVars = ["name", "code", "date", "holdings", "count", "totalInvested", "totalCurrent", "totalPnl", "totalPnlPct", "advisorName", "sebiRegNo"];
+  const lineVars = ["stock", "quantity", "purchasePrice", "currentPrice", "invested", "current", "pnl", "pnlPct"];
+  const readRestore = (file) => {
+    setRestoreBusy(true);
+    const ext = file.name.split(".").pop().toLowerCase();
+    const done = (rows) => {
+      setRestoreBusy(false);
+      const built = clientsFromBackup(rows);
+      if (!built.clientCount) {
+        showToast("No client rows found. Use the Holdings backup sheet or the exported CSV.", "err");
+        return;
+      }
+      setRestore({ ...built, fname: file.name });
+    };
+    if (ext === "csv" || ext === "txt") {
+      Papa.parse(file, {
+        header: true,
+        skipEmptyLines: true,
+        complete: (r) => done(r.data),
+        error: () => {
+          setRestoreBusy(false);
+          showToast("Could not read the CSV.", "err");
+        }
+      });
+    } else if (["xlsx", "xls", "xlsm"].includes(ext)) {
+      const r = new FileReader();
+      r.onload = (e) => {
+        try {
+          const wb = XLSX.read(e.target.result, { type: "array" });
+          done(XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]], { defval: "" }));
+        } catch {
+          setRestoreBusy(false);
+          showToast("Could not read the Excel file.", "err");
+        }
+      };
+      r.readAsArrayBuffer(file);
+    } else {
+      setRestoreBusy(false);
+      showToast("Use a .csv or .xlsx file.", "err");
+    }
+  };
+  const applyRestore = async () => {
+    await commit((d) => {
+      d.clients = restore.clients;
+    }, "restore from backup");
+    showToast(`Restored ${restore.clientCount} clients and ${restore.holdingCount} holdings.`);
+    setRestore(null);
+    setConfirmRestore(false);
+  };
+  return /* @__PURE__ */ React.createElement("div", { className: "max-w-3xl space-y-4" }, /* @__PURE__ */ React.createElement(Card, { title: "GridKey auto-sync (trades & ledger)", icon: RefreshCw }, /* @__PURE__ */ React.createElement("p", { className: "text-xs text-slate-500 mb-3" }, "Google fetches your GridKey export twice a day (", /* @__PURE__ */ React.createElement("b", null, "6:00 am"), " and ", /* @__PURE__ */ React.createElement("b", null, "6:00 pm"), ") and overwrites the ", /* @__PURE__ */ React.createElement("b", null, "Trades"), " and ", /* @__PURE__ */ React.createElement("b", null, "Ledger"), " tabs of your sheet. The token is stored on Google's server, not in this browser and not in the sheet \u2014 so it isn't copied to staff devices."), /* @__PURE__ */ React.createElement("div", { className: "space-y-2" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("label", { className: "text-[11px] text-slate-500 block mb-1" }, "API token ", gk && gk.tokenSet ? /* @__PURE__ */ React.createElement("span", { className: "text-emerald-600 font-medium" }, "\xB7 a token is already saved") : /* @__PURE__ */ React.createElement("span", { className: "text-amber-700 font-medium" }, "\xB7 not set yet")), /* @__PURE__ */ React.createElement(
+    "input",
+    {
+      type: "password",
+      value: gkTok,
+      onChange: (e) => setGkTok(e.target.value),
+      placeholder: gk && gk.tokenSet ? "Leave blank to keep the saved token" : "Paste the GridKey token here",
+      className: "w-full px-3 py-2 text-sm border border-slate-300 rounded-lg"
+    }
+  )), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("label", { className: "text-[11px] text-slate-500 block mb-1" }, "Trades export URL"), /* @__PURE__ */ React.createElement(
+    "input",
+    {
+      value: gkTrUrl,
+      onChange: (e) => setGkTrUrl(e.target.value),
+      placeholder: "https://django-backend-prod.gridkey.in/transaction/export_csv/?show_zero_holding=false&filter=%7B%7D",
+      className: "w-full px-3 py-2 text-[12px] font-mono border border-slate-300 rounded-lg"
+    }
+  )), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("label", { className: "text-[11px] text-slate-500 block mb-1" }, "Ledger export URL ", /* @__PURE__ */ React.createElement("span", { className: "text-slate-400" }, "(paste when you have it)")), /* @__PURE__ */ React.createElement(
+    "input",
+    {
+      value: gkLdUrl,
+      onChange: (e) => setGkLdUrl(e.target.value),
+      placeholder: "https://django-backend-prod.gridkey.in/\u2026/export_csv/\u2026",
+      className: "w-full px-3 py-2 text-[12px] font-mono border border-slate-300 rounded-lg"
+    }
+  )), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("label", { className: "text-[11px] text-slate-500 block mb-1" }, "Combined holdings export URL ", /* @__PURE__ */ React.createElement("span", { className: "text-emerald-600" }, "(recommended \u2014 fixes splits & prices)")), /* @__PURE__ */ React.createElement(
+    "input",
+    {
+      value: gkHdUrl,
+      onChange: (e) => setGkHdUrl(e.target.value),
+      placeholder: "https://\u2026gridkey.in/\u2026/combined_holdings\u2026",
+      className: "w-full px-3 py-2 text-[12px] font-mono border border-slate-300 rounded-lg"
+    }
+  ))), /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap gap-2 mt-3" }, /* @__PURE__ */ React.createElement("button", { onClick: saveGk, disabled: gkBusy, className: "bg-indigo-600 hover:bg-indigo-700 text-white text-sm px-4 py-2 rounded-lg disabled:opacity-50" }, "Save to server"), /* @__PURE__ */ React.createElement("button", { onClick: runGk, disabled: gkBusy, className: "bg-slate-700 hover:bg-slate-800 text-white text-sm px-4 py-2 rounded-lg flex items-center gap-1.5 disabled:opacity-50" }, /* @__PURE__ */ React.createElement(RefreshCw, { size: 15, className: gkBusy ? "animate-spin" : "" }), " ", gkBusy ? "Fetching\u2026" : "Fetch now"), /* @__PURE__ */ React.createElement("button", { onClick: loadGk, className: "border border-slate-300 hover:bg-slate-50 text-slate-700 text-sm px-4 py-2 rounded-lg" }, "Refresh status")), /* @__PURE__ */ React.createElement("div", { className: "mt-3 flex flex-wrap gap-2 items-end" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("label", { className: "text-[11px] text-slate-500 block mb-1" }, "Trade missing? Check a date"), /* @__PURE__ */ React.createElement("input", { type: "date", value: probeOn, onChange: (e) => setProbeOn(e.target.value), className: "px-3 py-2 text-sm border border-slate-300 rounded-lg" })), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("label", { className: "text-[11px] text-slate-500 block mb-1" }, "\u2026or a stock symbol"), /* @__PURE__ */ React.createElement("input", { value: probeSym, onChange: (e) => setProbeSym(e.target.value.toUpperCase()), placeholder: "e.g. GICRE", className: "px-3 py-2 text-sm border border-slate-300 rounded-lg w-36" })), /* @__PURE__ */ React.createElement("button", { onClick: runProbe, disabled: probeBusy, className: "border border-slate-300 hover:bg-slate-50 text-slate-700 text-sm px-4 py-2 rounded-lg disabled:opacity-50" }, probeBusy ? "Checking\u2026" : "Check what GridKey returns"), /* @__PURE__ */ React.createElement("button", { onClick: loadHoldingsNow, disabled: loadBusy, className: "text-white text-sm px-4 py-2 rounded-lg disabled:opacity-50", style: { background: "#2E3192" } }, loadBusy ? "Loading\u2026" : "Load holdings onto this device")), loadMsg && /* @__PURE__ */ React.createElement("div", { className: "mt-2 text-[12px] rounded-lg border border-slate-200 bg-slate-50 px-3 py-2" }, loadMsg), probe && /* @__PURE__ */ React.createElement("div", { className: "mt-2 text-[12px] rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 space-y-0.5" }, probe.ok === false ? /* @__PURE__ */ React.createElement("div", { className: "text-rose-700" }, probe.error) : /* @__PURE__ */ React.createElement(React.Fragment, null, probe.fetchError ? /* @__PURE__ */ React.createElement("div", { className: "text-rose-700" }, "The export could not be fetched: ", probe.fetchError) : /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("div", null, "Export returned ", /* @__PURE__ */ React.createElement("b", null, fmtNum(probe.exportRows || 0)), " rows", probe.earliest ? /* @__PURE__ */ React.createElement(React.Fragment, null, " covering ", /* @__PURE__ */ React.createElement("b", null, probe.earliest), " to ", /* @__PURE__ */ React.createElement("b", null, probe.latest)) : null, "."), probe.askedFor && (probe.presentInExport ? /* @__PURE__ */ React.createElement("div", { className: "text-emerald-700" }, probe.askedFor, " ", /* @__PURE__ */ React.createElement("b", null, "is"), " in the export", probe.rowsInSheetOnThatDate != null ? /* @__PURE__ */ React.createElement(React.Fragment, null, " \u2014 and ", probe.rowsInSheetOnThatDate > 0 ? /* @__PURE__ */ React.createElement(React.Fragment, null, "already sits in the sheet (", fmtNum(probe.rowsInSheetOnThatDate), " row(s))") : /* @__PURE__ */ React.createElement("b", null, "is not in the sheet yet \u2014 press \u201CFetch now\u201D")) : null, ".") : /* @__PURE__ */ React.createElement("div", { className: "text-amber-700" }, probe.askedFor, " is ", /* @__PURE__ */ React.createElement("b", null, "not in the export at all"), " \u2014 the export URL is filtered or hasn't caught up, so the console can never see it."))), probe.symbol && /* @__PURE__ */ React.createElement("div", { className: "mt-1 pt-1 border-t border-slate-200" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("b", null, probe.symbol), ": ", fmtNum(probe.tradesForSymbol || 0), " trade(s) in the book", probe.lastTradeForSymbol ? /* @__PURE__ */ React.createElement(React.Fragment, null, ", latest ", /* @__PURE__ */ React.createElement("b", null, String(probe.lastTradeForSymbol).slice(0, 10))) : null, "."), /* @__PURE__ */ React.createElement("div", { className: probe.holdingRowsForSymbol ? "text-emerald-700" : "text-amber-700" }, probe.holdingRowsForSymbol ? /* @__PURE__ */ React.createElement(React.Fragment, null, "Held in ", /* @__PURE__ */ React.createElement("b", null, fmtNum(probe.holdingRowsForSymbol)), " client row(s) in the Holdings tab.") : /* @__PURE__ */ React.createElement(React.Fragment, null, "Not present in the Holdings tab \u2014 so the console cannot show it as a position.")), probe.combinedRowsForSymbol != null && /* @__PURE__ */ React.createElement("div", { className: probe.combinedRowsForSymbol ? "text-slate-500" : "text-rose-700" }, probe.combinedRowsForSymbol ? /* @__PURE__ */ React.createElement(React.Fragment, null, "GridKey's combined-holdings export lists it ", fmtNum(probe.combinedRowsForSymbol), " time(s) \u2014 press ", /* @__PURE__ */ React.createElement("b", null, "Fetch now"), " to pull it in.") : /* @__PURE__ */ React.createElement(React.Fragment, null, "GridKey's combined-holdings export does not contain it at all, so the position cannot reach the console.")), probe.symbolCombinedError && /* @__PURE__ */ React.createElement("div", { className: "text-amber-700" }, "Combined-holdings check failed: ", probe.symbolCombinedError)), probe.normalisedOnThatDate != null && (probe.normalisedOnThatDate > 0 ? /* @__PURE__ */ React.createElement("div", { className: "text-emerald-700" }, "The console's trade feed sees ", /* @__PURE__ */ React.createElement("b", null, fmtNum(probe.normalisedOnThatDate)), " trade(s) on that date (", fmtNum(probe.normalisedTotal || 0), " in total).") : /* @__PURE__ */ React.createElement("div", { className: "text-rose-700" }, "The sheet has those rows but the console's trade feed reads ", /* @__PURE__ */ React.createElement("b", null, "0"), " for that date \u2014 the export's columns aren't being recognised. Send me the Trades tab header row.")), /* @__PURE__ */ React.createElement("div", { className: "text-slate-500" }, "Sheet holds ", fmtNum(probe.sheetRows || 0), " rows \xD7 ", probe.sheetCols || 0, " columns (", fmtNum(probe.sheetCells || 0), " cells", (probe.sheetCells || 0) > 8e6 ? " \u2014 close to Google's 10 million cell limit, which blocks new rows" : "", ")."), probe.lastSync && /* @__PURE__ */ React.createElement("div", { className: "text-slate-500" }, "Last sync: ", probe.lastSync, " \u2014 ", probe.lastResult))), dedupeMsg && /* @__PURE__ */ React.createElement("div", { className: "mt-3 text-[12px] text-slate-700 bg-slate-50 border border-slate-200 rounded-lg px-3 py-2" }, dedupeMsg), gk && /* @__PURE__ */ React.createElement("div", { className: "mt-3 text-[12px] rounded-lg border px-3 py-2 space-y-0.5 border-slate-200 bg-slate-50" }, /* @__PURE__ */ React.createElement("div", null, "Schedule: ", gk.triggers > 0 ? /* @__PURE__ */ React.createElement("span", { className: "text-emerald-700 font-medium" }, "active \u2014 ", gk.triggers, " daily trigger(s) (", gk.timezone, ")") : /* @__PURE__ */ React.createElement("span", { className: "text-amber-700 font-medium" }, "not installed yet \u2014 run ", /* @__PURE__ */ React.createElement("code", { className: "bg-white px-1 rounded border" }, "setupGridkeyTriggers"), " once in Apps Script")), gk.lastSync && /* @__PURE__ */ React.createElement("div", null, "Last run: ", /* @__PURE__ */ React.createElement("b", null, gk.lastSync)), gk.lastResult && /* @__PURE__ */ React.createElement("div", { className: /^ERROR/.test(gk.lastResult) ? "text-rose-700" : "text-emerald-700" }, gk.lastResult), !gk.ledgerUrl && /* @__PURE__ */ React.createElement("div", { className: "text-slate-500" }, "Ledger URL not set \u2014 only trades will sync."))), /* @__PURE__ */ React.createElement(Card, { title: "Email sending & diagnostics", icon: Mail }, /* @__PURE__ */ React.createElement("p", { className: "text-sm text-slate-500 mb-3" }, "Advice, broadcasts and alerts are emailed by your Apps Script from the Google account that authorised it. If mail isn't going out, check it here \u2014 it shows the exact reason."), /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap gap-2 items-center" }, /* @__PURE__ */ React.createElement("button", { onClick: runDiag, disabled: diagBusy, className: "text-sm px-3 py-2 rounded-lg border border-slate-300 hover:bg-slate-50 text-slate-700 flex items-center gap-1.5 disabled:opacity-50" }, /* @__PURE__ */ React.createElement(ShieldCheck, { size: 15 }), " Check email setup"), /* @__PURE__ */ React.createElement("input", { value: testTo, onChange: (e) => setTestTo(e.target.value), placeholder: "send a test email to\u2026", className: "flex-1 min-w-[220px] px-3 py-2 text-sm border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500" }), /* @__PURE__ */ React.createElement("button", { onClick: sendTest, disabled: diagBusy, className: "text-sm px-4 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-700 text-white flex items-center gap-1.5 disabled:opacity-50" }, /* @__PURE__ */ React.createElement(Send, { size: 15 }), " Send test email")), diag && /* @__PURE__ */ React.createElement("div", { className: "mt-3 text-[13px] rounded-lg p-3 border bg-slate-50 border-slate-200 space-y-1" }, diag.error ? /* @__PURE__ */ React.createElement("div", { className: "text-rose-700" }, "Endpoint not reachable \u2014 check the /exec URL and that the deployment access is ", /* @__PURE__ */ React.createElement("b", null, "Anyone"), ", then redeploy a new version.") : /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("div", null, "Sends mail as: ", /* @__PURE__ */ React.createElement("b", { className: /@/.test(diag.user || "") ? "text-slate-800" : "text-rose-700" }, diag.user || "unknown"), " ", diag.user && !/vasupradah\.com/i.test(diag.user) && /* @__PURE__ */ React.createElement("span", { className: "text-amber-700" }, "\u2190 not your firm address; re-authorise & redeploy the script while signed in as jaideepmenon@vasupradah.com")), /* @__PURE__ */ React.createElement("div", null, "Gmail sends left today: ", /* @__PURE__ */ React.createElement("b", { className: diag.quota > 0 ? "text-emerald-700" : "text-rose-700" }, diag.quota), diag.quota === 0 && /* @__PURE__ */ React.createElement("span", { className: "text-rose-700" }, " \u2014 daily limit reached; try again tomorrow")), /* @__PURE__ */ React.createElement("div", { className: "text-slate-500" }, "Deployed version: ", diag.version || "unknown", diag.version !== "2026-09-05-pipeline" && /* @__PURE__ */ React.createElement("span", { className: "text-amber-700" }, " \u2014 older than this app; ", /* @__PURE__ */ React.createElement("b", null, "redeploy a NEW version"), " of the Apps Script (Deploy \u2192 Manage deployments \u2192 New version)")))), testMsg && /* @__PURE__ */ React.createElement("div", { className: "mt-2 text-[13px] text-slate-700 bg-slate-50 border border-slate-200 rounded-lg p-3" }, testMsg), /* @__PURE__ */ React.createElement("div", { className: "mt-3 text-[12px] text-slate-500" }, "If mail isn't sending, the usual cause is the Apps Script wasn't ", /* @__PURE__ */ React.createElement("b", null, "re-deployed as a NEW version"), " after the last update, or the ", /* @__PURE__ */ React.createElement("b", null, "Secret"), ` saved here doesn't match the one in the script. "Send test email" tells you which.`), /* @__PURE__ */ React.createElement("div", { className: "mt-4 pt-3 border-t border-slate-100" }, /* @__PURE__ */ React.createElement("div", { className: "text-sm font-medium text-slate-700 mb-1" }, "Short links for WhatsApp"), /* @__PURE__ */ React.createElement("p", { className: "text-[12px] text-slate-500 mb-2" }, "Emails hide the execute link behind a button, but WhatsApp always shows the address \u2014 so it is shortened. Pick who does the shortening."), /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap gap-2 items-end" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("label", { className: "text-[11px] text-slate-500 block mb-1" }, "Provider"), /* @__PURE__ */ React.createElement("select", { value: shortProv, onChange: (e) => setShortProv(e.target.value), className: "px-3 py-2 text-sm border border-slate-300 rounded-lg bg-white" }, /* @__PURE__ */ React.createElement("option", { value: "isgd" }, "is.gd (free, no account)"), /* @__PURE__ */ React.createElement("option", { value: "bitly" }, "Bitly (your account / branded domain)"), /* @__PURE__ */ React.createElement("option", { value: "custom" }, "Your own domain (redirect service)"), /* @__PURE__ */ React.createElement("option", { value: "tinyurl" }, "TinyURL"), /* @__PURE__ */ React.createElement("option", { value: "off" }, "Off \u2014 send the full link"))), shortProv === "bitly" && /* @__PURE__ */ React.createElement("div", { className: "flex-1 min-w-[220px]" }, /* @__PURE__ */ React.createElement("label", { className: "text-[11px] text-slate-500 block mb-1" }, "Bitly access token"), /* @__PURE__ */ React.createElement("input", { type: "password", value: shortTok, onChange: (e) => setShortTok(e.target.value), placeholder: "paste token", className: "w-full px-3 py-2 text-sm border border-slate-300 rounded-lg" })), (shortProv === "bitly" || shortProv === "custom") && /* @__PURE__ */ React.createElement("div", { className: "flex-1 min-w-[220px]" }, /* @__PURE__ */ React.createElement("label", { className: "text-[11px] text-slate-500 block mb-1" }, shortProv === "bitly" ? "Branded domain (optional)" : "Your shortener endpoint"), /* @__PURE__ */ React.createElement("input", { value: shortBase, onChange: (e) => setShortBase(e.target.value), placeholder: shortProv === "bitly" ? "links.vasupradah.com" : "https://vasupradah.com/s/create", className: "w-full px-3 py-2 text-sm border border-slate-300 rounded-lg" })), /* @__PURE__ */ React.createElement("button", { onClick: saveShortener, disabled: shortBusy, className: "text-sm px-4 py-2 rounded-lg text-white disabled:opacity-50", style: { background: "#2E3192" } }, shortBusy ? "Saving\u2026" : "Save")), /* @__PURE__ */ React.createElement("div", { className: "mt-2 text-[11px] text-slate-500" }, "The token is stored on Google's server with your script \u2014 never in this browser or the sheet. A custom endpoint should take ", /* @__PURE__ */ React.createElement("code", null, "?url="), " and return the short link as plain text.", diag && diag.shortener ? /* @__PURE__ */ React.createElement(React.Fragment, null, " Currently active: ", /* @__PURE__ */ React.createElement("b", null, diag.shortener), ".") : null))), /* @__PURE__ */ React.createElement(Card, { title: "Concentration limits", icon: AlertTriangle }, /* @__PURE__ */ React.createElement("p", { className: "text-xs text-slate-500 mb-3" }, "Flag any single stock whose market value exceeds this share of a client's ", /* @__PURE__ */ React.createElement("b", null, "total assets (holdings + cash)"), ". Leave a category blank to use the default. Breaches show as a red banner and a ", /* @__PURE__ */ React.createElement("b", null, "Concentration alerts"), " view in the Portfolio Report."), /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-2 sm:grid-cols-3 gap-3" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("label", { className: "text-[11px] text-slate-500 block mb-1" }, "Default limit"), /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-1" }, /* @__PURE__ */ React.createElement(
+    "input",
+    {
+      type: "number",
+      min: "0",
+      max: "100",
+      step: "0.5",
+      value: cl.default ?? "",
+      onChange: (e) => setCl((s) => ({ ...s, default: e.target.value })),
+      className: "px-3 py-2 text-sm border border-slate-300 rounded-lg w-24"
+    }
+  ), /* @__PURE__ */ React.createElement("span", { className: "text-sm text-slate-500" }, "%"))), RISK_CATEGORIES.map((rc) => /* @__PURE__ */ React.createElement("div", { key: rc }, /* @__PURE__ */ React.createElement("label", { className: "text-[11px] text-slate-500 block mb-1" }, rc), /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-1" }, /* @__PURE__ */ React.createElement(
+    "input",
+    {
+      type: "number",
+      min: "0",
+      max: "100",
+      step: "0.5",
+      value: cl[rc] ?? "",
+      placeholder: String(cl.default ?? 10),
+      onChange: (e) => setCl((s) => ({ ...s, [rc]: e.target.value })),
+      className: "px-3 py-2 text-sm border border-slate-300 rounded-lg w-24"
+    }
+  ), /* @__PURE__ */ React.createElement("span", { className: "text-sm text-slate-500" }, "%"))))), /* @__PURE__ */ /* @__PURE__ */ React.createElement("div", { className: "flex gap-2 mt-4" }, /* @__PURE__ */ React.createElement("button", { onClick: saveLimits, className: "bg-indigo-600 hover:bg-indigo-700 text-white text-sm px-4 py-2 rounded-lg" }, "Save limits"), /* @__PURE__ */ React.createElement("button", { onClick: () => setCl({ default: 10 }), className: "text-slate-600 text-sm px-3 py-2 rounded-lg border border-slate-200 hover:bg-slate-50" }, "Reset to 10% for all"))), /* @__PURE__ */ React.createElement(DataHealthCard, { db, showToast }), /* @__PURE__ */ React.createElement(Card, { title: "Staff logins", icon: Users },
+  /* @__PURE__ */ React.createElement("p", { className: "text-xs text-slate-500 mb-3" }, "Each person signs in with their own email and password - not shared with anyone else. Turning a login off keeps their name on old records but stops them signing in."),
+  /* @__PURE__ */ React.createElement("div", { className: "space-y-1.5 mb-4" },
+    users.map((u) => /* @__PURE__ */ React.createElement("div", { key: u.id, className: "flex items-center gap-2 bg-slate-50 rounded-lg px-3 py-2" },
+      /* @__PURE__ */ React.createElement("div", { className: "flex-1 min-w-0" },
+        /* @__PURE__ */ React.createElement("div", { className: "text-sm truncate" }, u.name || u.email, u.id === user.id && /* @__PURE__ */ React.createElement("span", { className: "text-slate-400" }, " \xB7 you")),
+        /* @__PURE__ */ React.createElement("div", { className: "text-[11px] text-slate-400 truncate" }, u.email)
+      ),
+      /* @__PURE__ */ React.createElement("select", {
+        value: u.role,
+        disabled: u.id === user.id,
+        onChange: (e) => setUserRole(u, e.target.value),
+        className: "text-xs border border-slate-200 rounded-md px-1.5 py-1 bg-white disabled:opacity-50"
+      }, /* @__PURE__ */ React.createElement("option", { value: "staff" }, "Staff"), /* @__PURE__ */ React.createElement("option", { value: "admin" }, "Admin")),
+      /* @__PURE__ */ React.createElement("button", {
+        onClick: () => setUserActive(u, !u.active),
+        disabled: u.id === user.id,
+        className: `text-xs px-2 py-1 rounded-md disabled:opacity-50 ${u.active ? "bg-emerald-100 text-emerald-700" : "bg-slate-200 text-slate-500"}`
+      }, u.active ? "Enabled" : "Disabled"),
+      u.id !== user.id && /* @__PURE__ */ React.createElement("button", { onClick: () => removeUser(u), className: "text-slate-400 hover:text-rose-600" }, /* @__PURE__ */ React.createElement(X, { size: 15 }))
+    )),
+    !users.length && !usersBusy && /* @__PURE__ */ React.createElement("p", { className: "text-xs text-slate-400" }, "No logins yet.")
+  ),
+  /* @__PURE__ */ React.createElement("div", { className: "border-t border-slate-100 pt-3" },
+    /* @__PURE__ */ React.createElement("div", { className: "text-xs font-medium text-slate-600 mb-2" }, "Add a login"),
+    /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-2 gap-2 mb-2" },
+      /* @__PURE__ */ React.createElement("input", { value: newUser.name, onChange: (e) => setNewUser({ ...newUser, name: e.target.value }), placeholder: "Name", className: "px-3 py-2 text-sm border border-slate-300 rounded-lg" }),
+      /* @__PURE__ */ React.createElement("input", { type: "email", value: newUser.email, onChange: (e) => setNewUser({ ...newUser, email: e.target.value }), placeholder: "Email", className: "px-3 py-2 text-sm border border-slate-300 rounded-lg" }),
+      /* @__PURE__ */ React.createElement("input", { type: "password", value: newUser.password, onChange: (e) => setNewUser({ ...newUser, password: e.target.value }), placeholder: "Password (8+ characters)", className: "px-3 py-2 text-sm border border-slate-300 rounded-lg" }),
+      /* @__PURE__ */ React.createElement("select", { value: newUser.role, onChange: (e) => setNewUser({ ...newUser, role: e.target.value }), className: "px-3 py-2 text-sm border border-slate-300 rounded-lg bg-white" }, /* @__PURE__ */ React.createElement("option", { value: "staff" }, "Staff"), /* @__PURE__ */ React.createElement("option", { value: "admin" }, "Admin"))
+    ),
+    /* @__PURE__ */ React.createElement("button", { onClick: addUser, className: "bg-indigo-600 hover:bg-indigo-700 text-white text-sm px-3 py-2 rounded-lg flex items-center gap-1" }, /* @__PURE__ */ React.createElement(Plus, { size: 16 }), " Add login")
+  )
+), /* @__PURE__ */ React.createElement(Card, { title: "WhatsApp message template", icon: MessageCircle }, /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-2 gap-3 mb-3" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("label", { className: "text-xs text-slate-500" }, "Advisor name"), /* @__PURE__ */ React.createElement("input", { value: adv, onChange: (e) => setAdv(e.target.value), className: "w-full mt-1 px-3 py-2 text-sm border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500" })), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("label", { className: "text-xs text-slate-500" }, "SEBI RIA Reg. No."), /* @__PURE__ */ React.createElement("input", { value: sebi, onChange: (e) => setSebi(e.target.value), className: "w-full mt-1 px-3 py-2 text-sm border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500" }))), /* @__PURE__ */ React.createElement("label", { className: "text-xs text-slate-500" }, "Message body (uses ", /* @__PURE__ */ React.createElement("code", { className: "bg-slate-100 px-1 rounded" }, "{holdings}"), " for the stock list)"), /* @__PURE__ */ React.createElement(
+    "textarea",
+    {
+      value: tpl,
+      onChange: (e) => setTpl(e.target.value),
+      rows: 11,
+      className: "w-full mt-1 px-3 py-2 text-xs font-mono border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500"
+    }
+  ), /* @__PURE__ */ React.createElement("div", { className: "text-[11px] text-slate-400 mt-1" }, portfolioVars.map((p) => /* @__PURE__ */ React.createElement("code", { key: p, className: "bg-slate-100 rounded px-1 mr-1" }, `{${p}}`))), /* @__PURE__ */ React.createElement("label", { className: "text-xs text-slate-500 mt-3 block" }, "Per-stock line format"), /* @__PURE__ */ React.createElement(
+    "textarea",
+    {
+      value: line,
+      onChange: (e) => setLine(e.target.value),
+      rows: 2,
+      className: "w-full mt-1 px-3 py-2 text-xs font-mono border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500"
+    }
+  ), /* @__PURE__ */ React.createElement("div", { className: "text-[11px] text-slate-400 mt-1" }, lineVars.map((p) => /* @__PURE__ */ React.createElement("code", { key: p, className: "bg-slate-100 rounded px-1 mr-1" }, `{${p}}`))), /* @__PURE__ */ React.createElement("button", { onClick: saveTemplate, className: "mt-3 bg-indigo-600 hover:bg-indigo-700 text-white text-sm px-4 py-2 rounded-lg" }, "Save template")), /* @__PURE__ */ React.createElement(Card, { title: "Advice & research messages", icon: Bell }, /* @__PURE__ */ React.createElement("label", { className: "text-xs text-slate-500" }, "Buy/Sell advice message"), /* @__PURE__ */ React.createElement(
+    "textarea",
+    {
+      value: advTpl,
+      onChange: (e) => setAdvTpl(e.target.value),
+      rows: 9,
+      className: "w-full mt-1 px-3 py-2 text-xs font-mono border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500"
+    }
+  ), /* @__PURE__ */ React.createElement("div", { className: "text-[11px] text-slate-400 mt-1" }, ["name", "action", "symbol", "company", "quantity", "price", "date", "reportLink", "advisorName", "sebiRegNo"].map((p) => /* @__PURE__ */ React.createElement("code", { key: p, className: "bg-slate-100 rounded px-1 mr-1" }, `{${p}}`))), /* @__PURE__ */ React.createElement("label", { className: "text-xs text-slate-500 mt-3 block" }, "Research report message"), /* @__PURE__ */ React.createElement(
+    "textarea",
+    {
+      value: repTpl,
+      onChange: (e) => setRepTpl(e.target.value),
+      rows: 7,
+      className: "w-full mt-1 px-3 py-2 text-xs font-mono border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500"
+    }
+  ), /* @__PURE__ */ React.createElement("div", { className: "text-[11px] text-slate-400 mt-1" }, ["name", "symbol", "company", "reportLink", "advisorName", "sebiRegNo"].map((p) => /* @__PURE__ */ React.createElement("code", { key: p, className: "bg-slate-100 rounded px-1 mr-1" }, `{${p}}`))), /* @__PURE__ */ React.createElement("button", { onClick: saveAdvice, className: "mt-3 bg-indigo-600 hover:bg-indigo-700 text-white text-sm px-4 py-2 rounded-lg" }, "Save advice templates")), /* @__PURE__ */ React.createElement(Card, { title: "How each client acts on advice", icon: Users }, /* @__PURE__ */ React.createElement("p", { className: "text-xs text-slate-500 mb-3" }, /* @__PURE__ */ React.createElement("b", null, "Email approval"), " clients get Approve / Reject buttons in the advice mail — Approve opens a reply to the dealing team with the order and the GTC instruction filled in. ", /* @__PURE__ */ React.createElement("b", null, "Execute link"), " clients get the one-click gateway link instead. Advice orders sends each client the format set here."), /* @__PURE__ */ React.createElement("div", { className: "rounded-lg border border-slate-200 p-3 mb-4" }, /* @__PURE__ */ React.createElement("label", { className: "text-[11px] text-slate-500 block mb-1" }, "Open WhatsApp in"), /* @__PURE__ */ React.createElement("select", { value: waMode, onChange: (e) => saveWaMode(e.target.value), className: "w-full px-3 py-2 text-sm border border-slate-300 rounded-lg" }, /* @__PURE__ */ React.createElement("option", { value: "auto" }, "Automatic \u2014 web on a computer, app on a phone (recommended)"), /* @__PURE__ */ React.createElement("option", { value: "web" }, "Always WhatsApp Web"), /* @__PURE__ */ React.createElement("option", { value: "link" }, "wa.me link"), /* @__PURE__ */ React.createElement("option", { value: "app" }, "Installed desktop app")), /* @__PURE__ */ React.createElement("p", { className: "text-[11px] text-slate-400 mt-1" }, "The installed desktop app ignores the phone number when it is already running and just shows the last chat you had open, so alerts can land in the wrong conversation. WhatsApp Web always opens the right one \u2014 scan the QR once and it stays signed in.")), /* @__PURE__ */ React.createElement("div", { className: "grid md:grid-cols-2 gap-3 mb-4" }, /* @__PURE__ */ React.createElement("div", { className: "md:col-span-2" }, /* @__PURE__ */ React.createElement("label", { className: "text-[11px] text-slate-500 block mb-1" }, "Approve goes to (first address is To, the rest are Cc)"), /* @__PURE__ */ React.createElement("input", { value: apTo, onChange: (e) => setApTo(e.target.value), placeholder: DEFAULT_APPROVE_TO, className: "w-full px-3 py-2 text-sm border border-slate-300 rounded-lg" })), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("label", { className: "text-[11px] text-slate-500 block mb-1" }, "Reject goes to (first address is To, the rest are Cc)"), /* @__PURE__ */ React.createElement("input", { value: rjTo, onChange: (e) => setRjTo(e.target.value), placeholder: DEFAULT_REJECT_TO, className: "w-full px-3 py-2 text-sm border border-slate-300 rounded-lg" })), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("label", { className: "text-[11px] text-slate-500 block mb-1" }, "Approval reply text"), /* @__PURE__ */ React.createElement("input", { value: apText, onChange: (e) => setApText(e.target.value), placeholder: DEFAULT_APPROVE_TEXT, className: "w-full px-3 py-2 text-sm border border-slate-300 rounded-lg" }))), /* @__PURE__ */ React.createElement("button", { onClick: saveApproval, className: "mb-4 bg-indigo-600 hover:bg-indigo-700 text-white text-sm px-4 py-2 rounded-lg" }, "Save approval settings"), /* @__PURE__ */ React.createElement("div", { className: "border-t border-slate-100 pt-3" }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap items-center gap-2 mb-2" }, /* @__PURE__ */ React.createElement("input", { value: emQuery, onChange: (e) => setEmQuery(e.target.value), placeholder: "Filter by name / code…", className: "flex-1 min-w-[180px] px-3 py-2 text-sm border border-slate-300 rounded-lg" }), /* @__PURE__ */ React.createElement("span", { className: "text-[11px] text-slate-400" }, "Set all ", execShown.length, " shown:"), /* @__PURE__ */ React.createElement("button", { onClick: () => setExecShown("email"), className: "text-xs px-2.5 py-1.5 rounded-md border border-amber-200 text-amber-700 hover:bg-amber-50" }, "Email approval"), /* @__PURE__ */ React.createElement("button", { onClick: () => setExecShown("gateway"), className: "text-xs px-2.5 py-1.5 rounded-md border border-indigo-200 text-indigo-700 hover:bg-indigo-50" }, "Execute link")), /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap items-center gap-2 mb-2" }, /* @__PURE__ */ React.createElement("span", { className: "text-[11px] text-slate-400" }, "Stored in the sheet's ", /* @__PURE__ */ React.createElement("b", null, "OrderMethod"), " tab \u2014 changes save as you click, and reach other staff devices on the next sync."), /* @__PURE__ */ React.createElement("button", { onClick: saveExecAll, disabled: execBusy, className: "ml-auto text-xs px-2.5 py-1.5 rounded-md border border-slate-200 text-slate-600 hover:bg-slate-50 disabled:opacity-50" }, "Save all to sheet"), /* @__PURE__ */ React.createElement("button", { onClick: loadExecAll, disabled: execBusy, className: "text-xs px-2.5 py-1.5 rounded-md border border-slate-200 text-slate-600 hover:bg-slate-50 disabled:opacity-50" }, "Load from sheet")), /* @__PURE__ */ React.createElement("div", { className: "border border-slate-200 rounded-lg divide-y divide-slate-100", style: { maxHeight: "40vh", overflowY: "auto" } }, execShown.map((c) => {
+    const mode = execModeOf(db, c.code);
+    return /* @__PURE__ */ React.createElement("div", { key: c.code, className: "flex items-center gap-2 px-3 py-1.5" }, /* @__PURE__ */ React.createElement("div", { className: "min-w-0 flex-1" }, /* @__PURE__ */ React.createElement("div", { className: "text-sm text-slate-800 truncate" }, c.name), /* @__PURE__ */ React.createElement("div", { className: "text-[11px] text-slate-400" }, c.code)), /* @__PURE__ */ React.createElement("button", { onClick: () => setExecOne(c.code, "email"), className: `text-xs px-2.5 py-1 rounded-md border ${mode === "email" ? "bg-amber-500 text-white border-amber-500" : "border-slate-200 text-slate-500 hover:bg-slate-50"}` }, "Email approval"), /* @__PURE__ */ React.createElement("button", { onClick: () => setExecOne(c.code, "gateway"), className: `text-xs px-2.5 py-1 rounded-md border ${mode === "gateway" ? "bg-indigo-600 text-white border-indigo-600" : "border-slate-200 text-slate-500 hover:bg-slate-50"}` }, "Execute link"));
+  }), !execShown.length && /* @__PURE__ */ React.createElement("div", { className: "px-3 py-6 text-center text-sm text-slate-400" }, execClients.length ? "No client matches that filter." : "No clients loaded yet.")))), /* @__PURE__ */ React.createElement(Card, { title: "Order-link gateway (execute links)", icon: Share2 }, /* @__PURE__ */ React.createElement("p", { className: "text-xs text-slate-500 mb-3" }, "Generates the one-click execute link used in Advice orders. Each link is gated to the client's WhatsApp number — it only opens for that number, and re-sending the same order reuses the same link rather than creating a duplicate. The Gateway itself doesn't accept calls straight from a browser (no CORS headers), so this needs a small local proxy running — see ", /* @__PURE__ */ React.createElement("code", { className: "bg-slate-100 px-1 rounded" }, "order-link-proxy/"), " in the repo for setup. ", /* @__PURE__ */ React.createElement("b", null, "The Gateway credentials live in that proxy's own .env, not in this browser.")), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("label", { className: "text-[11px] text-slate-500 block mb-1" }, "Proxy URL"), /* @__PURE__ */ React.createElement("input", { value: gwProxyUrl, onChange: (e) => setGwProxyUrl(e.target.value), placeholder: "http://localhost:8787", className: "w-full px-3 py-2 text-sm border border-slate-300 rounded-lg" })), /* @__PURE__ */ React.createElement("button", { onClick: saveGateway, className: "mt-3 bg-indigo-600 hover:bg-indigo-700 text-white text-sm px-4 py-2 rounded-lg" }, "Save gateway settings")), /* @__PURE__ */ React.createElement(Card, { title: "Google Sheet backup", icon: FileSpreadsheet }, /* @__PURE__ */ React.createElement("p", { className: "text-xs text-slate-500 mb-3" }, "Mirror the holdings into your sheet ", /* @__PURE__ */ React.createElement("b", null, "ADVISORY CLIENT DATA"), ". Two ways \u2014 the first always works."), /* @__PURE__ */ React.createElement("div", { className: "rounded-lg border border-emerald-200 bg-emerald-50/50 p-3 mb-4" }, /* @__PURE__ */ React.createElement("div", { className: "text-sm font-medium text-emerald-800 mb-1" }, "Method 1 \u2014 Copy & paste (recommended)"), /* @__PURE__ */ React.createElement("p", { className: "text-[12px] text-slate-600 mb-2" }, "Open the sheet \u2192 click cell ", /* @__PURE__ */ React.createElement("b", null, "A1"), " \u2192 paste. It fills in as columns."), /* @__PURE__ */ React.createElement("div", { className: "flex gap-2" }, /* @__PURE__ */ React.createElement("button", { onClick: copyForSheet, className: "bg-emerald-600 hover:bg-emerald-700 text-white text-sm px-4 py-2 rounded-lg flex items-center gap-1.5" }, /* @__PURE__ */ React.createElement(Download, { size: 15 }), " Copy rows for Google Sheet"), /* @__PURE__ */ React.createElement("button", { onClick: exportCsv, className: "text-sm text-emerald-700 px-3 py-2 rounded-lg border border-emerald-200 hover:bg-emerald-50" }, "Or download CSV"))), /* @__PURE__ */ React.createElement("details", { className: "rounded-lg border border-slate-200 p-3" }, /* @__PURE__ */ React.createElement("summary", { className: "text-sm font-medium text-slate-700 cursor-pointer" }, "Method 2 \u2014 Auto-send (self-hosted only)"), /* @__PURE__ */ React.createElement("p", { className: "text-[12px] text-amber-700 bg-amber-50 border border-amber-200 rounded-lg p-2 my-2" }, `The "Back up now" button below sends data straight to the sheet, but it only works when this console is hosted as a normal web page. Inside Claude it's blocked by the sandbox \u2014 that's the "could not reach the endpoint" message. Use Method 1 here.`), /* @__PURE__ */ React.createElement("ol", { className: "text-[12px] text-slate-600 list-decimal ml-4 space-y-1 mb-3" }, /* @__PURE__ */ React.createElement("li", null, "Open the sheet \u2192 ", /* @__PURE__ */ React.createElement("b", null, "Extensions \u2192 Apps Script"), ". Replace everything with the script below, set your own ", /* @__PURE__ */ React.createElement("code", { className: "bg-slate-100 px-1 rounded" }, "SECRET"), ", and ", /* @__PURE__ */ React.createElement("b", null, "Save"), "."), /* @__PURE__ */ React.createElement("li", null, /* @__PURE__ */ React.createElement("b", null, "Deploy \u2192 New deployment \u2192 Web app"), ". Execute as ", /* @__PURE__ */ React.createElement("b", null, "Me"), ", access ", /* @__PURE__ */ React.createElement("b", null, "Anyone"), ", authorise. Paste the ", /* @__PURE__ */ React.createElement("b", null, "Web app URL"), " below with the same secret."), /* @__PURE__ */ React.createElement("li", null, /* @__PURE__ */ React.createElement("b", null, "If only the header appears and no data:"), " you almost certainly edited the script without re-publishing. Go to ", /* @__PURE__ */ React.createElement("b", null, "Deploy \u2192 Manage deployments \u2192 \u270F\uFE0F Edit \u2192 Version: New version \u2192 Deploy"), ". Editing the code alone does ", /* @__PURE__ */ React.createElement("b", null, "not"), " update the live web app \u2014 it keeps running the old version."), /* @__PURE__ */ React.createElement("li", null, /* @__PURE__ */ React.createElement("b", null, "Test it:"), ' open the Web app URL in a browser tab. You should see "endpoint is live". The data lands in a tab named ', /* @__PURE__ */ React.createElement("b", null, "Holdings"), ' (created automatically) \u2014 check there. After a backup the script replies "wrote N data rows".'), /* @__PURE__ */ React.createElement("li", null, /* @__PURE__ */ React.createElement("b", null, "Live current prices:"), " the same web app also feeds the portfolio. Keep a tab named ", /* @__PURE__ */ React.createElement("b", null, "Sheet1"), " with a column for the ", /* @__PURE__ */ React.createElement("b", null, "symbol"), " (e.g. CARRARO) and one for the ", /* @__PURE__ */ React.createElement("b", null, "current price"), ' (header containing "current", "price", "LTP" or "close"). The report pulls these every couple of minutes, so Current price, Value and P/L stay live. After editing the script you must ', /* @__PURE__ */ React.createElement("b", null, "re-deploy a new version"), " for this to work."), /* @__PURE__ */ React.createElement("li", null, /* @__PURE__ */ React.createElement("b", null, "Cash & account type:"), " keep a tab named ", /* @__PURE__ */ React.createElement("b", null, "Cash"), " with the ", /* @__PURE__ */ React.createElement("b", null, "client name"), " in column 1 and the cash balance in column 2. Optionally add the ", /* @__PURE__ */ React.createElement("b", null, "client code"), " in column 3 (used in preference to the name when present) and the ", /* @__PURE__ */ React.createElement("b", null, "account type"), " (NRE / NRO / Resident Indian) in column 4. Cash, account type and a per-client ", /* @__PURE__ */ React.createElement("b", null, "Total portfolio"), " (holdings + cash) then appear in the report, with an account-type filter and stock weightages.")), /* @__PURE__ */ React.createElement("div", { className: "relative mb-3" }, /* @__PURE__ */ React.createElement("pre", { className: "whitespace-pre-wrap text-[11px] font-mono bg-slate-900 text-slate-100 rounded-lg p-3 pr-14 max-h-52 overflow-y-auto" }, APPS_SCRIPT), /* @__PURE__ */ React.createElement(
+    "button",
+    {
+      onClick: async () => {
+        const ok = await copyText(APPS_SCRIPT);
+        showToast(ok ? "Apps Script copied." : COPY_FAILED, ok ? "ok" : "err");
+      },
+      className: "absolute top-2 right-2 text-[11px] bg-white/15 hover:bg-white/25 text-white px-2 py-1 rounded"
+    },
+    "Copy"
+  )), /* @__PURE__ */ React.createElement("label", { className: "text-xs text-slate-500" }, "Web app URL"), /* @__PURE__ */ React.createElement(
+    "input",
+    {
+      value: sUrl,
+      onChange: (e) => setSUrl(e.target.value),
+      placeholder: "https://script.google.com/macros/s/\u2026/exec",
+      className: "w-full mt-1 mb-2 px-3 py-2 text-sm border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500"
+    }
+  ), /* @__PURE__ */ React.createElement("label", { className: "text-xs text-slate-500" }, "Secret (must match the script)"), /* @__PURE__ */ React.createElement(
+    "input",
+    {
+      value: sTok,
+      onChange: (e) => setSTok(e.target.value),
+      placeholder: "your-secret-token",
+      className: "w-full mt-1 mb-3 px-3 py-2 text-sm border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500"
+    }
+  ), /* @__PURE__ */ React.createElement("label", { className: "flex items-center gap-2 text-[12px] text-slate-600 mb-2" }, /* @__PURE__ */ React.createElement("input", { type: "checkbox", checked: autoBk, onChange: (e) => setAutoBk(e.target.checked) }), "Auto-send after every holdings upload (self-hosted only)"), /* @__PURE__ */ React.createElement("label", { className: "flex items-start gap-2 text-[12px] text-slate-700 mb-3 bg-indigo-50/60 border border-indigo-100 rounded-lg px-3 py-2" }, /* @__PURE__ */ React.createElement("input", { type: "checkbox", checked: teamSync, onChange: (e) => setTeamSync(e.target.checked), className: "mt-0.5" }), /* @__PURE__ */ React.createElement("span", null, /* @__PURE__ */ React.createElement("b", null, "Team sync"), " \u2014 treat the Google Sheet as the shared master copy: this device ", /* @__PURE__ */ React.createElement("b", null, "pulls"), " the latest client data at sign-in and every few minutes, and ", /* @__PURE__ */ React.createElement("b", null, "pushes"), " after every change, so you and your staff always see the same data. Turn this on (with the same URL and Secret) on each device.")), /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap gap-2" }, /* @__PURE__ */ React.createElement("button", { onClick: saveSheet, className: "bg-indigo-600 hover:bg-indigo-700 text-white text-sm px-4 py-2 rounded-lg" }, "Save settings"), /* @__PURE__ */ React.createElement("button", { onClick: runBackup, className: "bg-slate-700 hover:bg-slate-800 text-white text-sm px-4 py-2 rounded-lg flex items-center gap-1.5" }, /* @__PURE__ */ React.createElement(Send, { size: 15 }), " Back up now (push)"), /* @__PURE__ */ React.createElement("button", { onClick: doPull, disabled: pullBusy, className: "border border-slate-300 hover:bg-slate-50 text-slate-700 text-sm px-4 py-2 rounded-lg flex items-center gap-1.5 disabled:opacity-50" }, /* @__PURE__ */ React.createElement(RefreshCw, { size: 15, className: pullBusy ? "animate-spin" : "" }), " ", pullBusy ? "Reading sheet\u2026" : "Pull from sheet now")), pushBlock && /* @__PURE__ */ React.createElement("div", { className: "mt-3 border border-rose-300 bg-rose-50 rounded-lg p-3 text-sm space-y-2" }, /* @__PURE__ */ React.createElement("div", { className: "flex items-start gap-2" }, /* @__PURE__ */ React.createElement(AlertTriangle, { size: 16, className: "text-rose-600 mt-0.5 shrink-0" }), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: "font-semibold text-rose-800" }, "Push blocked \u2014 sheet has more data than this device"), /* @__PURE__ */ React.createElement("div", { className: "text-[12px] text-rose-800 mt-1" }, pushBlock.msg))), /* @__PURE__ */ React.createElement("div", { className: "text-[12px] text-slate-700 bg-white border border-slate-200 rounded-md p-2" }, /* @__PURE__ */ React.createElement("div", { className: "font-medium mb-1" }, "What to do"), /* @__PURE__ */ React.createElement("div", null, "If this device is missing clients (a fresh install, or you haven't pulled recently), click ", /* @__PURE__ */ React.createElement("b", null, "Pull from sheet now"), " above to load the shared data, then push again."), /* @__PURE__ */ React.createElement("div", { className: "mt-1" }, "If the shrinkage is genuine (a large clean-up), type ", /* @__PURE__ */ React.createElement("b", null, "CONFIRM"), " below and click Force push. This will overwrite the sheet.")), /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap items-center gap-2" }, /* @__PURE__ */ React.createElement(
+    "input",
+    {
+      value: forceConfirmText,
+      onChange: (e) => setForceConfirmText(e.target.value),
+      placeholder: "Type CONFIRM",
+      className: "px-3 py-1.5 text-sm border border-slate-300 rounded-md w-40"
+    }
+  ), /* @__PURE__ */ React.createElement(
+    "button",
+    {
+      onClick: forceBackup,
+      disabled: forceConfirmText.trim().toUpperCase() !== "CONFIRM",
+      className: "bg-rose-600 hover:bg-rose-700 text-white text-sm px-3 py-1.5 rounded-md disabled:opacity-50"
+    },
+    "Force push (override safety check)"
+  ), /* @__PURE__ */ React.createElement("button", { onClick: () => {
+    setPushBlock(null);
+    setForceConfirmText("");
+  }, className: "text-slate-600 text-sm px-3 py-1.5 rounded-md hover:bg-slate-100" }, "Cancel"))), pullRes && /* @__PURE__ */ React.createElement("div", { className: "mt-3 border border-slate-200 rounded-lg p-3 text-sm space-y-2" }, /* @__PURE__ */ React.createElement("div", null, "The sheet holds ", /* @__PURE__ */ React.createElement("b", null, pullRes.built.clientCount), " clients \xB7 ", /* @__PURE__ */ React.createElement("b", null, pullRes.built.holdingCount), " holdings (", pullRes.rowCount, " rows).", Object.keys(db.clients || {}).length > 0 && /* @__PURE__ */ React.createElement("span", { className: "block text-[11px] text-amber-700 mt-1" }, "Applying will replace the ", Object.keys(db.clients).length, " client(s) currently on this device. You can undo immediately.")), /* @__PURE__ */ React.createElement("div", { className: `text-[12px] rounded-md px-2.5 py-1.5 border ${pullRes.dups.clean ? "text-emerald-700 bg-emerald-50 border-emerald-200" : "text-amber-800 bg-amber-50 border-amber-200"}` }, pullRes.dups.clean ? /* @__PURE__ */ React.createElement("span", null, /* @__PURE__ */ React.createElement(Check, { size: 13, className: "inline mb-0.5" }), " Duplicate check: clean \u2014 no repeated client-code + stock rows, no client name under two codes.") : /* @__PURE__ */ React.createElement("span", null, /* @__PURE__ */ React.createElement(AlertTriangle, { size: 13, className: "inline mb-0.5" }), " Duplicate check found issues:", pullRes.dups.dupRows.length > 0 && /* @__PURE__ */ React.createElement("span", { className: "block mt-1" }, /* @__PURE__ */ React.createElement("b", null, pullRes.dups.dupRows.length), " repeated code+stock row(s) \u2014 the LAST row wins on pull: ", pullRes.dups.dupRows.slice(0, 6).map((d) => `${d.code}/${d.stock}\xD7${d.count}`).join(", "), pullRes.dups.dupRows.length > 6 ? "\u2026" : ""), pullRes.dups.sameName.length > 0 && /* @__PURE__ */ React.createElement("span", { className: "block mt-1" }, /* @__PURE__ */ React.createElement("b", null, pullRes.dups.sameName.length), " name(s) under more than one code (fine if the client truly has multiple accounts): ", pullRes.dups.sameName.slice(0, 4).map((d) => `${d.name} \u2192 ${d.codes.join(" / ")}`).join("; "), pullRes.dups.sameName.length > 4 ? "\u2026" : ""))), /* @__PURE__ */ React.createElement("div", { className: "flex gap-2" }, /* @__PURE__ */ React.createElement("button", { onClick: applyPull, className: "bg-indigo-600 hover:bg-indigo-700 text-white text-sm px-4 py-2 rounded-lg" }, "Apply to this device"), /* @__PURE__ */ React.createElement("button", { onClick: () => setPullRes(null), className: "text-slate-500 text-sm px-3 py-2 rounded-lg hover:bg-slate-100" }, "Cancel"))))), /* @__PURE__ */ React.createElement(Card, { title: "Restore from backup", icon: Upload }, /* @__PURE__ */ React.createElement("p", { className: "text-xs text-slate-500 mb-3" }, "Rebuild your whole client list from a backup \u2014 the ", /* @__PURE__ */ React.createElement("b", null, "Holdings"), " tab of your linked Google Sheet (download it as CSV/Excel), or a CSV exported from ", /* @__PURE__ */ React.createElement("b", null, "Security & data"), " below. This ", /* @__PURE__ */ React.createElement("b", null, "replaces"), " the current client list, so use it on a fresh or empty copy. It can be undone."), /* @__PURE__ */ React.createElement(
+    "div",
+    {
+      onDragOver: (e) => e.preventDefault(),
+      onDrop: (e) => {
+        e.preventDefault();
+        if (e.dataTransfer.files[0]) readRestore(e.dataTransfer.files[0]);
+      },
+      onClick: () => restoreRef.current.click(),
+      className: "border-2 border-dashed border-slate-300 rounded-xl p-5 text-center cursor-pointer hover:border-indigo-400 hover:bg-indigo-50/40"
+    },
+    /* @__PURE__ */ React.createElement(Download, { size: 22, className: "mx-auto text-slate-400 mb-1" }),
+    /* @__PURE__ */ React.createElement("div", { className: "text-sm text-slate-600" }, restoreBusy ? "Reading\u2026" : "Drop the backup file here, or click to choose"),
+    /* @__PURE__ */ React.createElement("div", { className: "text-[11px] text-slate-400 mt-1" }, ".csv \xB7 .xlsx (the Holdings backup columns)"),
+    /* @__PURE__ */ React.createElement(
+      "input",
+      {
+        ref: restoreRef,
+        type: "file",
+        accept: ".csv,.xlsx,.xls,.xlsm",
+        className: "hidden",
+        onChange: (e) => e.target.files[0] && readRestore(e.target.files[0])
+      }
+    )
+  ), restore && /* @__PURE__ */ React.createElement("div", { className: "mt-3 border border-slate-100 rounded-lg p-3 flex items-center gap-3" }, /* @__PURE__ */ React.createElement("div", { className: "flex-1 text-sm" }, "Found ", /* @__PURE__ */ React.createElement("b", null, restore.clientCount), " clients \xB7 ", /* @__PURE__ */ React.createElement("b", null, restore.holdingCount), " holdings in ", /* @__PURE__ */ React.createElement("span", { className: "text-slate-500" }, restore.fname), ".", Object.keys(db.clients || {}).length > 0 && /* @__PURE__ */ React.createElement("span", { className: "block text-[11px] text-amber-700 mt-1" }, "This will replace the ", Object.keys(db.clients).length, " client(s) currently loaded.")), /* @__PURE__ */ React.createElement("button", { onClick: () => setConfirmRestore(true), className: "bg-indigo-600 hover:bg-indigo-700 text-white text-sm px-4 py-2 rounded-lg" }, "Restore"), /* @__PURE__ */ React.createElement("button", { onClick: () => setRestore(null), className: "text-slate-500 text-sm px-3 py-2 rounded-lg hover:bg-slate-100" }, "Cancel"))), /* @__PURE__ */ React.createElement(Card, { title: "Security & data", icon: Lock }, /* @__PURE__ */ React.createElement("button", { onClick: exportCsv, className: "text-sm text-indigo-700 flex items-center gap-1.5 hover:underline" }, /* @__PURE__ */ React.createElement(Download, { size: 15 }), " Export all holdings (CSV backup)")), /* @__PURE__ */ React.createElement("div", { className: "flex gap-2 text-[11px] text-slate-500 bg-slate-100 border border-slate-200 rounded-lg p-3" }, /* @__PURE__ */ React.createElement(ShieldCheck, { size: 16, className: "shrink-0 mt-0.5 text-slate-400" }), /* @__PURE__ */ React.createElement("span", null, "Client names, emails and numbers come from your master sheet. Keep a CSV backup before bulk uploads. For a permanent SEBI-RIA system handling client PII at scale, a privately hosted version with per-user logins is the more robust route.")), confirmRestore && restore && /* @__PURE__ */ React.createElement(
+    ConfirmModal,
+    {
+      title: "Restore from backup?",
+      body: `Replace the current client list with ${restore.clientCount} clients and ${restore.holdingCount} holdings from the backup? You can undo this immediately afterwards.`,
+      confirmLabel: "Restore",
+      tone: "danger",
+      onConfirm: applyRestore,
+      onClose: () => setConfirmRestore(false)
+    }
+  ));
+}
