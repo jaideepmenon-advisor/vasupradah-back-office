@@ -2774,6 +2774,19 @@ window.storage = {
   }
 };
 
+// The signed-in person's own PocketBase login token, mirrored here from
+// db.sheetToken (which is what actually persists, and what every POST body
+// already sends) so the ~30 GET helpers below - which take a bare `url`
+// string, not the whole `db` object - can reach it too, without changing
+// every one of those function signatures. Kept in sync by App() whenever
+// db.sheetToken changes (login, logout, or restoring a saved session).
+let SESSION_TOKEN = "";
+function withToken(url) {
+  const u = (url || "").trim();
+  if (!u) return u;
+  return u + (u.includes("?") ? "&" : "?") + "token=" + encodeURIComponent(SESSION_TOKEN);
+}
+
 // Inline icon set (lucide path data) so no icon library is needed.
 const mkIcon = inner => function Icon({
   size = 18,
@@ -3163,7 +3176,7 @@ async function shortenLink(db, url) {
   const base = (db.sheetUrl || "").trim();
   if (!base) return url;
   try {
-    const res = await fetch(base + (base.includes("?") ? "&" : "?") + "shorten=1&u=" + encodeURIComponent(url));
+    const res = await fetch(withToken(base) + "&shorten=1&u=" + encodeURIComponent(url));
     const d = await res.json();
     if (d && d.ok && d.short) {
       SHORT_CACHE[url] = d.short;
@@ -7215,7 +7228,7 @@ function clientsSig(clients) {
   }));
 }
 async function pullHoldingsFromSheet(url) {
-  const res = await fetch(url + (url.includes("?") ? "&" : "?") + "holdings=1");
+  const res = await fetch(withToken(url) + "&holdings=1");
   const data = await res.json();
   const list = Array.isArray(data.holdings) ? data.holdings : [];
   const rows = holdingsRowsToObjects(list);
@@ -7246,7 +7259,7 @@ async function pullStaffFromSheet(url) {
     const ctl = typeof AbortController !== "undefined" ? new AbortController() : null;
     const timer = ctl ? setTimeout(() => ctl.abort(), ms) : null;
     try {
-      const res = await fetch(url + (url.includes("?") ? "&" : "?") + q, ctl ? { signal: ctl.signal } : void 0);
+      const res = await fetch(withToken(url) + "&" + q, ctl ? { signal: ctl.signal } : void 0);
       const data = await res.json();
       return Array.isArray(data.staff) ? data.staff : null;
     } finally {
@@ -7272,8 +7285,7 @@ async function pushStaffToSheet(db) {
   try {
     await fetch(url, {
       method: "POST",
-      mode: "no-cors",
-      headers: { "Content-Type": "text/plain;charset=utf-8" },
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ token: db.sheetToken || "", type: "staff", staff: Array.isArray(db.staff) ? db.staff : [] })
     });
   } catch (e) {
@@ -7284,24 +7296,23 @@ async function logAdviceTrace(db, entries) {
   try {
     await fetch(db.sheetUrl, {
       method: "POST",
-      mode: "no-cors",
-      headers: { "Content-Type": "text/plain;charset=utf-8" },
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ token: db.sheetToken || "", type: "advice_trace", rows: entries })
     });
   } catch (e) {
   }
 }
 async function pingEndpoint(url) {
-  const res = await fetch(url + (url.includes("?") ? "&" : "?") + "ping=1");
+  const res = await fetch(withToken(url) + "&ping=1");
   return res.json();
 }
 async function pullAdviceTrace(url) {
-  const res = await fetch(url + (url.includes("?") ? "&" : "?") + "advice_trace=1");
+  const res = await fetch(withToken(url) + "&advice_trace=1");
   const data = await res.json();
   return Array.isArray(data.rows) ? data.rows : [];
 }
 async function pullClientDetails(url) {
-  const res = await fetch(url + (url.includes("?") ? "&" : "?") + "client_details=1");
+  const res = await fetch(withToken(url) + "&client_details=1");
   const data = await res.json();
   const rows = Array.isArray(data.rows) ? data.rows : [];
   if (rows.length < 2) return {};
@@ -7325,8 +7336,7 @@ async function pushClientDetails(db, row) {
   try {
     await fetch(db.sheetUrl, {
       method: "POST",
-      mode: "no-cors",
-      headers: { "Content-Type": "text/plain;charset=utf-8" },
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ token: db.sheetToken || "", type: "client_details", row })
     });
     return true;
@@ -7335,7 +7345,7 @@ async function pushClientDetails(db, row) {
   }
 }
 async function pullAdviceContacts(url) {
-  const res = await fetch(url + (url.includes("?") ? "&" : "?") + "advice_contacts=1");
+  const res = await fetch(withToken(url) + "&advice_contacts=1");
   const data = await res.json();
   const rows = Array.isArray(data.rows) ? data.rows : [];
   if (rows.length < 2) return {};
@@ -7362,8 +7372,7 @@ async function pushAdviceContacts(db, rows) {
   try {
     await fetch(db.sheetUrl, {
       method: "POST",
-      mode: "no-cors",
-      headers: { "Content-Type": "text/plain;charset=utf-8" },
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ token: db.sheetToken || "", type: "advice_contacts", rows })
     });
     return true;
@@ -7402,7 +7411,7 @@ function feePlanCapWarning(p) {
     : "";
 }
 async function pullFeePlans(url) {
-  const res = await fetch(url + (url.includes("?") ? "&" : "?") + "fee_plans=1");
+  const res = await fetch(withToken(url) + "&fee_plans=1");
   const data = await res.json();
   const rows = Array.isArray(data.rows) ? data.rows : [];
   if (rows.length < 2) return {};
@@ -7431,8 +7440,7 @@ async function pushFeePlans(db, rows) {
   try {
     await fetch(db.sheetUrl, {
       method: "POST",
-      mode: "no-cors",
-      headers: { "Content-Type": "text/plain;charset=utf-8" },
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ token: db.sheetToken || "", type: "fee_plans", rows })
     });
     return true;
@@ -7445,8 +7453,7 @@ async function deleteFeePlanOnSheet(db, id) {
   try {
     await fetch(db.sheetUrl, {
       method: "POST",
-      mode: "no-cors",
-      headers: { "Content-Type": "text/plain;charset=utf-8" },
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ token: db.sheetToken || "", type: "fee_plans", action: "delete", id })
     });
     return true;
@@ -7686,7 +7693,7 @@ function invoiceQr(inv, st) {
   return (uri && qrDataUrl(uri, 300)) || (st || {}).upiQr || "";
 }
 async function pullBillingProfiles(url) {
-  const res = await fetch(url + (url.includes("?") ? "&" : "?") + "billing_profiles=1");
+  const res = await fetch(withToken(url) + "&billing_profiles=1");
   const data = await res.json();
   const rows = Array.isArray(data.rows) ? data.rows : [];
   if (rows.length < 2) return {};
@@ -7707,13 +7714,13 @@ async function pullBillingProfiles(url) {
 async function pushBillingProfiles(db, rows) {
   if (!(db.sheetUrl || "").trim() || !(rows || []).length) return false;
   try {
-    await fetch(db.sheetUrl, { method: "POST", mode: "no-cors", headers: { "Content-Type": "text/plain;charset=utf-8" },
+    await fetch(db.sheetUrl, { method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ token: db.sheetToken || "", type: "billing_profiles", rows }) });
     return true;
   } catch (e) { return false; }
 }
 async function pullBillingSettings(url) {
-  const res = await fetch(url + (url.includes("?") ? "&" : "?") + "billing_settings=1");
+  const res = await fetch(withToken(url) + "&billing_settings=1");
   const data = await res.json();
   const rows = Array.isArray(data.rows) ? data.rows : [];
   if (rows.length < 2) return null;
@@ -7736,13 +7743,13 @@ async function pullBillingSettings(url) {
 async function pushBillingSettings(db, row) {
   if (!(db.sheetUrl || "").trim()) return false;
   try {
-    await fetch(db.sheetUrl, { method: "POST", mode: "no-cors", headers: { "Content-Type": "text/plain;charset=utf-8" },
+    await fetch(db.sheetUrl, { method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ token: db.sheetToken || "", type: "billing_settings", row }) });
     return true;
   } catch (e) { return false; }
 }
 async function pullInvoices(url, period) {
-  const res = await fetch(url + (url.includes("?") ? "&" : "?") + "invoices=1" + (period ? "&period=" + encodeURIComponent(period) : ""));
+  const res = await fetch(withToken(url) + "&invoices=1" + (period ? "&period=" + encodeURIComponent(period) : ""));
   const data = await res.json();
   const rows = Array.isArray(data.rows) ? data.rows : [];
   if (rows.length < 2) return {};
@@ -7766,7 +7773,7 @@ async function pullInvoices(url, period) {
 async function pushInvoices(db, rows) {
   if (!(db.sheetUrl || "").trim() || !(rows || []).length) return false;
   try {
-    await fetch(db.sheetUrl, { method: "POST", mode: "no-cors", headers: { "Content-Type": "text/plain;charset=utf-8" },
+    await fetch(db.sheetUrl, { method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ token: db.sheetToken || "", type: "invoices", rows }) });
     return true;
   } catch (e) { return false; }
@@ -7774,7 +7781,7 @@ async function pushInvoices(db, rows) {
 async function deleteInvoiceOnSheet(db, id) {
   if (!(db.sheetUrl || "").trim() || !id) return false;
   try {
-    await fetch(db.sheetUrl, { method: "POST", mode: "no-cors", headers: { "Content-Type": "text/plain;charset=utf-8" },
+    await fetch(db.sheetUrl, { method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ token: db.sheetToken || "", type: "invoices", action: "delete", id }) });
     return true;
   } catch (e) { return false; }
@@ -7782,7 +7789,7 @@ async function deleteInvoiceOnSheet(db, id) {
 // The earliest executed trade per client code, computed on the sheet so this stays a
 // few KB. It is what a new client's first quarter is charged from.
 async function pullFirstTrades(url) {
-  const res = await fetch(url + (url.includes("?") ? "&" : "?") + "first_trades=1");
+  const res = await fetch(withToken(url) + "&first_trades=1");
   const data = await res.json();
   return data && data.first && typeof data.first === "object" ? data.first : {};
 }
@@ -7792,7 +7799,7 @@ async function sendBillingEmail(db, recipients, qr) {
   const url = (db.sheetUrl || "").trim();
   if (!url) return { ok: false, msg: "Connect the office Google Sheet in Settings first." };
   try {
-    const res = await fetch(url, { method: "POST", headers: { "Content-Type": "text/plain;charset=utf-8" },
+    const res = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ token: db.sheetToken || "", type: "billing_email", recipients, qr: qr || "",
         fromName: db.firmName || "Vasupradah Investment Advisory", replyTo: "" }) });
     const txt = await res.text();
@@ -8083,7 +8090,7 @@ function cgHarvestSaving(g, rates, stclAdd, ltclAdd) {
 }
 async function pullCapGains(url, fy, code) {
   const q = "capgains=1&fy=" + encodeURIComponent(fy) + (code ? "&code=" + encodeURIComponent(code) : "");
-  const res = await fetch(url + (url.includes("?") ? "&" : "?") + q);
+  const res = await fetch(withToken(url) + "&" + q);
   const data = await res.json();
   if (!data || data.ok !== true) throw new Error((data && data.error) || "The sheet could not work out the gains.");
   return data;
@@ -8107,7 +8114,7 @@ const cgFyRange = (fy) => {
 // has to be explained or filled. This puts a name to the likely cause from what
 // the book itself shows, rather than guessing.
 async function pullGapScan(url, fy) {
-  const res = await fetch(url + (url.includes("?") ? "&" : "?") + "gap_scan=1&fy=" + encodeURIComponent(fy));
+  const res = await fetch(withToken(url) + "&gap_scan=1&fy=" + encodeURIComponent(fy));
   const data = await res.json();
   if (!data || data.ok !== true) throw new Error((data && data.error) || "The sheet could not scan the book.");
   return data;
@@ -8116,7 +8123,7 @@ async function pushManualTrades(db, trades) {
   const url = (db.sheetUrl || "").trim();
   if (!url || !(trades || []).length) return { ok: false, msg: "Nothing to send." };
   try {
-    const res = await fetch(url, { method: "POST", headers: { "Content-Type": "text/plain;charset=utf-8" },
+    const res = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ token: db.sheetToken || "", type: "manual_trade", trades }) });
     const txt = await res.text();
     return { ok: /^ok:/.test(txt), msg: txt.slice(0, 200) };
@@ -8167,7 +8174,7 @@ const GAP_CAUSE_LABEL = {
 const MIS_DEFAULT_TO = ["jaideepmenon@vasupradah.com", "neelakantanpillai@vasupradah.com", "abhishakemathur@vasupradah.com"];
 const MIS_DAYS = ["MONDAY", "TUESDAY", "WEDNESDAY", "THURSDAY", "FRIDAY", "SATURDAY", "SUNDAY"];
 async function pullMis(url, on) {
-  const res = await fetch(url + (url.includes("?") ? "&" : "?") + "mis=1" + (on ? "&on=" + encodeURIComponent(on) : ""));
+  const res = await fetch(withToken(url) + "&mis=1" + (on ? "&on=" + encodeURIComponent(on) : ""));
   const data = await res.json();
   if (!data || data.ok !== true) throw new Error((data && data.error) || "The sheet could not build the report.");
   return data;
@@ -8176,7 +8183,7 @@ async function sendMisNow(db, to, on) {
   const url = (db.sheetUrl || "").trim();
   if (!url) return { ok: false, msg: "Connect the office Google Sheet in Settings first." };
   try {
-    const res = await fetch(url, { method: "POST", headers: { "Content-Type": "text/plain;charset=utf-8" },
+    const res = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ token: db.sheetToken || "", type: "mis_send", to, on: on || "" }) });
     const txt = await res.text();
     try {
@@ -8189,7 +8196,7 @@ async function saveMisSchedule(db, cfg) {
   const url = (db.sheetUrl || "").trim();
   if (!url) return { ok: false, msg: "Connect the office Google Sheet in Settings first." };
   try {
-    const res = await fetch(url, { method: "POST", headers: { "Content-Type": "text/plain;charset=utf-8" },
+    const res = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ token: db.sheetToken || "", type: "mis_config", ...cfg }) });
     const txt = await res.text();
     try { const j = JSON.parse(txt); return { ok: !!j.ok, scheduled: j.scheduled, config: j.config }; }
@@ -8200,13 +8207,13 @@ async function saveMisSchedule(db, cfg) {
 // database. Measured on the sheet, because that is the only place the timings mean
 // anything.
 async function pullDbHealth(url, deep) {
-  const res = await fetch(url + (url.includes("?") ? "&" : "?") + "dbhealth=1" + (deep ? "&deep=1" : ""));
+  const res = await fetch(withToken(url) + "&dbhealth=1" + (deep ? "&deep=1" : ""));
   const data = await res.json();
   if (!data || data.ok !== true) throw new Error((data && data.error) || "The sheet could not run the check.");
   return data;
 }
 async function pullExecModes(url) {
-  const res = await fetch(url + (url.includes("?") ? "&" : "?") + "exec_modes=1");
+  const res = await fetch(withToken(url) + "&exec_modes=1");
   const data = await res.json();
   const rows = Array.isArray(data.rows) ? data.rows : [];
   if (rows.length < 2) return {};
@@ -8223,8 +8230,7 @@ async function pushExecModes(db, rows) {
   try {
     await fetch(db.sheetUrl, {
       method: "POST",
-      mode: "no-cors",
-      headers: { "Content-Type": "text/plain;charset=utf-8" },
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ token: db.sheetToken || "", type: "exec_modes", rows })
     });
     return true;
@@ -8233,7 +8239,7 @@ async function pushExecModes(db, rows) {
   }
 }
 async function pullBaskets(url) {
-  const res = await fetch(url + (url.includes("?") ? "&" : "?") + "baskets=1");
+  const res = await fetch(withToken(url) + "&baskets=1");
   const data = await res.json();
   const rows = Array.isArray(data.rows) ? data.rows : [];
   if (rows.length < 2) return {};
@@ -8256,8 +8262,7 @@ async function pushBaskets(db, payload) {
   try {
     await fetch(db.sheetUrl, {
       method: "POST",
-      mode: "no-cors",
-      headers: { "Content-Type": "text/plain;charset=utf-8" },
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify(Object.assign({ token: db.sheetToken || "", type: "baskets" }, payload))
     });
   } catch (e) {
@@ -8275,7 +8280,7 @@ function mergeBaskets(local, remote) {
   return out;
 }
 async function pullManualTrades(url) {
-  const res = await fetch(url + (url.includes("?") ? "&" : "?") + "manual_trades=1");
+  const res = await fetch(withToken(url) + "&manual_trades=1");
   const data = await res.json();
   const rows = Array.isArray(data.rows) ? data.rows : [];
   if (rows.length < 2) return [];
@@ -8298,8 +8303,7 @@ async function pushManualTrade(db, payload) {
   try {
     await fetch(db.sheetUrl, {
       method: "POST",
-      mode: "no-cors",
-      headers: { "Content-Type": "text/plain;charset=utf-8" },
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify(Object.assign({ token: db.sheetToken || "", type: "manual_trade" }, payload))
     });
     return true;
@@ -8308,7 +8312,7 @@ async function pushManualTrade(db, payload) {
   }
 }
 async function pullPipeline(url) {
-  const res = await fetch(url + (url.includes("?") ? "&" : "?") + "pipeline=1");
+  const res = await fetch(withToken(url) + "&pipeline=1");
   const data = await res.json();
   const rows = Array.isArray(data.rows) ? data.rows : [];
   if (rows.length < 2) return [];
@@ -8336,8 +8340,7 @@ async function pushPipeline(db, payload) {
   try {
     await fetch(db.sheetUrl, {
       method: "POST",
-      mode: "no-cors",
-      headers: { "Content-Type": "text/plain;charset=utf-8" },
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify(Object.assign({ token: db.sheetToken || "", type: "pipeline" }, payload))
     });
   } catch (e) {
@@ -8353,7 +8356,7 @@ function mergePipeline(local, remote) {
   return Object.values(byId).sort((a, b) => num(b.updatedAt) - num(a.updatedAt));
 }
 async function pullAdviceAlertsFromSheet(url) {
-  const res = await fetch(url + (url.includes("?") ? "&" : "?") + "advice_alerts=1");
+  const res = await fetch(withToken(url) + "&advice_alerts=1");
   const data = await res.json();
   const rows = Array.isArray(data.rows) ? data.rows : [];
   if (rows.length < 2) return [];
@@ -8377,7 +8380,7 @@ async function backupToSheet(db, opts = {}) {
       return { ok: false, msg: "Refused to push: this device has no clients. Pull from the sheet first, or upload holdings \u2014 the sheet's Holdings tab has been left untouched." };
     }
     try {
-      const r = await fetch(db.sheetUrl + (db.sheetUrl.includes("?") ? "&" : "?") + "holdings=1");
+      const r = await fetch(withToken(db.sheetUrl) + "&holdings=1");
       const data = await r.json();
       const sheetHoldings = Array.isArray(data.holdings) ? data.holdings.length : 0;
       const sheetClients = Array.isArray(data.holdings) ? new Set(data.holdings.map((row) => String((Array.isArray(row) ? row[0] : row["Client code"]) || "").trim()).filter(Boolean)).size : 0;
@@ -8403,8 +8406,7 @@ async function backupToSheet(db, opts = {}) {
   try {
     await fetch(db.sheetUrl, {
       method: "POST",
-      mode: "no-cors",
-      headers: { "Content-Type": "text/plain;charset=utf-8" },
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ token: db.sheetToken || "", rows, staff: Array.isArray(db.staff) ? db.staff : [] })
     });
     return { ok: true, msg: `Sent ${clientCount} client(s), ${rows.length} row(s) to the Google Sheet.` };
@@ -9027,15 +9029,14 @@ function AdviceOrders({ db, commit, showToast }) {
       const startedAt = Date.now();
       await fetch(db.sheetUrl, {
         method: "POST",
-        mode: "no-cors",
-        headers: { "Content-Type": "text/plain;charset=utf-8" },
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ token: db.sheetToken || "", type: "greeting_email", image: "", subject: "Investment advice", bodyText: "", recipients, personalize: true, replyTo: withE.some((u) => methodOf(u) === "email") ? approveReplyTo(db) : "", fromName: db.advisorName || "Vasupradah Investment Advisory" })
       });
       let result = null;
       for (let i = 0; i < 6; i++) {
         await new Promise((r) => setTimeout(r, 1800));
         try {
-          const rs = await fetch(db.sheetUrl + (db.sheetUrl.includes("?") ? "&" : "?") + "greeting_status=1");
+          const rs = await fetch(withToken(db.sheetUrl) + "&greeting_status=1");
           const d = await rs.json();
           if (d && d.result && d.at && d.at >= startedAt) {
             result = d.result;
@@ -9124,8 +9125,7 @@ function AdviceOrders({ db, commit, showToast }) {
     try {
       await fetch(db.sheetUrl, {
         method: "POST",
-        mode: "no-cors",
-        headers: { "Content-Type": "text/plain;charset=utf-8" },
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ token: db.sheetToken || "", type: "advice_alerts", alerts: (list || []).slice(0, 15) })
       });
     } catch (e) {
@@ -9175,8 +9175,7 @@ function AdviceOrders({ db, commit, showToast }) {
       const recipients = withE.map((r) => ({ email: r.email, name: r.name, subject: r.subject, body: r.body }));
       await fetch(db.sheetUrl, {
         method: "POST",
-        mode: "no-cors",
-        headers: { "Content-Type": "text/plain;charset=utf-8" },
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ token: db.sheetToken || "", type: "greeting_email", image: "", subject: "Investment advice", bodyText: "", recipients, personalize: true, replyTo: approveReplyTo(db), fromName: db.advisorName || "Vasupradah Investment Advisory" })
       });
       showToast(`Resent to ${withE.length} client(s) by email.`);
@@ -11427,8 +11426,7 @@ ${SENDER}` }
       const startedAt = Date.now();
       await fetch(db.sheetUrl, {
         method: "POST",
-        mode: "no-cors",
-        headers: { "Content-Type": "text/plain;charset=utf-8" },
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           token: db.sheetToken || "",
           type: "greeting_email",
@@ -11444,7 +11442,7 @@ ${SENDER}` }
       for (let i = 0; i < 6; i++) {
         await new Promise((z) => setTimeout(z, 1800));
         try {
-          const rs = await fetch(db.sheetUrl + (db.sheetUrl.includes("?") ? "&" : "?") + "greeting_status=1");
+          const rs = await fetch(withToken(db.sheetUrl) + "&greeting_status=1");
           const d = await rs.json();
           if (d && d.result && d.at && d.at >= startedAt) {
             result = d.result;
@@ -11527,7 +11525,8 @@ function App() {
   const pvRef = useRef(0);
   useEffect(() => {
     WA_OPEN_MODE = db.waOpenMode || "auto";
-  }, [db.waOpenMode]);
+    SESSION_TOKEN = db.sheetToken || "";
+  }, [db.waOpenMode, db.sheetToken]);
   useEffect(() => {
     (async () => {
       const loaded = await loadDB();
@@ -11778,7 +11777,7 @@ function App() {
     const url = urlRef.current;
     if (!url) return { ok: false, msg: "No linked sheet URL set (Settings \u2192 Google Sheet backup)." };
     try {
-      const u = url + (url.includes("?") ? "&" : "?") + "prices=1";
+      const u = withToken(url) + "&prices=1";
       const res = await fetch(u, { redirect: "follow" });
       const data = await res.json();
       if (data && data.ok && data.prices) {
@@ -11823,188 +11822,132 @@ function App() {
   return /* @__PURE__ */ React.createElement(React.Fragment, null, saveWarn && /* @__PURE__ */ React.createElement("div", { className: "fixed top-0 inset-x-0 z-[60] bg-rose-600 text-white text-[12px] text-center px-3 py-1.5" }, "This browser's storage is full \u2014 your newest changes may not survive a page reload. Export a CSV backup (Settings \u2192 Security) and remove data you no longer need.", /* @__PURE__ */ React.createElement("button", { onClick: () => setSaveWarn(false), className: "underline ml-2" }, "dismiss")), /* @__PURE__ */ React.createElement(Console, { db: dbView, user, commit, undo, refreshPrices, onLogout: () => setUser(null) }));
 }
 function Login({ db, commit, onLogin }) {
-  const [name, setName] = useState("");
-  const [pin, setPin] = useState("");
-  const [stage, setStage] = useState("name");
+  const [connUrl, setConnUrl] = useState(db.sheetUrl || "");
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
   const [err, setErr] = useState("");
-  const [checking, setChecking] = useState(false);
-  const [connUrl, setConnUrl] = useState("");
-  const [connTok, setConnTok] = useState("");
-  const connectSheet = async () => {
+  const [busy, setBusy] = useState(false);
+  const [changingServer, setChangingServer] = useState(!(db.sheetUrl || "").trim());
+  // The server's own address minus the "/exec" the console calls for everything
+  // else - PocketBase's built-in login endpoint lives one level up, at /api/...
+  const baseUrl = (u) => (u || "").trim().replace(/\/?exec\/?$/, "");
+  const connectServer = async () => {
     setErr("");
     const url = connUrl.trim();
     if (!url) {
-      setErr("Paste the Web app URL first.");
+      setErr("Paste the server's Web app URL first.");
       return;
     }
-    setChecking(true);
+    setBusy(true);
     try {
-      const remote = await pullStaffFromSheet(url);
-      if (remote == null) {
-        setErr("Can't reach that URL. Double-check the /exec address and try again.");
-        return;
-      }
       await commit((d) => {
         d.sheetUrl = url;
-        if (connTok.trim()) d.sheetToken = connTok.trim();
-        d.teamSync = true;
-        d.staff = mergeStaffLists(d.staff, remote);
-      }, "connect to office sheet");
-      setConnUrl("");
-      setConnTok("");
-      setErr(remote.length ? "" : "Connected, but the office sheet has no staff list on it yet. Ask the Principal Officer to open Settings and enable your name - it is published the moment they do.");
+      }, "connect to server");
+      setChangingServer(false);
     } finally {
-      setChecking(false);
+      setBusy(false);
     }
   };
-  const adminKey = nameKey(db.adminName);
-  const isAdmin = (n) => !!adminKey && nameKey(n) === adminKey;
-  // A row with no name at all used to throw here, which blanked the whole sign-in
-  // screen for everyone - hence the guards rather than a bare s.name.
-  const staffRec = (list, n) => (list || []).find((s) => s && nameKey(s.name) && nameKey(s.name) === nameKey(n));
-  const OFF = "Your access has been turned off. Ask the Principal Officer to enable your name again.";
-  const UNKNOWN = "This name is not on the office list. Ask the Principal Officer to add and enable it in Settings, exactly as you type it here.";
-  const submitName = async () => {
+  const submitLogin = async () => {
     setErr("");
-    const n = name.trim();
-    if (!n) return;
-    if (isAdmin(n)) {
-      setStage(db.adminPin ? "adminpin" : "setpin");
-      return;
-    }
     const url = (db.sheetUrl || "").trim();
-    const local = staffRec(db.staff, n);
-    // Ask the office sheet first when this device is connected: it is the Principal
-    // Officer's list, so a name enabled minutes ago works straight away and one that
-    // has been turned off stops working. Falls back to this device's own list when
-    // the sheet can't be reached, so a poor connection never strands anyone.
-    if (url) {
-      setChecking(true);
-      let remote = null;
-      try {
-        remote = await pullStaffFromSheet(url);
-      } finally {
-        setChecking(false);
-      }
-      if (remote != null) {
+    if (!url) {
+      setErr("Set the server's Web app URL first.");
+      return;
+    }
+    if (!email.trim() || !password) {
+      setErr("Enter your email and password.");
+      return;
+    }
+    setBusy(true);
+    try {
+      const res = await fetch(baseUrl(url) + "/api/collections/users/auth-with-password", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ identity: email.trim(), password })
+      });
+      const data = await res.json().catch(() => null);
+      if (data && data.token && data.record) {
         await commit((d) => {
-          d.staff = mergeStaffLists(d.staff, remote);
-        }, "sync staff from sheet");
-        const match = staffRec(remote, n);
-        if (match && match.enabled) {
-          onLogin({ name: tidyName(match.name), role: "staff" });
-          return;
-        }
-        setErr(match ? OFF : UNKNOWN);
+          d.sheetToken = data.token;
+        }, "sign in");
+        onLogin({ name: data.record.name || data.record.email, role: data.record.role, email: data.record.email, id: data.record.id });
         return;
       }
-      if (local && local.enabled) {
-        onLogin({ name: tidyName(local.name), role: "staff" });
-        return;
+      if (res.status === 403) {
+        setErr("Your account has been deactivated. Ask the Principal Officer to reactivate it.");
+      } else {
+        setErr("Incorrect email or password.");
       }
-      setErr(local ? OFF : "Can't reach the office Google Sheet right now, and this name isn't on the list saved on this device. Check your internet and try again.");
-      return;
-    }
-    if (local) {
-      if (local.enabled) onLogin({ name: tidyName(local.name), role: "staff" });
-      else setErr(OFF);
-      return;
-    }
-    setErr("This device isn't connected to the office Google Sheet yet, so it can't check who is enabled. Paste the Web app URL and Secret below and click Connect.");
-  };
-  const submitPin = async () => {
-    setErr("");
-    if (stage === "setpin") {
-      if (pin.length < 4) {
-        setErr("Choose a PIN of at least 4 digits.");
-        return;
-      }
-      await commit((d) => {
-        d.adminPin = pin;
-      }, "set admin PIN");
-      onLogin({ name: name.trim(), role: "admin" });
-    } else {
-      if (pin === db.adminPin) onLogin({ name: name.trim(), role: "admin" });
-      else setErr("Incorrect PIN.");
+    } catch (e) {
+      setErr("Can't reach the server. Check the Web app URL and your internet connection.");
+    } finally {
+      setBusy(false);
     }
   };
-  return /* @__PURE__ */ React.createElement("div", { className: "min-h-screen bg-slate-50 flex items-center justify-center p-4" }, /* @__PURE__ */ React.createElement("div", { className: "w-full max-w-md bg-white rounded-2xl shadow-sm border border-slate-200 p-8" }, /* @__PURE__ */ React.createElement("div", { className: "text-center mb-6" }, /* @__PURE__ */ React.createElement("div", { className: "inline-flex items-center justify-center rounded-xl mb-3 px-4 py-3", style: { background: VP_NAVY } }, /* @__PURE__ */ React.createElement(VasupradahMark, { height: 30 })), /* @__PURE__ */ React.createElement("h1", { className: "text-lg font-semibold text-slate-800" }, "Client Console"), /* @__PURE__ */ React.createElement("p", { className: "text-xs text-slate-500 mt-1" }, "Investment Advisory Services P Ltd \xB7 Kochi")), stage === "name" && /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("label", { className: "block text-sm font-medium text-slate-700 mb-1" }, "Your name"), /* @__PURE__ */ React.createElement(
-    "input",
-    {
-      autoFocus: true,
-      value: name,
-      onChange: (e) => setName(e.target.value),
-      onKeyDown: (e) => e.key === "Enter" && submitName(),
-      placeholder: "Enter your enabled name",
-      className: "w-full px-3 py-2 border border-slate-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"
-    }
-  ), /* @__PURE__ */ React.createElement(
-    "button",
-    {
-      onClick: submitName,
-      disabled: checking,
-      className: "mt-4 w-full bg-indigo-600 hover:bg-indigo-700 text-white text-sm font-medium py-2.5 rounded-lg disabled:opacity-60"
-    },
-    checking ? "Checking with office sheet\u2026" : "Continue"
-  ), /* @__PURE__ */ React.createElement("p", { className: "text-[11px] text-slate-400 mt-3 leading-relaxed" }, "Principal Officer signs in as ", /* @__PURE__ */ React.createElement("b", null, db.adminName), " + PIN. Staff use the name enabled for them in Settings."), /* @__PURE__ */ React.createElement("div", { className: "mt-4 pt-3 border-t border-slate-200" }, /* @__PURE__ */ React.createElement("div", { className: "text-[11px] font-semibold text-slate-600 mb-1" }, "Office Google Sheet ", (db.sheetUrl || "").trim() ? /* @__PURE__ */ React.createElement("span", { className: "text-emerald-600 font-normal" }, "\xB7 connected") : /* @__PURE__ */ React.createElement("span", { className: "text-amber-700 font-normal" }, "\xB7 not connected on this device")), /* @__PURE__ */ React.createElement("p", { className: "text-[11px] text-slate-500 mb-2 leading-relaxed" }, (db.sheetUrl || "").trim() ? "This device is linked to the office sheet. You can update the URL or Secret below if it has changed." : "First time on this device? Paste the Web app URL and Secret from the Principal Officer, then click Connect. This lets your enabled name sign in and keeps your data in sync with the office."), /* @__PURE__ */ React.createElement(
-    "input",
-    {
-      value: connUrl,
-      onChange: (e) => setConnUrl(e.target.value),
-      placeholder: (db.sheetUrl || "").trim() ? "New Web app URL (only if changing)" : "https://script.google.com/macros/s/\u2026/exec",
-      className: "w-full mb-2 px-3 py-2 text-[12px] border border-slate-300 rounded-md focus:outline-none focus:ring-2 focus:ring-indigo-500"
-    }
-  ), /* @__PURE__ */ React.createElement(
-    "input",
-    {
-      value: connTok,
-      onChange: (e) => setConnTok(e.target.value),
-      placeholder: "Secret",
-      className: "w-full mb-2 px-3 py-2 text-[12px] border border-slate-300 rounded-md focus:outline-none focus:ring-2 focus:ring-indigo-500"
-    }
-  ), /* @__PURE__ */ React.createElement(
-    "button",
-    {
-      onClick: connectSheet,
-      disabled: checking || !connUrl.trim(),
-      className: "w-full text-[12px] font-medium bg-slate-700 hover:bg-slate-800 text-white py-2 rounded-md disabled:opacity-60"
-    },
-    checking ? "Connecting\u2026" : "Connect to office sheet"
-  ))), (stage === "adminpin" || stage === "setpin") && /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-2 text-sm text-slate-700 mb-1" }, /* @__PURE__ */ React.createElement(Lock, { size: 14 }), " ", stage === "setpin" ? "Create an admin PIN" : "Admin PIN"), /* @__PURE__ */ React.createElement(
-    "input",
-    {
-      autoFocus: true,
-      type: "password",
-      inputMode: "numeric",
-      value: pin,
-      onChange: (e) => setPin(e.target.value.replace(/\D/g, "")),
-      onKeyDown: (e) => e.key === "Enter" && submitPin(),
-      placeholder: stage === "setpin" ? "Set a 4+ digit PIN" : "Enter PIN",
-      className: "w-full px-3 py-2 border border-slate-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"
-    }
-  ), /* @__PURE__ */ React.createElement(
-    "button",
-    {
-      onClick: submitPin,
-      className: "mt-4 w-full bg-indigo-600 hover:bg-indigo-700 text-white text-sm font-medium py-2.5 rounded-lg"
-    },
-    stage === "setpin" ? "Set PIN & enter" : "Sign in"
-  ), /* @__PURE__ */ React.createElement(
-    "button",
-    {
-      onClick: () => {
-        setStage("name");
-        setPin("");
-        setErr("");
-      },
-      className: "mt-2 w-full text-slate-500 text-xs py-1"
-    },
-    "Back"
-  )), err && /* @__PURE__ */ React.createElement("p", { className: "text-xs text-rose-600 mt-3" }, err), !hasStore && /* @__PURE__ */ React.createElement("div", { className: "mt-5 flex gap-2 text-[11px] text-amber-700 bg-amber-50 border border-amber-200 rounded-lg p-2.5" }, /* @__PURE__ */ React.createElement(AlertTriangle, { size: 14, className: "shrink-0 mt-0.5" }), /* @__PURE__ */ React.createElement("span", null, "Preview mode: saving and multi-user sync are off. Open the published/shared link to enable them."))));
+  return /* @__PURE__ */ React.createElement("div", { className: "min-h-screen bg-slate-50 flex items-center justify-center p-4" }, /* @__PURE__ */ React.createElement("div", { className: "w-full max-w-md bg-white rounded-2xl shadow-sm border border-slate-200 p-8" },
+    /* @__PURE__ */ React.createElement("div", { className: "text-center mb-6" },
+      /* @__PURE__ */ React.createElement("div", { className: "inline-flex items-center justify-center rounded-xl mb-3 px-4 py-3", style: { background: VP_NAVY } }, /* @__PURE__ */ React.createElement(VasupradahMark, { height: 30 })),
+      /* @__PURE__ */ React.createElement("h1", { className: "text-lg font-semibold text-slate-800" }, "Client Console"),
+      /* @__PURE__ */ React.createElement("p", { className: "text-xs text-slate-500 mt-1" }, "Investment Advisory Services P Ltd \xB7 Kochi")
+    ),
+    changingServer ? /* @__PURE__ */ React.createElement(React.Fragment, null,
+      /* @__PURE__ */ React.createElement("label", { className: "block text-sm font-medium text-slate-700 mb-1" }, "Server Web app URL"),
+      /* @__PURE__ */ React.createElement("input", {
+        autoFocus: true,
+        value: connUrl,
+        onChange: (e) => setConnUrl(e.target.value),
+        onKeyDown: (e) => e.key === "Enter" && connectServer(),
+        placeholder: "https://your-server-host/exec",
+        className: "w-full px-3 py-2 border border-slate-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"
+      }),
+      /* @__PURE__ */ React.createElement("button", {
+        onClick: connectServer,
+        disabled: busy || !connUrl.trim(),
+        className: "mt-4 w-full bg-indigo-600 hover:bg-indigo-700 text-white text-sm font-medium py-2.5 rounded-lg disabled:opacity-60"
+      }, busy ? "Saving…" : "Save & continue"),
+      (db.sheetUrl || "").trim() && /* @__PURE__ */ React.createElement("button", {
+        onClick: () => { setChangingServer(false); setErr(""); },
+        className: "mt-2 w-full text-slate-500 text-xs py-1"
+      }, "Back")
+    ) : /* @__PURE__ */ React.createElement(React.Fragment, null,
+      /* @__PURE__ */ React.createElement("label", { className: "block text-sm font-medium text-slate-700 mb-1" }, "Email"),
+      /* @__PURE__ */ React.createElement("input", {
+        autoFocus: true,
+        type: "email",
+        value: email,
+        onChange: (e) => setEmail(e.target.value),
+        onKeyDown: (e) => e.key === "Enter" && submitLogin(),
+        placeholder: "you@vasupradah.com",
+        className: "w-full px-3 py-2 border border-slate-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"
+      }),
+      /* @__PURE__ */ React.createElement("label", { className: "block text-sm font-medium text-slate-700 mb-1 mt-3" }, "Password"),
+      /* @__PURE__ */ React.createElement("input", {
+        type: "password",
+        value: password,
+        onChange: (e) => setPassword(e.target.value),
+        onKeyDown: (e) => e.key === "Enter" && submitLogin(),
+        placeholder: "Password",
+        className: "w-full px-3 py-2 border border-slate-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"
+      }),
+      /* @__PURE__ */ React.createElement("button", {
+        onClick: submitLogin,
+        disabled: busy,
+        className: "mt-4 w-full bg-indigo-600 hover:bg-indigo-700 text-white text-sm font-medium py-2.5 rounded-lg disabled:opacity-60"
+      }, busy ? "Signing in…" : "Sign in"),
+      /* @__PURE__ */ React.createElement("button", {
+        onClick: () => { setChangingServer(true); setErr(""); },
+        className: "mt-2 w-full text-slate-500 text-xs py-1"
+      }, "Change server")
+    ),
+    err && /* @__PURE__ */ React.createElement("p", { className: "text-xs text-rose-600 mt-3" }, err),
+    !hasStore && /* @__PURE__ */ React.createElement("div", { className: "mt-5 flex gap-2 text-[11px] text-amber-700 bg-amber-50 border border-amber-200 rounded-lg p-2.5" }, /* @__PURE__ */ React.createElement(AlertTriangle, { size: 14, className: "shrink-0 mt-0.5" }), /* @__PURE__ */ React.createElement("span", null, "Preview mode: saving and multi-user sync are off. Open the published/shared link to enable them."))
+  ));
 }
 function Console({ db, user, commit, undo, refreshPrices, onLogout }) {
   const [tab, setTab] = useState("report");
   const [toast, setToast] = useState(null);
+  const [showPwModal, setShowPwModal] = useState(false);
   const showToast = (m, kind = "ok") => {
     setToast({ m, kind });
     setTimeout(() => setToast(null), 2600);
@@ -12048,7 +11991,7 @@ function Console({ db, user, commit, undo, refreshPrices, onLogout }) {
     },
     /* @__PURE__ */ React.createElement(Undo2, { size: 15 }),
     " Undo"
-  ), /* @__PURE__ */ React.createElement("div", { className: "text-right leading-tight mr-1" }, /* @__PURE__ */ React.createElement("div", { className: "text-xs font-medium text-white" }, user.name), /* @__PURE__ */ React.createElement("div", { className: "text-[10px] capitalize", style: { color: "rgba(255,255,255,0.6)" } }, user.role, user.role !== "admin" ? " \xB7 view only" : "")), /* @__PURE__ */ React.createElement("button", { onClick: onLogout, title: "Sign out", className: "p-1.5 rounded-lg vp-onnavy-icon" }, /* @__PURE__ */ React.createElement(LogOut, { size: 16 })))), /* @__PURE__ */ React.createElement("div", { className: "md:hidden flex", style: { borderTop: "1px solid rgba(255,255,255,0.15)" } }, tabs.map((t) => /* @__PURE__ */ React.createElement(
+  ), /* @__PURE__ */ React.createElement("div", { className: "text-right leading-tight mr-1" }, /* @__PURE__ */ React.createElement("div", { className: "text-xs font-medium text-white" }, user.name), /* @__PURE__ */ React.createElement("div", { className: "text-[10px] capitalize", style: { color: "rgba(255,255,255,0.6)" } }, user.role, user.role !== "admin" ? " \xB7 view only" : "")), /* @__PURE__ */ React.createElement("button", { onClick: () => setShowPwModal(true), title: "Change password", className: "p-1.5 rounded-lg vp-onnavy-icon" }, /* @__PURE__ */ React.createElement(Lock, { size: 16 })), /* @__PURE__ */ React.createElement("button", { onClick: onLogout, title: "Sign out", className: "p-1.5 rounded-lg vp-onnavy-icon" }, /* @__PURE__ */ React.createElement(LogOut, { size: 16 })))), /* @__PURE__ */ React.createElement("div", { className: "md:hidden flex", style: { borderTop: "1px solid rgba(255,255,255,0.15)" } }, tabs.map((t) => /* @__PURE__ */ React.createElement(
     "button",
     {
       key: t.id,
@@ -12059,7 +12002,51 @@ function Console({ db, user, commit, undo, refreshPrices, onLogout }) {
     /* @__PURE__ */ React.createElement(t.icon, { size: 16 }),
     " ",
     t.label.split(" ")[0]
-  ))), db.lastAction && /* @__PURE__ */ React.createElement("div", { className: "bg-slate-50 border-t border-slate-100 px-4 py-1 text-[11px] text-slate-400 text-center" }, "Last: ", /* @__PURE__ */ React.createElement("b", { className: "text-slate-500" }, db.lastAction.type), " by ", db.lastAction.by, " \xB7 ", new Date(db.lastAction.at).toLocaleTimeString("en-IN"))), /* @__PURE__ */ React.createElement("main", { className: "max-w-[1760px] mx-auto px-3 py-5" }, tab === "report" && /* @__PURE__ */ React.createElement(Report, { db, user, commit, showToast, refreshPrices }), tab === "advice" && /* @__PURE__ */ React.createElement(AdviceTab, { db, user, commit, showToast }), tab === "performance" && /* @__PURE__ */ React.createElement(PerformanceTab, { db, showToast }), tab === "orders" && user.role === "admin" && /* @__PURE__ */ React.createElement(AdviceOrders, { db, commit, showToast }), tab === "pipeline" && /* @__PURE__ */ React.createElement(PipelineTab, { db, user, commit, showToast }), tab === "billing" && /* @__PURE__ */ React.createElement(BillingTab, { db, user, commit, showToast }), tab === "capgains" && /* @__PURE__ */ React.createElement(CapitalGainsTab, { db, user, showToast }), tab === "upload" && user.role === "admin" && /* @__PURE__ */ React.createElement(UploadTab, { db, commit, showToast }), tab === "settings" && user.role === "admin" && /* @__PURE__ */ React.createElement(SettingsTab, { db, commit, showToast })), toast && /* @__PURE__ */ React.createElement("div", { className: `fixed bottom-5 left-1/2 -translate-x-1/2 px-4 py-2.5 rounded-lg text-sm text-white shadow-lg z-50 flex items-center gap-2 ${toast.kind === "err" ? "bg-rose-600" : "bg-slate-800"}` }, toast.kind === "err" ? /* @__PURE__ */ React.createElement(AlertTriangle, { size: 15 }) : /* @__PURE__ */ React.createElement(Check, { size: 15 }), " ", toast.m));
+  ))), db.lastAction && /* @__PURE__ */ React.createElement("div", { className: "bg-slate-50 border-t border-slate-100 px-4 py-1 text-[11px] text-slate-400 text-center" }, "Last: ", /* @__PURE__ */ React.createElement("b", { className: "text-slate-500" }, db.lastAction.type), " by ", db.lastAction.by, " \xB7 ", new Date(db.lastAction.at).toLocaleTimeString("en-IN"))), /* @__PURE__ */ React.createElement("main", { className: "max-w-[1760px] mx-auto px-3 py-5" }, tab === "report" && /* @__PURE__ */ React.createElement(Report, { db, user, commit, showToast, refreshPrices }), tab === "advice" && /* @__PURE__ */ React.createElement(AdviceTab, { db, user, commit, showToast }), tab === "performance" && /* @__PURE__ */ React.createElement(PerformanceTab, { db, showToast }), tab === "orders" && user.role === "admin" && /* @__PURE__ */ React.createElement(AdviceOrders, { db, commit, showToast }), tab === "pipeline" && /* @__PURE__ */ React.createElement(PipelineTab, { db, user, commit, showToast }), tab === "billing" && /* @__PURE__ */ React.createElement(BillingTab, { db, user, commit, showToast }), tab === "capgains" && /* @__PURE__ */ React.createElement(CapitalGainsTab, { db, user, showToast }), tab === "upload" && user.role === "admin" && /* @__PURE__ */ React.createElement(UploadTab, { db, commit, showToast }), tab === "settings" && user.role === "admin" && /* @__PURE__ */ React.createElement(SettingsTab, { db, commit, showToast, user })), toast && /* @__PURE__ */ React.createElement("div", { className: `fixed bottom-5 left-1/2 -translate-x-1/2 px-4 py-2.5 rounded-lg text-sm text-white shadow-lg z-50 flex items-center gap-2 ${toast.kind === "err" ? "bg-rose-600" : "bg-slate-800"}` }, toast.kind === "err" ? /* @__PURE__ */ React.createElement(AlertTriangle, { size: 15 }) : /* @__PURE__ */ React.createElement(Check, { size: 15 }), " ", toast.m), showPwModal && /* @__PURE__ */ React.createElement(ChangePasswordModal, { db, onClose: () => setShowPwModal(false), showToast }));
+}
+function ChangePasswordModal({ db, onClose, showToast }) {
+  const [current, setCurrent] = useState("");
+  const [next, setNext] = useState("");
+  const [confirm, setConfirm] = useState("");
+  const [err, setErr] = useState("");
+  const [busy, setBusy] = useState(false);
+  const submit = async () => {
+    setErr("");
+    if (next.length < 8) { setErr("New password needs at least 8 characters."); return; }
+    if (next !== confirm) { setErr("The new password and its confirmation don't match."); return; }
+    setBusy(true);
+    try {
+      const res = await fetch((db.sheetUrl || "").trim(), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ token: db.sheetToken || "", type: "change_password", currentPassword: current, newPassword: next })
+      });
+      const data = await res.json().catch(() => null);
+      if (data && data.ok) {
+        showToast("Password changed.");
+        onClose();
+      } else {
+        setErr((data && data.error) || "Could not change the password.");
+      }
+    } catch (e) {
+      setErr("Could not reach the server.");
+    } finally {
+      setBusy(false);
+    }
+  };
+  return /* @__PURE__ */ React.createElement("div", { className: "fixed inset-0 bg-black/40 z-50 flex items-center justify-center p-4" },
+    /* @__PURE__ */ React.createElement("div", { className: "bg-white rounded-xl shadow-lg w-full max-w-sm p-5" },
+      /* @__PURE__ */ React.createElement("h3", { className: "text-sm font-semibold text-slate-800 mb-3 flex items-center gap-1.5" }, /* @__PURE__ */ React.createElement(Lock, { size: 15 }), " Change password"),
+      /* @__PURE__ */ React.createElement("input", { type: "password", value: current, onChange: (e) => setCurrent(e.target.value), placeholder: "Current password", className: "w-full mb-2 px-3 py-2 text-sm border border-slate-300 rounded-lg" }),
+      /* @__PURE__ */ React.createElement("input", { type: "password", value: next, onChange: (e) => setNext(e.target.value), placeholder: "New password (8+ characters)", className: "w-full mb-2 px-3 py-2 text-sm border border-slate-300 rounded-lg" }),
+      /* @__PURE__ */ React.createElement("input", { type: "password", value: confirm, onChange: (e) => setConfirm(e.target.value), onKeyDown: (e) => e.key === "Enter" && submit(), placeholder: "Confirm new password", className: "w-full mb-3 px-3 py-2 text-sm border border-slate-300 rounded-lg" }),
+      err && /* @__PURE__ */ React.createElement("p", { className: "text-xs text-rose-600 mb-3" }, err),
+      /* @__PURE__ */ React.createElement("div", { className: "flex gap-2" },
+        /* @__PURE__ */ React.createElement("button", { onClick: submit, disabled: busy, className: "flex-1 bg-indigo-600 hover:bg-indigo-700 text-white text-sm py-2 rounded-lg disabled:opacity-60" }, busy ? "Saving…" : "Save"),
+        /* @__PURE__ */ React.createElement("button", { onClick: onClose, className: "flex-1 border border-slate-300 text-slate-600 text-sm py-2 rounded-lg hover:bg-slate-50" }, "Cancel")
+      )
+    )
+  );
 }
 function TradeHistoryModal({ db, code, name, symbol, onClose }) {
   const [store, setStore] = useState(null);
@@ -12078,7 +12065,7 @@ function TradeHistoryModal({ db, code, name, symbol, onClose }) {
           if (!dead && (!local || local.marker)) setState(local && local.marker ? "error" : "empty");
           return;
         }
-        const res = await fetch(url + (url.includes("?") ? "&" : "?") + "trades=1&code=" + encodeURIComponent(code) + "&sym=" + encodeURIComponent(sym));
+        const res = await fetch(withToken(url) + "&trades=1&code=" + encodeURIComponent(code) + "&sym=" + encodeURIComponent(sym));
         const data = await res.json();
         let list = Array.isArray(data.trades) ? data.trades : [];
         if (dead) return;
@@ -13727,15 +13714,14 @@ function AdviceAlertsPanel({ db, user, commit, showToast }) {
       const startedAt = Date.now();
       await fetch(db.sheetUrl, {
         method: "POST",
-        mode: "no-cors",
-        headers: { "Content-Type": "text/plain;charset=utf-8" },
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ token: db.sheetToken || "", type: "greeting_email", image: "", subject: "Investment advice", bodyText: "", recipients, personalize: true, replyTo: approveReplyTo(db), fromName: db.advisorName || "Vasupradah Investment Advisory" })
       });
       let result = null;
       for (let i = 0; i < 6; i++) {
         await new Promise((r) => setTimeout(r, 1800));
         try {
-          const rs = await fetch(db.sheetUrl + (db.sheetUrl.includes("?") ? "&" : "?") + "greeting_status=1");
+          const rs = await fetch(withToken(db.sheetUrl) + "&greeting_status=1");
           const d = await rs.json();
           if (d && d.result && d.at && d.at >= startedAt) {
             result = d.result;
@@ -13768,8 +13754,7 @@ function AdviceAlertsPanel({ db, user, commit, showToast }) {
     try {
       await fetch(db.sheetUrl, {
         method: "POST",
-        mode: "no-cors",
-        headers: { "Content-Type": "text/plain;charset=utf-8" },
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ token: db.sheetToken || "", type: "greeting_email", image: "", subject: "Investment advice", bodyText: "", recipients: [{ email: r.email, name: r.name, subject: r.subject, body: r.body }], personalize: true, replyTo: approveReplyTo(db), fromName: db.advisorName || "Vasupradah Investment Advisory" })
       });
       setSentEmail((p) => {
@@ -13929,7 +13914,7 @@ function AdviceTab({ db, user, commit, showToast }) {
     }
     setLoadingSheet(true);
     try {
-      const res = await fetch(url + (url.includes("?") ? "&" : "?") + "alerts=1");
+      const res = await fetch(withToken(url) + "&alerts=1");
       const data = await res.json();
       const list = Array.isArray(data.alerts) ? data.alerts : [];
       if (!list.length) {
@@ -14114,7 +14099,7 @@ function AdviceTab({ db, user, commit, showToast }) {
     }
   ));
 }
-function SettingsTab({ db, commit, showToast }) {
+function SettingsTab({ db, commit, showToast, user }) {
   const [newStaff, setNewStaff] = useState("");
   const [tpl, setTpl] = useState(db.template);
   const [line, setLine] = useState(db.lineTemplate);
@@ -14122,7 +14107,6 @@ function SettingsTab({ db, commit, showToast }) {
   const [repTpl, setRepTpl] = useState(db.reportTemplate);
   const [adv, setAdv] = useState(db.advisorName);
   const [sebi, setSebi] = useState(db.sebiRegNo);
-  const [newPin, setNewPin] = useState("");
   const [sUrl, setSUrl] = useState(db.sheetUrl || "");
   const [sTok, setSTok] = useState(db.sheetToken || "");
   const [gwProxyUrl, setGwProxyUrl] = useState(db.gwProxyUrl || "http://localhost:8787");
@@ -14131,6 +14115,69 @@ function SettingsTab({ db, commit, showToast }) {
   const [apText, setApText] = useState(db.approveText != null ? db.approveText : DEFAULT_APPROVE_TEXT);
   const [emQuery, setEmQuery] = useState("");
   const [waMode, setWaMode] = useState(db.waOpenMode || "auto");
+  // Staff logins (the real users collection - see pocketbase/pb_migrations
+  // and pb_hooks/backend.pb.js), replacing the old name+PIN sign-in.
+  const [users, setUsers] = useState([]);
+  const [usersBusy, setUsersBusy] = useState(false);
+  const [newUser, setNewUser] = useState({ email: "", name: "", role: "staff", password: "" });
+  const loadUsers = useCallback(async () => {
+    const url = (db.sheetUrl || "").trim();
+    if (!url) return;
+    setUsersBusy(true);
+    try {
+      const res = await fetch(withToken(url) + "&users=1");
+      const data = await res.json();
+      if (data && data.ok) setUsers(data.rows || []);
+    } catch (e) {
+    } finally {
+      setUsersBusy(false);
+    }
+  }, [db.sheetUrl]);
+  useEffect(() => {
+    loadUsers();
+  }, [loadUsers]);
+  const postUsers = async (payload) => {
+    const url = (db.sheetUrl || "").trim();
+    if (!url) return { ok: false, error: "Set the server URL first." };
+    try {
+      const res = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ token: db.sheetToken || "", type: "users", ...payload })
+      });
+      return await res.json();
+    } catch (e) {
+      return { ok: false, error: "Could not reach the server." };
+    }
+  };
+  const addUser = async () => {
+    if (!newUser.email.trim() || newUser.password.length < 8) {
+      showToast("An email and a password of at least 8 characters are needed.", "err");
+      return;
+    }
+    const r = await postUsers({ email: newUser.email.trim(), name: newUser.name.trim(), role: newUser.role, newPassword: newUser.password });
+    if (r.ok) {
+      showToast(`${newUser.email.trim()} can now sign in.`);
+      setNewUser({ email: "", name: "", role: "staff", password: "" });
+      loadUsers();
+    } else showToast(r.error || "Could not create that account.", "err");
+  };
+  const setUserActive = async (u, active) => {
+    const r = await postUsers({ id: u.id, role: u.role, active });
+    if (r.ok) loadUsers();
+    else showToast(r.error || "Could not update that account.", "err");
+  };
+  const setUserRole = async (u, role) => {
+    const r = await postUsers({ id: u.id, role, active: u.active });
+    if (r.ok) loadUsers();
+    else showToast(r.error || "Could not update that account.", "err");
+  };
+  const removeUser = async (u) => {
+    if (!window.confirm(`Delete the login for ${u.email}? This cannot be undone.`)) return;
+    const r = await postUsers({ id: u.id, action: "delete" });
+    if (r.ok) loadUsers();
+    else showToast(r.error || "Could not delete that account.", "err");
+  };
   const saveWaMode = async (v) => {
     setWaMode(v);
     await commit((d) => {
@@ -14230,7 +14277,7 @@ function SettingsTab({ db, commit, showToast }) {
     const url = (db.sheetUrl || "").trim();
     if (!url) return;
     try {
-      const res = await fetch(url + (url.includes("?") ? "&" : "?") + "gridkey=1");
+      const res = await fetch(withToken(url) + "&gridkey=1");
       const d = await res.json();
       setGk(d);
       setGkTrUrl((v) => v || d.tradesUrl || "");
@@ -14252,8 +14299,7 @@ function SettingsTab({ db, commit, showToast }) {
     try {
       await fetch(url, {
         method: "POST",
-        mode: "no-cors",
-        headers: { "Content-Type": "text/plain;charset=utf-8" },
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           token: db.sheetToken || "",
           type: "gridkey_config",
@@ -14283,8 +14329,7 @@ function SettingsTab({ db, commit, showToast }) {
     try {
       await fetch(url, {
         method: "POST",
-        mode: "no-cors",
-        headers: { "Content-Type": "text/plain;charset=utf-8" },
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ token: db.sheetToken || "", type: "gridkey_run" })
       });
       setTimeout(async () => {
@@ -14382,17 +14427,6 @@ function SettingsTab({ db, commit, showToast }) {
     }, "edit advice templates");
     showToast("Advice & report templates saved.");
   };
-  const changePin = async () => {
-    if (newPin.length < 4) {
-      showToast("PIN must be 4+ digits.", "err");
-      return;
-    }
-    await commit((d) => {
-      d.adminPin = newPin;
-    }, "change PIN");
-    setNewPin("");
-    showToast("Admin PIN updated.");
-  };
   const saveSheet = async () => {
     await commit((d) => {
       d.sheetUrl = sUrl.trim();
@@ -14414,7 +14448,7 @@ function SettingsTab({ db, commit, showToast }) {
     setDedupeBusy(true);
     setDedupeMsg("Cleaning\u2026 this can take a minute on a large sheet.");
     try {
-      const res = await fetch(url + (url.includes("?") ? "&" : "?") + "dedupe=Trades,Ledger&token=" + encodeURIComponent(db.sheetToken || ""));
+      const res = await fetch(withToken(url) + "&dedupe=Trades,Ledger");
       const d = await res.json();
       if (!d.ok) setDedupeMsg("Couldn't clean: " + (d.error || "unknown error"));
       else setDedupeMsg((d.results || []).map((r) => r.error ? `${r.sheet}: ${r.error}` : `${r.sheet}: ${fmtNum(r.before)} rows \u2192 ${fmtNum(r.after)} (removed ${fmtNum(r.removed)})`).join(" \xB7 "));
@@ -14468,7 +14502,7 @@ function SettingsTab({ db, commit, showToast }) {
     setProbeBusy(true);
     setProbe(null);
     try {
-      const res = await fetch(url + (url.includes("?") ? "&" : "?") + "gk_probe=trades&on=" + encodeURIComponent(probeOn) + (probeSym.trim() ? "&sym=" + encodeURIComponent(probeSym.trim()) : "") + "&token=" + encodeURIComponent(db.sheetToken || ""));
+      const res = await fetch(withToken(url) + "&gk_probe=trades&on=" + encodeURIComponent(probeOn) + (probeSym.trim() ? "&sym=" + encodeURIComponent(probeSym.trim()) : ""));
       setProbe(await res.json());
     } catch (e) {
       setProbe({ ok: false, error: "Couldn't reach the endpoint \u2014 redeploy the script as a new version." });
@@ -14490,8 +14524,7 @@ function SettingsTab({ db, commit, showToast }) {
     try {
       await fetch(url, {
         method: "POST",
-        mode: "no-cors",
-        headers: { "Content-Type": "text/plain;charset=utf-8" },
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           token: db.sheetToken || "",
           type: "shortener_config",
@@ -14545,8 +14578,7 @@ function SettingsTab({ db, commit, showToast }) {
       const startedAt = Date.now();
       await fetch(url, {
         method: "POST",
-        mode: "no-cors",
-        headers: { "Content-Type": "text/plain;charset=utf-8" },
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           token: db.sheetToken || "",
           type: "greeting_email",
@@ -14562,7 +14594,7 @@ function SettingsTab({ db, commit, showToast }) {
       for (let i = 0; i < 8; i++) {
         await new Promise((r) => setTimeout(r, 1800));
         try {
-          const rs = await fetch(url + (url.includes("?") ? "&" : "?") + "greeting_status=1");
+          const rs = await fetch(withToken(url) + "&greeting_status=1");
           const dd = await rs.json();
           if (dd && dd.result && dd.at && dd.at >= startedAt) {
             result = dd.result;
@@ -14770,16 +14802,40 @@ function SettingsTab({ db, commit, showToast }) {
       onChange: (e) => setCl((s) => ({ ...s, [rc]: e.target.value })),
       className: "px-3 py-2 text-sm border border-slate-300 rounded-lg w-24"
     }
-  ), /* @__PURE__ */ React.createElement("span", { className: "text-sm text-slate-500" }, "%"))))), /* @__PURE__ */ /* @__PURE__ */ React.createElement("div", { className: "flex gap-2 mt-4" }, /* @__PURE__ */ React.createElement("button", { onClick: saveLimits, className: "bg-indigo-600 hover:bg-indigo-700 text-white text-sm px-4 py-2 rounded-lg" }, "Save limits"), /* @__PURE__ */ React.createElement("button", { onClick: () => setCl({ default: 10 }), className: "text-slate-600 text-sm px-3 py-2 rounded-lg border border-slate-200 hover:bg-slate-50" }, "Reset to 10% for all"))), /* @__PURE__ */ React.createElement(DataHealthCard, { db, showToast }), /* @__PURE__ */ React.createElement(Card, { title: "Staff access", icon: Users }, /* @__PURE__ */ React.createElement("p", { className: "text-xs text-slate-500 mb-3" }, "Only the names listed and enabled here can sign in (besides the Principal Officer)."), /* @__PURE__ */ React.createElement("div", { className: "flex gap-2 mb-3" }, /* @__PURE__ */ React.createElement(
-    "input",
-    {
-      value: newStaff,
-      onChange: (e) => setNewStaff(e.target.value),
-      onKeyDown: (e) => e.key === "Enter" && addStaff(),
-      placeholder: "Add staff name",
-      className: "flex-1 px-3 py-2 text-sm border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500"
-    }
-  ), /* @__PURE__ */ React.createElement("button", { onClick: addStaff, className: "bg-indigo-600 hover:bg-indigo-700 text-white text-sm px-3 py-2 rounded-lg flex items-center gap-1" }, /* @__PURE__ */ React.createElement(Plus, { size: 16 }), " Add")), /* @__PURE__ */ React.createElement("div", { className: "space-y-1.5" }, (db.staff || []).filter((s) => s && tidyName(s.name)).map((s) => /* @__PURE__ */ React.createElement("div", { key: nameKey(s.name), className: "flex items-center gap-2 bg-slate-50 rounded-lg px-3 py-2" }, /* @__PURE__ */ React.createElement("span", { className: "text-sm flex-1" }, tidyName(s.name)), /* @__PURE__ */ React.createElement("button", { onClick: () => toggleStaff(s.name), className: `text-xs px-2 py-1 rounded-md ${s.enabled ? "bg-emerald-100 text-emerald-700" : "bg-slate-200 text-slate-500"}` }, s.enabled ? "Enabled" : "Disabled"), /* @__PURE__ */ React.createElement("button", { onClick: () => removeStaff(s.name), className: "text-slate-400 hover:text-rose-600" }, /* @__PURE__ */ React.createElement(X, { size: 15 })))), !(db.staff || []).length && /* @__PURE__ */ React.createElement("p", { className: "text-xs text-slate-400" }, "No staff added yet."))), /* @__PURE__ */ React.createElement(Card, { title: "WhatsApp message template", icon: MessageCircle }, /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-2 gap-3 mb-3" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("label", { className: "text-xs text-slate-500" }, "Advisor name"), /* @__PURE__ */ React.createElement("input", { value: adv, onChange: (e) => setAdv(e.target.value), className: "w-full mt-1 px-3 py-2 text-sm border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500" })), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("label", { className: "text-xs text-slate-500" }, "SEBI RIA Reg. No."), /* @__PURE__ */ React.createElement("input", { value: sebi, onChange: (e) => setSebi(e.target.value), className: "w-full mt-1 px-3 py-2 text-sm border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500" }))), /* @__PURE__ */ React.createElement("label", { className: "text-xs text-slate-500" }, "Message body (uses ", /* @__PURE__ */ React.createElement("code", { className: "bg-slate-100 px-1 rounded" }, "{holdings}"), " for the stock list)"), /* @__PURE__ */ React.createElement(
+  ), /* @__PURE__ */ React.createElement("span", { className: "text-sm text-slate-500" }, "%"))))), /* @__PURE__ */ /* @__PURE__ */ React.createElement("div", { className: "flex gap-2 mt-4" }, /* @__PURE__ */ React.createElement("button", { onClick: saveLimits, className: "bg-indigo-600 hover:bg-indigo-700 text-white text-sm px-4 py-2 rounded-lg" }, "Save limits"), /* @__PURE__ */ React.createElement("button", { onClick: () => setCl({ default: 10 }), className: "text-slate-600 text-sm px-3 py-2 rounded-lg border border-slate-200 hover:bg-slate-50" }, "Reset to 10% for all"))), /* @__PURE__ */ React.createElement(DataHealthCard, { db, showToast }), /* @__PURE__ */ React.createElement(Card, { title: "Staff logins", icon: Users },
+  /* @__PURE__ */ React.createElement("p", { className: "text-xs text-slate-500 mb-3" }, "Each person signs in with their own email and password - not shared with anyone else. Turning a login off keeps their name on old records but stops them signing in."),
+  /* @__PURE__ */ React.createElement("div", { className: "space-y-1.5 mb-4" },
+    users.map((u) => /* @__PURE__ */ React.createElement("div", { key: u.id, className: "flex items-center gap-2 bg-slate-50 rounded-lg px-3 py-2" },
+      /* @__PURE__ */ React.createElement("div", { className: "flex-1 min-w-0" },
+        /* @__PURE__ */ React.createElement("div", { className: "text-sm truncate" }, u.name || u.email, u.id === user.id && /* @__PURE__ */ React.createElement("span", { className: "text-slate-400" }, " \xB7 you")),
+        /* @__PURE__ */ React.createElement("div", { className: "text-[11px] text-slate-400 truncate" }, u.email)
+      ),
+      /* @__PURE__ */ React.createElement("select", {
+        value: u.role,
+        disabled: u.id === user.id,
+        onChange: (e) => setUserRole(u, e.target.value),
+        className: "text-xs border border-slate-200 rounded-md px-1.5 py-1 bg-white disabled:opacity-50"
+      }, /* @__PURE__ */ React.createElement("option", { value: "staff" }, "Staff"), /* @__PURE__ */ React.createElement("option", { value: "admin" }, "Admin")),
+      /* @__PURE__ */ React.createElement("button", {
+        onClick: () => setUserActive(u, !u.active),
+        disabled: u.id === user.id,
+        className: `text-xs px-2 py-1 rounded-md disabled:opacity-50 ${u.active ? "bg-emerald-100 text-emerald-700" : "bg-slate-200 text-slate-500"}`
+      }, u.active ? "Enabled" : "Disabled"),
+      u.id !== user.id && /* @__PURE__ */ React.createElement("button", { onClick: () => removeUser(u), className: "text-slate-400 hover:text-rose-600" }, /* @__PURE__ */ React.createElement(X, { size: 15 }))
+    )),
+    !users.length && !usersBusy && /* @__PURE__ */ React.createElement("p", { className: "text-xs text-slate-400" }, "No logins yet.")
+  ),
+  /* @__PURE__ */ React.createElement("div", { className: "border-t border-slate-100 pt-3" },
+    /* @__PURE__ */ React.createElement("div", { className: "text-xs font-medium text-slate-600 mb-2" }, "Add a login"),
+    /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-2 gap-2 mb-2" },
+      /* @__PURE__ */ React.createElement("input", { value: newUser.name, onChange: (e) => setNewUser({ ...newUser, name: e.target.value }), placeholder: "Name", className: "px-3 py-2 text-sm border border-slate-300 rounded-lg" }),
+      /* @__PURE__ */ React.createElement("input", { type: "email", value: newUser.email, onChange: (e) => setNewUser({ ...newUser, email: e.target.value }), placeholder: "Email", className: "px-3 py-2 text-sm border border-slate-300 rounded-lg" }),
+      /* @__PURE__ */ React.createElement("input", { type: "password", value: newUser.password, onChange: (e) => setNewUser({ ...newUser, password: e.target.value }), placeholder: "Password (8+ characters)", className: "px-3 py-2 text-sm border border-slate-300 rounded-lg" }),
+      /* @__PURE__ */ React.createElement("select", { value: newUser.role, onChange: (e) => setNewUser({ ...newUser, role: e.target.value }), className: "px-3 py-2 text-sm border border-slate-300 rounded-lg bg-white" }, /* @__PURE__ */ React.createElement("option", { value: "staff" }, "Staff"), /* @__PURE__ */ React.createElement("option", { value: "admin" }, "Admin"))
+    ),
+    /* @__PURE__ */ React.createElement("button", { onClick: addUser, className: "bg-indigo-600 hover:bg-indigo-700 text-white text-sm px-3 py-2 rounded-lg flex items-center gap-1" }, /* @__PURE__ */ React.createElement(Plus, { size: 16 }), " Add login")
+  )
+), /* @__PURE__ */ React.createElement(Card, { title: "WhatsApp message template", icon: MessageCircle }, /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-2 gap-3 mb-3" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("label", { className: "text-xs text-slate-500" }, "Advisor name"), /* @__PURE__ */ React.createElement("input", { value: adv, onChange: (e) => setAdv(e.target.value), className: "w-full mt-1 px-3 py-2 text-sm border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500" })), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("label", { className: "text-xs text-slate-500" }, "SEBI RIA Reg. No."), /* @__PURE__ */ React.createElement("input", { value: sebi, onChange: (e) => setSebi(e.target.value), className: "w-full mt-1 px-3 py-2 text-sm border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500" }))), /* @__PURE__ */ React.createElement("label", { className: "text-xs text-slate-500" }, "Message body (uses ", /* @__PURE__ */ React.createElement("code", { className: "bg-slate-100 px-1 rounded" }, "{holdings}"), " for the stock list)"), /* @__PURE__ */ React.createElement(
     "textarea",
     {
       value: tpl,
@@ -14883,17 +14939,7 @@ function SettingsTab({ db, commit, showToast }) {
         onChange: (e) => e.target.files[0] && readRestore(e.target.files[0])
       }
     )
-  ), restore && /* @__PURE__ */ React.createElement("div", { className: "mt-3 border border-slate-100 rounded-lg p-3 flex items-center gap-3" }, /* @__PURE__ */ React.createElement("div", { className: "flex-1 text-sm" }, "Found ", /* @__PURE__ */ React.createElement("b", null, restore.clientCount), " clients \xB7 ", /* @__PURE__ */ React.createElement("b", null, restore.holdingCount), " holdings in ", /* @__PURE__ */ React.createElement("span", { className: "text-slate-500" }, restore.fname), ".", Object.keys(db.clients || {}).length > 0 && /* @__PURE__ */ React.createElement("span", { className: "block text-[11px] text-amber-700 mt-1" }, "This will replace the ", Object.keys(db.clients).length, " client(s) currently loaded.")), /* @__PURE__ */ React.createElement("button", { onClick: () => setConfirmRestore(true), className: "bg-indigo-600 hover:bg-indigo-700 text-white text-sm px-4 py-2 rounded-lg" }, "Restore"), /* @__PURE__ */ React.createElement("button", { onClick: () => setRestore(null), className: "text-slate-500 text-sm px-3 py-2 rounded-lg hover:bg-slate-100" }, "Cancel"))), /* @__PURE__ */ React.createElement(Card, { title: "Security & data", icon: Lock }, /* @__PURE__ */ React.createElement("div", { className: "flex items-end gap-2 mb-4" }, /* @__PURE__ */ React.createElement("div", { className: "flex-1" }, /* @__PURE__ */ React.createElement("label", { className: "text-xs text-slate-500" }, "Change admin PIN"), /* @__PURE__ */ React.createElement(
-    "input",
-    {
-      type: "password",
-      inputMode: "numeric",
-      value: newPin,
-      onChange: (e) => setNewPin(e.target.value.replace(/\D/g, "")),
-      placeholder: "New PIN",
-      className: "w-full mt-1 px-3 py-2 text-sm border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500"
-    }
-  )), /* @__PURE__ */ React.createElement("button", { onClick: changePin, className: "bg-slate-800 text-white text-sm px-4 py-2 rounded-lg" }, "Update PIN")), /* @__PURE__ */ React.createElement("button", { onClick: exportCsv, className: "text-sm text-indigo-700 flex items-center gap-1.5 hover:underline" }, /* @__PURE__ */ React.createElement(Download, { size: 15 }), " Export all holdings (CSV backup)")), /* @__PURE__ */ React.createElement("div", { className: "flex gap-2 text-[11px] text-slate-500 bg-slate-100 border border-slate-200 rounded-lg p-3" }, /* @__PURE__ */ React.createElement(ShieldCheck, { size: 16, className: "shrink-0 mt-0.5 text-slate-400" }), /* @__PURE__ */ React.createElement("span", null, "Client names, emails and numbers come from your master sheet. Keep a CSV backup before bulk uploads. For a permanent SEBI-RIA system handling client PII at scale, a privately hosted version with per-user logins is the more robust route.")), confirmRestore && restore && /* @__PURE__ */ React.createElement(
+  ), restore && /* @__PURE__ */ React.createElement("div", { className: "mt-3 border border-slate-100 rounded-lg p-3 flex items-center gap-3" }, /* @__PURE__ */ React.createElement("div", { className: "flex-1 text-sm" }, "Found ", /* @__PURE__ */ React.createElement("b", null, restore.clientCount), " clients \xB7 ", /* @__PURE__ */ React.createElement("b", null, restore.holdingCount), " holdings in ", /* @__PURE__ */ React.createElement("span", { className: "text-slate-500" }, restore.fname), ".", Object.keys(db.clients || {}).length > 0 && /* @__PURE__ */ React.createElement("span", { className: "block text-[11px] text-amber-700 mt-1" }, "This will replace the ", Object.keys(db.clients).length, " client(s) currently loaded.")), /* @__PURE__ */ React.createElement("button", { onClick: () => setConfirmRestore(true), className: "bg-indigo-600 hover:bg-indigo-700 text-white text-sm px-4 py-2 rounded-lg" }, "Restore"), /* @__PURE__ */ React.createElement("button", { onClick: () => setRestore(null), className: "text-slate-500 text-sm px-3 py-2 rounded-lg hover:bg-slate-100" }, "Cancel"))), /* @__PURE__ */ React.createElement(Card, { title: "Security & data", icon: Lock }, /* @__PURE__ */ React.createElement("button", { onClick: exportCsv, className: "text-sm text-indigo-700 flex items-center gap-1.5 hover:underline" }, /* @__PURE__ */ React.createElement(Download, { size: 15 }), " Export all holdings (CSV backup)")), /* @__PURE__ */ React.createElement("div", { className: "flex gap-2 text-[11px] text-slate-500 bg-slate-100 border border-slate-200 rounded-lg p-3" }, /* @__PURE__ */ React.createElement(ShieldCheck, { size: 16, className: "shrink-0 mt-0.5 text-slate-400" }), /* @__PURE__ */ React.createElement("span", null, "Client names, emails and numbers come from your master sheet. Keep a CSV backup before bulk uploads. For a permanent SEBI-RIA system handling client PII at scale, a privately hosted version with per-user logins is the more robust route.")), confirmRestore && restore && /* @__PURE__ */ React.createElement(
     ConfirmModal,
     {
       title: "Restore from backup?",
@@ -15144,7 +15190,7 @@ function PerformanceTab({ db, showToast }) {
     }
     setLoadingSheet(true);
     try {
-      const res = await fetch(url + (url.includes("?") ? "&" : "?") + "trades=1");
+      const res = await fetch(withToken(url) + "&trades=1");
       const data = await res.json();
       let list = Array.isArray(data.trades) ? data.trades : [];
       if (list.length && Array.isArray(list[0])) {
@@ -15180,15 +15226,14 @@ function PerformanceTab({ db, showToast }) {
         const rows = tuples.slice(i, i + CHUNK).map((t) => [t[2], t[0], nameOf(t[0]), t[1], t[3] === "S" ? "SELL" : "BUY", t[4], t[5], t[6]]);
         await fetch(url, {
           method: "POST",
-          mode: "no-cors",
-          headers: { "Content-Type": "text/plain;charset=utf-8" },
+          headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ token: db.sheetToken || "", type: "trades", reset: i === 0, rows })
         });
         setPush({ done: Math.min(i + CHUNK, tuples.length), total: tuples.length });
       }
       let verified = null;
       try {
-        const res = await fetch(url + (url.includes("?") ? "&" : "?") + "trades=1");
+        const res = await fetch(withToken(url) + "&trades=1");
         const data = await res.json();
         verified = Array.isArray(data.trades) ? data.trades.length : null;
       } catch (e) {
@@ -15506,8 +15551,7 @@ function GreetingModal({ db, onClose, showToast }) {
       const startedAt = Date.now();
       await fetch(db.sheetUrl, {
         method: "POST",
-        mode: "no-cors",
-        headers: { "Content-Type": "text/plain;charset=utf-8" },
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           token: db.sheetToken || "",
           type: "greeting_email",
@@ -15523,7 +15567,7 @@ function GreetingModal({ db, onClose, showToast }) {
       for (let i = 0; i < 6; i++) {
         await new Promise((r) => setTimeout(r, 1800));
         try {
-          const rs = await fetch(db.sheetUrl + (db.sheetUrl.includes("?") ? "&" : "?") + "greeting_status=1");
+          const rs = await fetch(withToken(db.sheetUrl) + "&greeting_status=1");
           const d = await rs.json();
           if (d && d.result && d.at && d.at >= startedAt) {
             result = d.result;

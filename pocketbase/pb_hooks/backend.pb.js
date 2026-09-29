@@ -60,6 +60,37 @@ routerAdd("GET", "/exec", (e) => {
     return o;
   }
 
+  // Every request carries a per-person PocketBase login token in ?token=,
+  // the same query-string slot the shared secret used to sit in - so the
+  // console's existing "?flag=1&token=..." fetches need no new wiring, only
+  // a real JWT instead of the one shared string. `active` is re-checked
+  // here (not just relied on at login) because a token issued before
+  // someone was deactivated stays cryptographically valid until it expires
+  // on its own - PocketBase's authRule only stops a NEW login.
+  function currentUser() {
+    try {
+      const rec = $app.findAuthRecordByToken(str(q.token), "auth");
+      if (rec.collection().name !== "users" || !rec.get("active")) return null;
+      return rec;
+    } catch (err) { return null; }
+  }
+  const me = currentUser();
+  if (!me) return e.json(200, { ok: false, error: "please sign in again" });
+
+  // ---- ?whoami=1 - who this token belongs to, for the console right after login
+  if (str(q.whoami)) {
+    return e.json(200, { ok: true, id: me.get("id"), email: me.get("email"), name: me.get("name"), role: me.get("role") });
+  }
+
+  // ---- ?users=1 (admin only) - the staff/admin roster itself ----------
+  if (str(q.users)) {
+    if (me.get("role") !== "admin") return e.json(200, { ok: false, error: "admin only" });
+    const rows = findAll("users", "", "created").map((r) => ({
+      id: r.get("id"), email: r.get("email"), name: r.get("name"), role: r.get("role"), active: !!r.get("active"),
+    }));
+    return e.json(200, { ok: true, rows, me: { id: me.get("id"), email: me.get("email"), name: me.get("name"), role: me.get("role") } });
+  }
+
   // ---- ?staff=1 --------------------------------------------------------
   if (str(q.staff)) {
     const rows = findAll("staff", "", "name").map((r) => ({ name: r.get("name"), enabled: !!r.get("enabled") }));
@@ -461,20 +492,34 @@ routerAdd("GET", "/exec", (e) => {
 
 // ============================================================================
 // POST /exec  - body.type decides which write runs, exactly like doPost(e).
-// Every branch checks the shared secret first, exactly as Code.gs did; GET
-// stays unauthenticated because that is what Code.gs itself did (reads never
-// carried a token) - not a gap introduced by this port.
+// Every branch resolves `body.token` to a real logged-in person first, in
+// the same slot the one shared secret used to sit in - real per-person
+// login via PocketBase's own `users` collection replaced that shared
+// secret entirely (see pb_migrations/..._add_user_roles.js). GET now
+// requires the same token (see ?token= there) - Code.gs itself left reads
+// open, but a real login makes locking those down too the obviously right
+// call, not a gap to preserve.
 // ============================================================================
 routerAdd("POST", "/exec", (e) => {
   const body = e.requestInfo().body || {};
 
-  function pbSecret() {
-    const v = $os.getenv("PB_SECRET");
-    return v && v.trim() ? v.trim() : "820082";
+  function currentUser() {
+    try {
+      const rec = $app.findAuthRecordByToken(String(body.token || ""), "auth");
+      if (rec.collection().name !== "users" || !rec.get("active")) return null;
+      return rec;
+    } catch (err) { return null; }
   }
-  if (String(body.token || "") !== pbSecret()) {
-    return e.json(200, { ok: false, error: "token mismatch" });
-  }
+  const me = currentUser();
+  if (!me) return e.json(200, { ok: false, error: "please sign in again" });
+  const isAdmin = me.get("role") === "admin";
+  // Returns true if the caller is NOT an admin. Deliberately returns a plain
+  // bool rather than calling e.json() itself and handing back its result -
+  // e.json()'s return value is falsy on success, so a call site trusting it
+  // as the "was denied" signal would never actually short-circuit, and end
+  // up writing a second response on top of the first (caught by the test
+  // suite as two concatenated JSON bodies on one HTTP response).
+  function notAdmin() { return !isAdmin; }
 
   function num(v) {
     const n = parseFloat(String(v == null ? "" : v).replace(/[^0-9.\-]/g, ""));
@@ -525,6 +570,7 @@ routerAdd("POST", "/exec", (e) => {
 
   // ---- fee_plans ----------------------------------------------------------
   if (body.type === "fee_plans") {
+    if (notAdmin()) return e.json(200, { ok: false, error: "admin only" });
     if (body.action === "delete") {
       const id = trim(body.id);
       if (!id) return e.json(200, { ok: false, error: "delete needs an id" });
@@ -547,6 +593,7 @@ routerAdd("POST", "/exec", (e) => {
 
   // ---- billing_profiles ---------------------------------------------------
   if (body.type === "billing_profiles") {
+    if (notAdmin()) return e.json(200, { ok: false, error: "admin only" });
     if (body.action === "delete") {
       const code = trim(body.code);
       if (!code) return e.json(200, { ok: false, error: "delete needs a client code" });
@@ -570,6 +617,7 @@ routerAdd("POST", "/exec", (e) => {
 
   // ---- billing_settings (singleton) ---------------------------------------
   if (body.type === "billing_settings") {
+    if (notAdmin()) return e.json(200, { ok: false, error: "admin only" });
     const r = body.row || {};
     let qr = str(r.upiQr);
     let qrNote = "";
@@ -590,6 +638,7 @@ routerAdd("POST", "/exec", (e) => {
 
   // ---- invoices -------------------------------------------------------
   if (body.type === "invoices") {
+    if (notAdmin()) return e.json(200, { ok: false, error: "admin only" });
     if (body.action === "delete") {
       const id = trim(body.id);
       if (!id) return e.json(200, { ok: false, error: "delete needs an id" });
@@ -641,6 +690,7 @@ routerAdd("POST", "/exec", (e) => {
     // since those never go through a filter query.
     const bKey = (c, sym) => trim(c).toLowerCase() + "::" + trim(sym).toUpperCase();
     if (body.action === "delete") {
+      if (notAdmin()) return e.json(200, { ok: false, error: "admin only" });
       const gone = deleteBy("baskets", "key", bKey(body.category, body.symbol));
       return e.json(200, { ok: true, message: gone ? "basket row deleted" : "basket row not found" });
     }
@@ -690,6 +740,7 @@ routerAdd("POST", "/exec", (e) => {
   if (body.type === "manual_trade") {
     const coll = $app.findCollectionByNameOrId("manual_trades");
     if (body.action === "delete") {
+      if (notAdmin()) return e.json(200, { ok: false, error: "admin only" });
       const gone = deleteBy("manual_trades", "key", trim(body.id));
       return e.json(200, { ok: true, message: gone ? "manual trade deleted" : "manual trade not found" });
     }
@@ -726,6 +777,7 @@ routerAdd("POST", "/exec", (e) => {
   // ---- pipeline -------------------------------------------------------
   if (body.type === "pipeline") {
     if (body.action === "delete") {
+      if (notAdmin()) return e.json(200, { ok: false, error: "admin only" });
       const gone = deleteBy("pipeline", "key", trim(body.id));
       return e.json(200, { ok: true, message: gone ? "deleted" : "not found" });
     }
@@ -742,6 +794,90 @@ routerAdd("POST", "/exec", (e) => {
       meeting_time: str(rec.meetingTime),
     });
     return e.json(200, { ok: true, message: "pipeline saved" });
+  }
+
+  // ---- change_password (any signed-in person, for their own account only)
+  if (body.type === "change_password") {
+    const newPw = str(body.newPassword);
+    if (newPw.length < 8) return e.json(200, { ok: false, error: "new password needs at least 8 characters" });
+    if (!me.validatePassword(str(body.currentPassword))) return e.json(200, { ok: false, error: "current password is wrong" });
+    me.set("password", newPw);
+    $app.save(me);
+    return e.json(200, { ok: true, message: "password changed" });
+  }
+
+  // ---- users (admin only) - create, edit or remove a login, and hand out
+  //      or take away the admin role. A person can never deactivate,
+  //      demote or delete their own account (the only way back in then
+  //      would be the PocketBase dashboard), and the last remaining active
+  //      admin can never be demoted or deactivated by anyone - both are
+  //      real lockout risks worth refusing outright in a two-or-three
+  //      person firm, not edge cases to leave to carefulness. ------------
+  if (body.type === "users") {
+    if (notAdmin()) return e.json(200, { ok: false, error: "admin only" });
+    const usersColl = $app.findCollectionByNameOrId("users");
+    function findAllUsers(filter) {
+      const out = [];
+      let page = 0;
+      const pageSize = 500;
+      while (true) {
+        const batch = $app.findRecordsByFilter("users", filter || "", "", pageSize, page * pageSize);
+        out.push.apply(out, batch);
+        if (batch.length < pageSize) break;
+        page++;
+      }
+      return out;
+    }
+    const activeAdminCount = () => findAllUsers("role = 'admin' && active = true").length;
+
+    if (body.action === "delete") {
+      const id = trim(body.id);
+      if (!id) return e.json(200, { ok: false, error: "delete needs a user id" });
+      if (id === me.get("id")) return e.json(200, { ok: false, error: "you cannot delete your own account" });
+      let target = null;
+      try { target = $app.findRecordById("users", id); } catch (err) { target = null; }
+      if (!target) return e.json(200, { ok: true, message: "user not found" });
+      if (target.get("role") === "admin" && target.get("active") && activeAdminCount() <= 1) {
+        return e.json(200, { ok: false, error: "cannot remove the last remaining admin" });
+      }
+      $app.delete(target);
+      return e.json(200, { ok: true, message: "user deleted" });
+    }
+
+    const id = trim(body.id);
+    const role = String(body.role || "").toLowerCase() === "admin" ? "admin" : "staff";
+    const active = body.active === false ? false : true;
+
+    if (id) {
+      // Editing an existing account.
+      let target = null;
+      try { target = $app.findRecordById("users", id); } catch (err) { target = null; }
+      if (!target) return e.json(200, { ok: false, error: "user not found" });
+      const demoting = target.get("role") === "admin" && (role !== "admin" || !active);
+      if (demoting && id === me.get("id")) return e.json(200, { ok: false, error: "you cannot deactivate or demote your own account" });
+      if (demoting && activeAdminCount() <= 1) return e.json(200, { ok: false, error: "cannot demote or deactivate the last remaining admin" });
+      if (body.name !== undefined) target.set("name", str(body.name));
+      target.set("role", role);
+      target.set("active", active);
+      if (str(body.newPassword)) target.set("password", str(body.newPassword));
+      $app.save(target);
+      return e.json(200, { ok: true, message: "user updated" });
+    }
+
+    // Creating a new account.
+    const email = trim(body.email);
+    const pw = str(body.newPassword);
+    if (!email) return e.json(200, { ok: false, error: "a new user needs an email" });
+    if (pw.length < 8) return e.json(200, { ok: false, error: "new password needs at least 8 characters" });
+    const rec = new Record(usersColl);
+    rec.set("email", email);
+    rec.set("password", pw);
+    rec.set("name", str(body.name));
+    rec.set("role", role);
+    rec.set("active", active);
+    rec.set("verified", true);
+    $app.save(rec);
+    return e.json(200, { ok: true, message: "user created", id: rec.get("id") });
   }
 
   // ---- holdings backup (the default POST, same rule as Code.gs: a body
